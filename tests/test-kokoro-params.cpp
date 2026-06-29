@@ -27,3 +27,9 @@ TEST_CASE("kokoro_free: NULL context is a no-op", "[unit][kokoro]") {
     kokoro_free(nullptr);
     SUCCEED("kokoro_free tolerated a NULL ctx.");
 }
+
+TEST_CASE("kokoro embedded voice ABI: null guards are safe", "[unit][kokoro]") {
+    REQUIRE(kokoro_embedded_voice_count(nullptr) == 0);
+    REQUIRE(kokoro_embedded_voice_id(nullptr, 0) == nullptr);
+    REQUIRE(kokoro_select_embedded_voice(nullptr, "af_heart") == -1);
+}

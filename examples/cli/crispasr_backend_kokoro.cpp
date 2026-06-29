@@ -55,6 +55,16 @@ std::string kokoro_resolve_fallback_voice(const std::string& lang, const std::st
     return path;
 }
 
+bool file_exists(const std::string& path) {
+    if (path.empty())
+        return false;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    fclose(f);
+    return true;
+}
+
 class KokoroBackend : public CrispasrBackend {
 public:
     KokoroBackend() = default;
@@ -95,13 +105,35 @@ public:
         if (!ctx_ || text.empty())
             return {};
 
-        // Voice pack: load once on first call. Required — without it, synthesis
-        // returns nullptr (predictor needs a (style_pred, style_dec) reference).
-        // Resolution order: --voice (explicit) → ff_siwis fallback for non-native
-        // languages → sibling kokoro-voice-af_heart.gguf (auto-download default
-        // companion) → empty (synthesis will fail with a clear error).
-        std::string voice_path = params.tts_voice;
-        if (voice_path.empty() && !params.language.empty() && params.language != "auto" &&
+        // Voice source: newer full GGUFs embed many `voices.<id>.style`
+        // tensors; older GGUFs still use a separate `kokoro-voice-*.gguf`.
+        // Resolution order:
+        //   --voice existing path → separate voice pack
+        //   --voice non-path      → embedded voice id
+        //   no --voice + embedded → runtime default embedded voice
+        //   old fallback paths    → separate voice pack
+        std::string voice_path;
+        embedded_voice_selected_ = false;
+        const int embedded_count = kokoro_embedded_voice_count(ctx_);
+        if (!params.tts_voice.empty()) {
+            if (file_exists(params.tts_voice)) {
+                voice_path = params.tts_voice;
+            } else if (embedded_count > 0) {
+                if (kokoro_select_embedded_voice(ctx_, params.tts_voice.c_str()) != 0) {
+                    fprintf(stderr, "crispasr[kokoro]: embedded voice id '%s' not found in full GGUF\n",
+                            params.tts_voice.c_str());
+                    return {};
+                }
+                voice_loaded_ = false;
+                embedded_voice_selected_ = true;
+            } else {
+                voice_path = params.tts_voice;
+            }
+        } else if (embedded_count > 0) {
+            embedded_voice_selected_ = true;
+        }
+
+        if (voice_path.empty() && !embedded_voice_selected_ && !params.language.empty() && params.language != "auto" &&
             !crispasr_kokoro_lang_has_native_voice(params.language.c_str())) {
             std::string picked;
             voice_path = kokoro_resolve_fallback_voice(params.language, params.model, &picked);
@@ -138,7 +170,7 @@ public:
                         params.language.c_str());
             }
         }
-        if (voice_path.empty()) {
+        if (voice_path.empty() && !embedded_voice_selected_) {
             // Last-resort UX fallback for `-m auto` / native-voice languages
             // (en, ja, zh, ...) where the user passed no `--voice` but the
             // registry's auto-download companion sat `kokoro-voice-af_heart.gguf`
@@ -148,13 +180,11 @@ public:
             auto slash = mp.find_last_of("/\\");
             std::string dir = (slash == std::string::npos) ? "." : mp.substr(0, slash);
             std::string candidate = dir + "/kokoro-voice-af_heart.gguf";
-            FILE* tf = fopen(candidate.c_str(), "rb");
-            if (tf) {
-                fclose(tf);
+            if (file_exists(candidate)) {
                 voice_path = std::move(candidate);
             }
         }
-        if (!voice_loaded_ && !voice_path.empty()) {
+        if (!embedded_voice_selected_ && !voice_loaded_ && !voice_path.empty()) {
             if (kokoro_load_voice_pack(ctx_, voice_path.c_str()) != 0) {
                 fprintf(stderr, "crispasr[kokoro]: failed to load voice pack '%s'\n", voice_path.c_str());
                 return {};
@@ -177,11 +207,13 @@ public:
             ctx_ = nullptr;
         }
         voice_loaded_ = false;
+        embedded_voice_selected_ = false;
     }
 
 private:
     kokoro_context* ctx_ = nullptr;
     bool voice_loaded_ = false;
+    bool embedded_voice_selected_ = false;
     bool is_german_backbone_ = false;
 };
 

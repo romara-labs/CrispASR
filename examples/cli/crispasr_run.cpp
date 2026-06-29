@@ -1300,7 +1300,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // already told us where the codec is (--codec-model), or when the
     // companion already sits next to the model file or in the cache dir
     // (the backend's discover_* will find it without a download prompt).
-    if (!backend_name.empty() && params.tts_codec_model.empty()) {
+    const bool skip_registry_companion =
+        backend_name == "kokoro" && params.model.find(".full.gguf") != std::string::npos;
+    if (!backend_name.empty() && params.tts_codec_model.empty() && !skip_registry_companion) {
         CrispasrRegistryEntry entry;
         if (crispasr_registry_lookup(backend_name, entry, params.model_quant) && !entry.companion_filename.empty()) {
             // Check whether the companion already exists locally before

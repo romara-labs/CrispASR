@@ -1,6 +1,6 @@
 # Text-to-Speech (TTS)
 
-CrispASR ships **fourteen open-weights TTS engines** behind the same
+CrispASR ships **24 open-weights TTS engines** behind the same
 `crispasr` binary, each with a distinct voice / quality / footprint
 trade-off:
 
@@ -10,6 +10,7 @@ trade-off:
 | **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
 | **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
+| **`omnivoice`** | OmniVoice talker + MaskGIT/RVQ codec vendored into CrispASR. Supports VoiceDesign via `--instruct`, streaming output, and WAV voice cloning via `--voice <ref.wav> --ref-text "..."`. | Yes (`--voice <ref.wav> --ref-text "..."`) | Manual LM + codec GGUF paths (`-m` + `--codec-model`) |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
@@ -33,7 +34,36 @@ trade-off:
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 
-All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
+All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch, 16 kHz for speecht5, 24 kHz for most others including omnivoice, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
+
+## OmniVoice — vendored manual backend
+
+The `omnivoice` backend is compiled into CrispASR from `src/omnivoice/` and
+does not depend on the original `omnivoice.cpp-master` checkout at runtime.
+It currently has no registry entry, so `-m auto` is not available for this
+backend. Pass both GGUF files explicitly:
+
+```bash
+crispasr --backend omnivoice \
+    -m omnivoice-lm.gguf \
+    --codec-model omnivoice-codec.gguf \
+    --tts "Hello from OmniVoice." \
+    --instruct "young adult female voice, calm and clear" \
+    --tts-output omnivoice.wav
+```
+
+For voice cloning, provide a reference WAV and its transcript:
+
+```bash
+crispasr --backend omnivoice \
+    -m omnivoice-lm.gguf \
+    --codec-model omnivoice-codec.gguf \
+    --voice reference.wav \
+    --ref-text "Exact words spoken in the reference audio." \
+    --tts "This sentence uses the reference voice." \
+    --tts-output cloned.wav \
+    --i-have-rights
+```
 
 ## TADA — multilingual and voice cloning
 

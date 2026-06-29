@@ -65,6 +65,10 @@ CRISPASR_KV_QUANT=q4_0 CRISPASR_GGUF_MMAP=1 crispasr --backend voxtral4b -m auto
 # TTS — synthesize speech from text
 crispasr --backend kokoro -m auto --tts "Hello, how are you?" -o output.wav
 
+# TTS — OmniVoice requires explicit LM + codec GGUF paths
+crispasr --backend omnivoice -m omnivoice-lm.gguf --codec-model omnivoice-codec.gguf \
+    --tts "Hello from OmniVoice." -o omnivoice.wav
+
 # S2S — speech-to-speech (audio in → audio out)
 crispasr --backend lfm2-audio -m auto -f input.wav --s2s -o reply.wav
 
@@ -112,14 +116,14 @@ crispasr --list-backends
 |---|---|
 | `--voice PATH` | GGUF voice pack or reference WAV. GGUF packs are used for VibeVoice/Qwen3-TTS/Orpheus style conditioning; WAV enables voice cloning (requires `--i-have-rights`) |
 | `--voice-dir PATH` | Server: directory of `<name>.gguf` or `<name>.wav` voice profiles. Enables `/v1/voices` listing and name-based voice selection in `/v1/audio/speech` |
-| `--ref-text "TEXT"` | Reference transcription for the ref audio (qwen3-tts, f5-tts). Auto-transcribed from `--voice <wav>` if omitted |
+| `--ref-text "TEXT"` | Reference transcription for the ref audio (qwen3-tts, f5-tts, omnivoice). Auto-transcribed from `--voice <wav>` if omitted where supported |
 | `--ref-asr BACKEND` | ASR backend to auto-transcribe the ref audio (default: `whisper`) |
-| `--instruct "TEXT"` | Natural-language voice/style description. For qwen3-tts: VoiceDesign mode (voice description) or CustomVoice mode (style control) |
+| `--instruct "TEXT"` | Natural-language voice/style description. For qwen3-tts and omnivoice: VoiceDesign mode (voice description) or style control |
 | `--make-ref` | Create a TADA voice reference GGUF from `--voice <audio.wav>` + `--ref-text "transcript"`. Pure C++, no Python. Auto-discovers `tada-encoder-f16.gguf` + `tada-aligner-en.gguf` next to the model. Output path via `--make-ref-output` (default: `tada-ref-custom.gguf`) |
 | `--make-ref-output PATH` | Output path for `--make-ref` (default: `tada-ref-custom.gguf`) |
 | `--make-ref-encoder PATH` | Explicit path to the TADA encoder GGUF (auto-discovered if omitted) |
 | `--make-ref-aligner PATH` | Explicit path to the TADA aligner GGUF (auto-discovered if omitted) |
-| `--codec-model FNAME` | Explicit path to the codec/companion GGUF (e.g. Qwen3-TTS codec encoder). Defaults to sibling / cache / registry auto-discovery |
+| `--codec-model FNAME` | Explicit path to the codec/companion GGUF (e.g. Qwen3-TTS codec encoder or OmniVoice codec). Defaults to sibling / cache / registry auto-discovery when the backend has registry support; required for `omnivoice` |
 | `--codec-quant Q` | Preferred quant for registry companion resolution (codec model) |
 | `--tts-steps N` | DPM-Solver++ diffusion steps (VibeVoice only; default 20, valid range 10–20) |
 | `--tts-trim-silence` | Trim leading silence from TTS output |
@@ -865,7 +869,8 @@ default quantized model for the selected backend into
 | hubert | `cstr/hubert-large-ls960-ft-GGUF` | ~200 MB |
 | data2vec | `cstr/data2vec-audio-960h-GGUF` | ~60 MB |
 
-**TTS backends** — all auto-download the model + a default voice pack:
+**Registry-backed TTS backends** — auto-download the model and any default
+voice pack or companion codec:
 
 | Backend | Default download | Approx size | Notes |
 |---|---|---|---|
@@ -880,6 +885,17 @@ default quantized model for the selected backend into
 | piper | `cstr/piper-en-hfc-medium-GGUF` | ~63 MB | Lightweight, many voices via `--voice` |
 | tada-1b | `cstr/tada-tts-1b-GGUF` (Q4_K + codec) | ~2.7 GB | English-only; `--voice tada-ref.gguf` |
 | tada / tada-3b-ml | `cstr/tada-tts-3b-ml-GGUF` (Q4_K + codec) | ~5 GB | 9 languages; `-l fr` auto-downloads `tada-ref-fr.gguf` — see [tts.md §TADA](tts.md#tada--multilingual-and-voice-cloning) |
+
+`omnivoice` is vendored in the CrispASR binary but is not registry-backed yet.
+Use explicit paths instead of `-m auto`:
+
+```bash
+crispasr --backend omnivoice \
+    -m omnivoice-lm.gguf \
+    --codec-model omnivoice-codec.gguf \
+    --tts "Hello from OmniVoice." \
+    --tts-output omnivoice.wav
+```
 
 Downloads go through `curl` (preferred) with a `wget` fallback — **no
 Python, no libcurl link dependency**. Works identically on Linux,

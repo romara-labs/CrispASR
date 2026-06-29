@@ -40,6 +40,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_omnivoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_audio_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
@@ -178,6 +179,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_moonshine_backend();
     if (name.rfind("omniasr", 0) == 0)
         return crispasr_make_omniasr_backend();
+    if (name == "omnivoice" || name == "omnivoice-tts" || name == "ov-tts")
+        return crispasr_make_omnivoice_backend();
     if (name == "mimo-asr" || name == "mimo_asr" || name == "mimoasr")
         return crispasr_make_mimo_asr_backend();
     if (name == "moss-audio" || name == "moss_audio" || name == "mossaudio")
@@ -273,6 +276,8 @@ std::vector<std::string> crispasr_list_backends() {
         "omniasr-300m",
         "omniasr-llm",
         "omniasr-llm-1b",
+        "omnivoice",
+        "omnivoice-tts",
         "mimo-asr",
         "moss-audio",
         "funasr",

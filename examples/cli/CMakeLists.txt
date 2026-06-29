@@ -57,6 +57,7 @@ add_executable(${TARGET}
     crispasr_backend_moonshine_streaming.cpp
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
+    crispasr_backend_omnivoice.cpp
     crispasr_backend_mimo_asr.cpp
     crispasr_backend_moss_audio.cpp
     crispasr_backend_funasr.cpp
@@ -197,6 +198,7 @@ target_link_libraries(crispasr-diff PRIVATE
     mimo_asr
     moss_audio
     voxcpm2_tts
+    omnivoice
     funasr
     paraformer
     sensevoice
@@ -294,6 +296,7 @@ target_link_libraries(${TARGET} PRIVATE
     pocket-tts
     csm-tts
     voxcpm2_tts
+    omnivoice
     m2m100
     t5_translate
     canary_ctc

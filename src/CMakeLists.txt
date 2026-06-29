@@ -1425,6 +1425,26 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# omnivoice — OmniVoice TTS (Qwen3 backbone + RVQ codec, 24 kHz)
+# ---------------------------------------------------------------------------
+add_library(omnivoice STATIC
+    omnivoice/omnivoice.h
+    omnivoice/omnivoice.cpp
+    omnivoice/pipeline-tts.h
+    omnivoice/pipeline-tts.cpp
+    omnivoice/pipeline-codec.h
+    omnivoice/pipeline-codec.cpp
+)
+set_target_properties(omnivoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(omnivoice PUBLIC . omnivoice)
+target_compile_features   (omnivoice PUBLIC cxx_std_17)
+target_compile_definitions(omnivoice PUBLIC OMNIVOICE_STATIC)
+target_link_libraries     (omnivoice PUBLIC ggml ggml-base ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
+if(NOT MSVC)
+    target_compile_options(omnivoice PRIVATE -O3 -Wno-missing-declarations -Wno-shadow)
+endif()
+
+# ---------------------------------------------------------------------------
 # cosyvoice3_tts — FunAudioLLM/Fun-CosyVoice3-0.5B-2512 (Qwen2-0.5B LLM +
 # DiT-CFM flow + HiFi-GAN-iSTFT vocoder). Phase 2 ships the LLM only.
 # ---------------------------------------------------------------------------
@@ -2152,6 +2172,9 @@ if (TARGET t5_translate)
 endif()
 if (TARGET voxcpm2_tts)
     target_link_libraries(crispasr-lib PUBLIC voxcpm2_tts)
+endif()
+if (TARGET omnivoice)
+    target_link_libraries(crispasr-lib PUBLIC omnivoice)
 endif()
 if (TARGET cosyvoice3_tts)
     target_link_libraries(crispasr-lib PUBLIC cosyvoice3_tts)

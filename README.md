@@ -1,6 +1,6 @@
 # CrispASR
 
-**One C++ binary, 35 ASR backends + 23 TTS engines + multilingual text translation, zero Python dependencies.**
+**One C++ binary, 35 ASR backends + 24 TTS engines + multilingual text translation, zero Python dependencies.**
 
 CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-tts) for the TTS side.
 
@@ -36,7 +36,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 
 | Project | What it does |
 |---|---|
-| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech engine. 35 ASR backends + 23 TTS engines, CLI + HTTP server + C-ABI + Python/Rust/Dart/Go/Ruby bindings. |
+| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech engine. 35 ASR backends + 24 TTS engines, CLI + HTTP server + C-ABI + Python/Rust/Dart/Go/Ruby bindings. |
 | **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** | Cross-platform Flutter transcription app built on CrispASR. Desktop + mobile, all 10 backends, model browser with download queue, mic capture, SRT/VTT/JSON export, diarization, batch processing. Fully offline. |
 | **[CrispEmbed](https://github.com/CrispStrobe/CrispEmbed)** | Text embedding engine via ggml — same philosophy as CrispASR but for retrieval. 10 architectures (XLM-R, Qwen3-Embed, Gemma3, ModernBERT, ...), dense + sparse + ColBERT + reranking. 9.5x faster than ONNX on CPU, GPU via CUDA/Metal/Vulkan. Python/Rust/Dart bindings. |
 | **[Susurrus](https://github.com/CrispStrobe/Susurrus)** | Python ASR GUI with 9 backends (faster-whisper, mlx-whisper, voxtral, insanely-fast-whisper, ...). The Python counterpart to CrispASR's C++ approach. |
@@ -49,7 +49,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 - [Feature matrix](#feature-matrix)
 - [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md))
 - [Quick start — ASR](#quick-start)
-- [**Text-to-Speech (TTS)**](docs/tts.md) — Kokoro, Qwen3-TTS, VibeVoice, Orpheus, Chatterbox, IndexTTS, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
+- [**Text-to-Speech (TTS)**](docs/tts.md) — Kokoro, Qwen3-TTS, OmniVoice, VibeVoice, Orpheus, Chatterbox, IndexTTS, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
 - [Streaming & live transcription](docs/streaming.md)
 - [Server mode (HTTP API)](docs/server.md)
 - [CLI reference](docs/cli.md) — flags, VAD, CTC alignment, output formats, auto-download, audio formats
@@ -67,7 +67,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 ## Supported backends
 
 CrispASR ships **35 ASR backends** for transcription/translation and
-**23 TTS engines** for synthesis. Pick at the CLI with `--backend NAME`,
+**24 TTS engines** for synthesis. Pick at the CLI with `--backend NAME`,
 or omit it to let the binary auto-detect from the GGUF metadata. Jump
 to the [TTS table](#text-to-speech-models) for the synthesis side.
 
@@ -139,6 +139,7 @@ quick-start commands and engine selection guidance.
 | **kugelaudio** | [`kugelaudio-0-open`](https://huggingface.co/cstr/kugelaudio-0-open-GGUF) | Qwen2.5-7B LM + 4L DiT diffusion + acoustic VAE decoder; voice cloning | multilingual | Apache-2.0 |
 | **qwen3-tts** | [`Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`1.7B-Base`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF), [`1.7B-VoiceDesign`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) | Qwen3 talker LM + 12 Hz RVQ ([more](docs/architecture.md#qwen3-tts)) | multilingual | Apache-2.0 |
 | **qwen3-tts-customvoice** | [`1.7B-CustomVoice`](https://huggingface.co/cstr/qwen3-tts-1.7b-customvoice-GGUF) | Same talker + 9 premium built-in speakers (`--voice <name>`); optional style via `--instruct` (e.g. "spoke very slowly") ([more](docs/architecture.md#qwen3-tts)) | multilingual | Apache-2.0 |
+| **omnivoice** | Manual OmniVoice LM GGUF + codec GGUF (`-m` + `--codec-model`) | Qwen3-style talker + MaskGIT/RVQ codec at 24 kHz; VoiceDesign via `--instruct`; WAV cloning via `--voice <wav> --ref-text "..."`; Vulkan realtime default uses 16 MaskGIT steps | en, zh | — |
 | **melotts** | [`myshell-ai/MeloTTS`](https://github.com/myshell-ai/MeloTTS) EN_V2 | VITS2 (6L transformer + SDP/DP + transformer coupling flow + HiFi-GAN); 44.1 kHz, 102 MB + 52 MB BERT Q4_K companion (154 MB total); neural G2P; 4 EN speakers ([more](docs/architecture.md#melotts)) | en | MIT |
 | **piper** | [`rhasspy/piper`](https://github.com/rhasspy/piper) community voices | VITS (6L transformer + SDP + 4-block coupling flow + HiFi-GAN); 22 kHz mono, 30 MB F16 per voice; built-in G2P for EN/DE/FR/ES (`--g2p-dict`) | 30+ langs (built-in + espeak dlopen) | MIT |
 | **kokoro** | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) + German backbones | StyleTTS2 / iSTFTNet (82M); per-voice GGUF ([more](docs/architecture.md#kokoro)) | en, es, fr, hi, it, ja, pt, zh, de | Apache-2.0 |
@@ -166,6 +167,7 @@ quick-start commands and engine selection guidance.
 |---------|:---:|:---:|:---:|:---:|:---:|
 | vibevoice-tts | yes | temp | 24 | yes | yes |
 | qwen3-tts | yes* | temp | 24 | yes | yes |
+| omnivoice | yes | — | 24 | — | — |
 | kokoro | — | — | 24 | yes | — |
 | orpheus | — | temp | 24 | yes | yes |
 | chatterbox | yes | temp | 24 | yes | yes |
@@ -282,7 +284,7 @@ The static table below is a curated subset focusing on the ASR backends and the 
 | mmap weights (`CRISPASR_GGUF_MMAP`) | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | TTS | | | | | | | | | | | | | | | | | | | ✔ | | | | | |
 
-The matrix above covers 24 ASR backends. **Additional ASR backends** not shown: `nemotron` (39-lang streaming ASR with cache-aware FastConformer + RNN-T), `lfm2-audio` (ASR + TTS + S2S in one model), `moss-audio` (audio understanding + ASR), `mini-omni2` (ASR + TTS + S2S), `kugelaudio` (7B audio understanding). See [`docs/feature-matrix.md`](docs/feature-matrix.md) for the full 76-backend matrix. **TTS-only backends** (`kokoro`, `qwen3-tts` + variants, `vibevoice-tts`, `orpheus` + DE variants, `chatterbox` / `chatterbox-turbo` / `kartoffelbox-turbo` / `lahgtna-chatterbox`, `dia`, `bark`, `outetts`, `zonos`, `csm`, `f5-tts`, `parler-tts`, `speecht5`, `piper`, `fastpitch`, `pocket-tts`, `melotts`, `cosyvoice3`, `voxcpm2`, `tada-tts`) all carry the TTS, AUTO_DOWNLOAD, TEMPERATURE, and FLASH_ATTN caps; per-backend cloning + voice-pack support is documented in the [Text-to-Speech models](#text-to-speech-models) table above and [`docs/tts.md`](docs/tts.md). The vibevoice and lfm2-audio columns mark dual-mode (ASR + TTS) backends.
+The matrix above covers 24 ASR backends. **Additional ASR backends** not shown: `nemotron` (39-lang streaming ASR with cache-aware FastConformer + RNN-T), `lfm2-audio` (ASR + TTS + S2S in one model), `moss-audio` (audio understanding + ASR), `mini-omni2` (ASR + TTS + S2S), `kugelaudio` (7B audio understanding). See [`docs/feature-matrix.md`](docs/feature-matrix.md) for the full 76-backend matrix. **TTS-only backends** (`kokoro`, `qwen3-tts` + variants, `omnivoice`, `vibevoice-tts`, `orpheus` + DE variants, `chatterbox` / `chatterbox-turbo` / `kartoffelbox-turbo` / `lahgtna-chatterbox`, `dia`, `bark`, `outetts`, `zonos`, `csm`, `f5-tts`, `parler-tts`, `speecht5`, `piper`, `fastpitch`, `pocket-tts`, `melotts`, `cosyvoice3`, `voxcpm2`, `tada-tts`) carry the TTS cap; registry-backed TTS backends also carry AUTO_DOWNLOAD. `omnivoice` is vendored but currently manual-path only: pass the LM GGUF with `-m` and the codec GGUF with `--codec-model`. Per-backend cloning + voice-pack support is documented in the [Text-to-Speech models](#text-to-speech-models) table above and [`docs/tts.md`](docs/tts.md). The vibevoice and lfm2-audio columns mark dual-mode (ASR + TTS) backends.
 
 **Key:** ✔ = native/built-in, `-am` = via CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`), **LID** = via external language identification pre-step (`-l auto`), **pp** = via `--punc-model` post-processor (FireRedPunc or fullstop-punc), * = experimental or partial support, † = PLUS variant only (native `[T:N]` word timestamps with `-owts`; base uses `-am`). granite-4.1 covers both the regular and `-plus` variants; granite-4.1-nar is a non-autoregressive variant with encoder+projector only (no LLM decode features). The **KV quant** row marks backends that honor `CRISPASR_KV_QUANT={f16,q8_0,q4_0}` — CTC-style backends without a KV cache (parakeet, fc-ctc, wav2vec2, kyutai-stt, firered, moonshine variants, omniasr-CTC) don't apply. The same backends also honor the per-half `CRISPASR_KV_QUANT_K` / `CRISPASR_KV_QUANT_V` overrides (llama.cpp `--cache-type-k` / `--cache-type-v` parity) for asymmetric K-vs-V precision; common recipe `K=q8_0 V=q4_0` saves ~40 % more KV memory than symmetric Q8_0. The **mmap weights** row marks backends consuming `core_gguf::load_weights()` and therefore honoring `CRISPASR_GGUF_MMAP=1`; whisper itself uses upstream's loader and is unaffected. See [`docs/cli.md`](docs/cli.md) Memory footprint for usage + recommended combos.
 
@@ -644,6 +646,15 @@ crispasr --backend cosyvoice3-tts -m auto --tts "Hello world" --tts-output cosy.
 # CosyVoice3 fast mode: 5 flow steps instead of the quality-default 10
 COSYVOICE3_FLOW_STEPS=5 crispasr --backend cosyvoice3-tts -m auto \
   --tts "Hello world" --tts-output cosy-fast.wav
+
+# OmniVoice manual GGUF pair. On Vulkan, the default is tuned for realtime
+# with 16 MaskGIT steps; pass --tts-steps 20 for the quality default.
+crispasr --backend omnivoice \
+  -m omnivoice-base-BF16.gguf \
+  --codec-model omnivoice-tokenizer-BF16.gguf \
+  --gpu-backend vulkan \
+  --tts "Hello from OmniVoice." \
+  --tts-output omnivoice.wav
 
 # Persistent HTTP server, OpenAI-compatible
 crispasr --server -m model.gguf --port 8080

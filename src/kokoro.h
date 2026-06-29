@@ -71,6 +71,13 @@ void kokoro_set_length_scale(struct kokoro_context* ctx, float scale);
 // `kokoro_voice.name` metadata. Returns 0 on success.
 int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* path);
 
+// Full Kokoro GGUFs can embed multiple voices as `voices.<id>.style`
+// tensors. These helpers expose the loaded voice ids and select one by id.
+// Loading a separate voice pack later overrides the embedded selection.
+int kokoro_embedded_voice_count(struct kokoro_context* ctx);
+const char* kokoro_embedded_voice_id(struct kokoro_context* ctx, int index);
+int kokoro_select_embedded_voice(struct kokoro_context* ctx, const char* voice_id);
+
 // Override the espeak-ng language (default "en-us"). Returns 0 on success.
 int kokoro_set_language(struct kokoro_context* ctx, const char* espeak_lang);
 
