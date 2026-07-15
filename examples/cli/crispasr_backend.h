@@ -68,6 +68,14 @@ struct crispasr_segment {
     std::string itn_flag;    // "withitn" or "woitn"
 };
 
+struct crispasr_ctc_logits {
+    int n_frames = 0;
+    int n_vocab = 0;
+    std::vector<float> data;        // frame-major: data[t * n_vocab + v]
+    std::string normalization;      // "logits" or "log_probs"
+    std::vector<std::string> vocab; // optional raw token pieces indexed by id
+};
+
 // ---------------------------------------------------------------------------
 // Capability bitmask
 // ---------------------------------------------------------------------------
@@ -127,6 +135,12 @@ public:
     // offset).
     virtual std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                                      const whisper_params& params) = 0;
+
+    // Optional per-frame dense CTC grid captured by the most recent transcribe()
+    // when params.return_logits is true. Backends that do not produce a dense
+    // CTC grid return nullptr. The pointer is owned by the backend and valid
+    // until the next transcribe() / shutdown().
+    virtual const crispasr_ctc_logits* last_ctc_logits() const { return nullptr; }
 
     // Optional stereo-aware overload for backends that can split stereo
     // channels for diarization (currently: whisper). Default
@@ -204,6 +218,14 @@ public:
     // override this to get silence-bounded segments that match training.
     virtual bool prefers_vad() const { return false; }
 
+    // Maximum VAD slice duration (seconds) the backend can decode reliably
+    // in one pass; 0 = unbounded. VAD merges continuous speech into slices
+    // as long as the speech runs (40 s+ on podcast audio) — issue #89:
+    // parakeet-ja's encoder collapses past ~12 s, so slices are re-split at
+    // energy minima down to this cap before transcription. Only applied on
+    // the VAD path when the user didn't pass an explicit --chunk-seconds.
+    virtual int vad_slice_cap_seconds() const { return 0; }
+
     // Streaming transcription callback type.
     // Called with partial text (empty string counts as keep-alive)
     // and is_final flag. When is_final is true, partial_text is the
@@ -257,6 +279,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 // key using gguf_init_from_file() and maps it to a backend name. Returns
 // an empty string if detection fails.
 std::string crispasr_detect_backend_from_gguf(const std::string& model_path);
+
+// True if the GGUF at model_path is a pure-CTC FastConformer model (no RNN-T
+// decoder/joint tensors) — i.e. a parakeet-ctc / stt_*_fastconformer_ctc that must
+// run on the fastconformer-ctc backend, not the parakeet (transducer) backend.
+// Cheap: reads tensor infos only (no weights). Returns false on any read failure.
+bool crispasr_gguf_is_pure_ctc(const std::string& model_path);
 
 // List the backend names that were compiled into this binary.
 std::vector<std::string> crispasr_list_backends();

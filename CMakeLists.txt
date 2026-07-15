@@ -31,6 +31,10 @@ endif()
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
+# C2PA (Content Credentials) enablement — defines crispasr_enable_c2pa(<target>),
+# called for both the core lib (src/) and the CLI (examples/cli/).
+include(CrispasrC2pa)
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -58,13 +62,19 @@ if (EMSCRIPTEN)
 
     option(CRISPASR_WASM            "crispasr: build WASM/JS target (Emscripten)"              ON)
     option(CRISPASR_WASM_SINGLE_FILE "crispasr: embed WASM inside the generated crispasr.js"   ON)
+    # Single-threaded WASM: no pthreads, so NO SharedArrayBuffer / COOP-COEP required, and no
+    # blocking-compute deadlock when driven from a Web Worker. Slower (1 thread), but it just runs
+    # anywhere. Multithreaded (-pthread) stays the default.
+    option(CRISPASR_WASM_SINGLE_THREAD "crispasr: single-threaded WASM (no pthreads, no COOP/COEP)" OFF)
 
     # Multithreaded WASM: -pthread enables SharedArrayBuffer-based threading
     # in the browser. The hosting page MUST set COOP/COEP headers:
     #   Cross-Origin-Opener-Policy: same-origin
     #   Cross-Origin-Embedder-Policy: require-corp
-    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+    if (NOT CRISPASR_WASM_SINGLE_THREAD)
+        set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+    endif()
 
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s TOTAL_STACK=5242880")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -s TOTAL_STACK=5242880")
@@ -97,6 +107,15 @@ option(CRISPASR_SANITIZE_THREAD    "crispasr: enable thread sanitizer"    OFF)
 option(CRISPASR_SANITIZE_ADDRESS   "crispasr: enable address sanitizer"   OFF)
 option(CRISPASR_SANITIZE_UNDEFINED "crispasr: enable undefined sanitizer" OFF)
 
+# libFuzzer harnesses (clang only). Combine with -DCRISPASR_SANITIZE_ADDRESS=ON
+# for OOB detection. `-fsanitize=fuzzer-no-link` instruments every TU compiled
+# after this for coverage; each harness target adds `-fsanitize=fuzzer` for the
+# libFuzzer driver. See tests/fuzz/.
+option(CRISPASR_FUZZ "crispasr: build libFuzzer harnesses (clang only)" OFF)
+if (CRISPASR_FUZZ)
+    add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
+
 # extra artifacts
 option(CRISPASR_BUILD_TESTS    "crispasr: build tests"          ${CRISPASR_STANDALONE})
 option(CRISPASR_BUILD_EXAMPLES "crispasr: build examples"       ${CRISPASR_STANDALONE})
@@ -115,6 +134,7 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     option(CRISPASR_FFMPEG "crispasr: support building and linking with ffmpeg libs (avcodec, swresample, ...)" OFF)
 endif()
 
+option(CRISPASR_MEDIA_NDK              "crispasr: enable Android Media NDK (auto-detected)" ON)
 option(CRISPASR_COREML                "crispasr: enable Core ML framework"  OFF)
 option(CRISPASR_COREML_ALLOW_FALLBACK "crispasr: allow non-CoreML fallback" OFF)
 option(CRISPASR_OPENVINO              "crispasr: support for OpenVINO"      OFF)
@@ -161,6 +181,11 @@ set(GGML_SANITIZE_ADDRESS   ${CRISPASR_SANITIZE_ADDRESS})
 set(GGML_SANITIZE_UNDEFINED ${CRISPASR_SANITIZE_UNDEFINED})
 set(GGML_ALL_WARNINGS       ${CRISPASR_ALL_WARNINGS})
 set(GGML_FATAL_WARNINGS     ${CRISPASR_FATAL_WARNINGS})
+
+# §232: Enable tinyBLAS/llamafile GEMM by default — ~15-29% faster CPU encoder
+# matmuls across all backends. transcribe.cpp forces this ON; ggml defaults OFF.
+# No risk: tinyBLAS is a drop-in SIMD-optimized GEMM replacement.
+set(GGML_LLAMAFILE_DEFAULT ON)
 
 # transition helpers
 function (crispasr_option_depr TYPE OLD NEW)
@@ -280,6 +305,12 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/crispasr.pc"
 #
 # programs, examples and tests
 #
+
+# glint — our clean-room MP3 encoder (in-tree copy of the sibling glint
+# project, MP3 core only) for TTS output (server response_format=mp3,
+# CLI --tts-output *.mp3). Static lib, only built when a consumer
+# (cli/server/tests) links it.
+add_subdirectory(glint EXCLUDE_FROM_ALL)
 
 add_subdirectory(crisp_audio)
 

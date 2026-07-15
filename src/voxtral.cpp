@@ -18,6 +18,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -493,6 +494,7 @@ static void voxtral_fft(float* in, int N, float* out) {
 #include "core/mel.h"
 #include "core/ffn.h"
 #include "core/attention.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -835,7 +837,7 @@ extern "C" voxtral_context* voxtral_init_from_file(const char* path, voxtral_con
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -859,6 +861,7 @@ extern "C" voxtral_context* voxtral_init_from_file(const char* path, voxtral_con
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1229,11 +1232,14 @@ extern "C" float* voxtral_run_encoder(voxtral_context* ctx, const float* mel_fea
         return nullptr;
     }
 
-    // §176s: reuse cached encoder graph (topology is always fixed at T_mel=3000).
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
         ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
         ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
         ctx->cached_enc_ctx = ggml_init(aip);

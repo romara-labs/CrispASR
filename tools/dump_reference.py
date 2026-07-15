@@ -92,7 +92,19 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    # dots.tts (rednote-hilab/dots.tts-soar) TTS: Qwen2.5-1.5B LLM +
+    # 18L DiT flow-matching head + 24L VAESemanticEncoder (PatchEncoder)
+    # + BigVGAN vocoder. The C++ diff branch ("dots-tts") validates the
+    # PatchEncoder decode_patch in isolation (penc_in_patch0 -> penc_out_patch0).
+    # Text comes from $DOTS_TEXT; the --audio arg is ignored (TTS).
+    "dots-tts":   "reference_backends.dots_tts_reference",
+    # MOSS-TTS-v1.5 (MossTTSDelay) TTS: Qwen3-8B backbone + 32 RVQ codebooks
+    # under a delay pattern + 1.6B transformer codec. The greedy code grid
+    # ("codes") is the Phase-3 byte-parity target; "waveform" (needs the codec)
+    # is the Phase-4 decoded reference. Text from $MOSS_TTS_TEXT; --audio ignored.
+    "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
+    "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
     "granite":    "reference_backends.granite",
@@ -117,6 +129,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # branch ("canary") compares mel_spectrogram + encoder_output; the
     # per-layer captures listed in DEFAULT_STAGES are diagnostic-only.
     "canary":     "reference_backends.canary",
+    "canary-qwen": "reference_backends.canary_qwen",
     "gemma4":     "reference_backends.gemma4",
     # Qwen3-TTS-12Hz Base. The audio arg is the voice-clone reference WAV
     # (16 kHz mono); synth text + ref text come from env vars. See
@@ -131,6 +144,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Qwen3-TTS-Tokenizer-12Hz codec ENCODER (audio → codes).
     # model_dir = the Tokenizer-12Hz HF snapshot. audio is unused.
     "qwen3-tts-cenc":  "reference_backends.qwen3_tts_cenc",
+    # OmniVoice: k2-fsa/OmniVoice — Qwen3 + masked iterative TTS.
+    # model_dir = k2-fsa/OmniVoice (HF id) or local snapshot.
+    # audio arg is unused (TTS). Text from OMNIVOICE_SYN_TEXT env.
+    "omnivoice":  "reference_backends.omnivoice",
     # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.
@@ -147,6 +164,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = the MiMo-V2.5-ASR HF snapshot. The audio-tokenizer path
     # is read from MIMO_TOKENIZER_DIR (or auto-derived from a sibling dir).
     "mimo-asr":   "reference_backends.mimo_asr",
+    # ARK-ASR-3B: Whisper-RoPE encoder + MLP adapter + Qwen2.5-3B decoder.
+    "arkasr":     "reference_backends.arkasr",
+    "ark-asr":    "reference_backends.arkasr",
     # Kokoro / StyleTTS2 (iSTFTNet). Text-driven; the audio arg is a
     # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
     # env vars (see reference_backends/kokoro.py for the full list).
@@ -245,6 +265,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # dir. GitHub source (modeling code) expected at ref/moss_audio/github/
     # or via MOSS_AUDIO_GITHUB env. Prompt from MOSS_AUDIO_PROMPT env.
     "moss-audio":  "reference_backends.moss_audio",
+    # MOSS-Transcribe-preview-2B: Qwen3-Omni audio encoder + GatedMLP adapter +
+    # Qwen3-1.7B LM. Ships modeling+processing code (no GitHub clone needed).
+    # model_dir = OpenMOSS-Team/MOSS-Transcribe-preview-2B HF id or local dir.
+    "moss-transcribe": "reference_backends.moss_transcribe",
     # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
@@ -276,6 +300,23 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
     # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
     "mini-omni2": "reference_backends.mini_omni2",
+    # Irodori-TTS (Aratako/Irodori-TTS-500M-v3): RF-DiT flow matching TTS.
+    # model_dir = HF id or local .safetensors. Audio arg is unused (TTS).
+    # Text from IRODORI_TEST_TEXT env (default "こんにちは、世界。").
+    # Captures text_state, cond_embed, dit_block_0, v_pred_step0.
+    "irodori-tts": "reference_backends.irodori_tts",
+    # kyutai/stt-1b-en_fr and kyutai/stt-2.6b-en.
+    # Captures: pcm_24k, seanet_output, enc_tfm_output, downsampled,
+    # rvq_codes, lm_frame0_logits, generated_text.
+    # Requires: safetensors sentencepiece scipy moshi
+    "kyutai-stt":  "reference_backends.kyutai_stt",
+    # mistralai/Voxtral-4B-TTS-2603. Three-component TTS:
+    # Ministral-3B AR + 3L FM transformer + codec decoder → 24 kHz PCM.
+    # Text from VOXTRAL_TTS_TEXT env, voice from VOXTRAL_TTS_VOICE env.
+    "voxtral-tts": "reference_backends.voxtral_tts",
+    # MOSS-Transcribe-Diarize: Whisper-Medium encoder + VQAdaptor + Qwen3-0.6B.
+    # Joint ASR + diarization + timestamps. model_dir = OpenMOSS-Team/MOSS-Transcribe-Diarize.
+    "moss-diarize": "reference_backends.moss_diarize",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

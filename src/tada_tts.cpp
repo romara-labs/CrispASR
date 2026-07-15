@@ -9,6 +9,7 @@
 #include "core/attention.h"
 #include "core/ffn.h"
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -19,6 +20,7 @@
 #include <cassert>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -221,8 +223,14 @@ struct tada_context {
         std::vector<uint8_t> meta;
         ggml_cgraph* gf = nullptr;
     };
-    static constexpr int kBucketN = 4;
-    static constexpr int kBucketLks[kBucketN] = {512, 1024, 2048, 4096};
+    // §215b follow-up: smaller buckets prepended for short generations. The
+    // eligible floor is gated at runtime (tada_pick_bucket): backend-conditional
+    // by default (64 on Metal/CPU where a tighter Lk is a measured byte-identical
+    // win, 512 on discrete GPU where it is marginal + not bit-identical), and
+    // CRISPASR_TADA_BUCKET_MIN overrides. On CUDA the 512 floor keeps {64,128,256}
+    // inert, reproducing the original §176b set byte-for-byte.
+    static constexpr int kBucketN = 7;
+    static constexpr int kBucketLks[kBucketN] = {64, 128, 256, 512, 1024, 2048, 4096};
     std::array<TadaBucket, kBucketN> ar_buckets{};
     ggml_backend_sched_t ar_step_sched = nullptr;
 
@@ -531,9 +539,14 @@ static ggml_cgraph* build_graph_talker_kv(tada_context* c, int n_past, int n_tok
         ggml_set_input(causal_mask);
     }
 
-    const core_attn::KvSelfAttnParams kvp = {
+    core_attn::KvSelfAttnParams kvp = {
         n_q, n_kv, hd, n_kv_grp, (int)hp.max_pos, theta, 0.0f, 0.0f, attn_scale, 0.0f, core_attn::GQA_MANUAL_CONT,
     };
+    // On the native Vulkan path the F16 KV cache can't be GQA-expanded: Vulkan has
+    // no REPEAT f16→f16 pipeline (aborts "Missing op: REPEAT for f16 to f16" on
+    // both RADV and MoltenVK; #192). Force the cache read up to F32 so the GQA
+    // repeat lowers to a supported F32 REPEAT. Metal/CPU keep the F16 fast path.
+    kvp.force_kv_read_f32 = c->vulkan_native;
 
     ggml_tensor* eff_kv_indices = fixed_kv_len > 0 ? positions : nullptr;
 
@@ -1149,10 +1162,42 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
 }
 
 // §176b: Lk-bucketed single-step AR decode helpers.
+// §215b: default bucket floor, chosen by backend. Metal + CPU -> 64 (a tighter Lk
+// is a MEASURED byte-identical win there: the -inf-masked padding is Lk-invariant
+// AND those backends reduce it deterministically, so a shorter/tighter attention
+// is output-identical, just faster — Metal 1.07-1.21x). Discrete GPU backends
+// (CUDA/ROCm/Vulkan/WebGPU) -> 512: their parallel reduction ORDER over the masked
+// padding makes the output NOT bit-identical across a bucket-width change (benign
+// FP, still intelligible) and the win is marginal (CUDA A/B 1.02-1.06x), so their
+// default output is left byte-for-byte unchanged. CRISPASR_TADA_BUCKET_MIN overrides.
+static int tada_default_bucket_min(tada_context* c) {
+    if (!c->backend || ggml_backend_is_cpu(c->backend))
+        return 64;
+    const char* name = ggml_backend_name(c->backend);
+    if (name && (strstr(name, "CUDA") || strstr(name, "ROCm") || strstr(name, "Vulkan") || strstr(name, "WebGPU") ||
+                 strstr(name, "Kompute")))
+        return 512;
+    return 64; // Metal (and any other deterministic / CPU-like backend)
+}
+
 static int tada_pick_bucket(tada_context* c, int needed_lk) {
-    for (int i = 0; i < tada_context::kBucketN; i++)
-        if (tada_context::kBucketLks[i] >= needed_lk && tada_context::kBucketLks[i] <= c->kv_max_ctx)
+    // §215b follow-up: smallest ELIGIBLE bucket. Buckets below the floor are gated
+    // out. CRISPASR_TADA_BUCKET_MIN overrides; otherwise the floor is backend-
+    // conditional (tada_default_bucket_min). A tighter floor lets a short
+    // generation (n_past << 512) use a tighter Lk and waste far less padded
+    // attention — masked to -inf, so output-neutral on the deterministic backends.
+    static const int s_env_min = []() {
+        const char* e = std::getenv("CRISPASR_TADA_BUCKET_MIN");
+        return (e && e[0]) ? atoi(e) : -1;
+    }();
+    const int floor = (s_env_min >= 0) ? s_env_min : tada_default_bucket_min(c);
+    for (int i = 0; i < tada_context::kBucketN; i++) {
+        const int lk = tada_context::kBucketLks[i];
+        if (lk < floor)
+            continue;
+        if (lk >= needed_lk && lk <= c->kv_max_ctx)
             return i;
+    }
     return -1;
 }
 
@@ -1239,7 +1284,14 @@ static talker_result run_talker_kv_bucket(tada_context* c, const float* embeds, 
 static talker_result run_talker_kv(tada_context* c, const float* embeds, int n_tokens, int n_past, bool need_logits,
                                    ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
     // §176b: Lk-bucketed fast path for single-step decode on default KV.
-    if (n_tokens == 1 && !use_kv_k && !use_kv_v) {
+    // §215b diagnostic: CRISPASR_TADA_NO_BUCKET=1 forces the positive pass through
+    // the exact-Lk path (same as the CFG negative pass) to isolate how much of the
+    // pos/neg per-call asymmetry is the bucket's padded-attention (Lk>=512) width.
+    static const bool s_no_bucket = []() {
+        const char* e = std::getenv("CRISPASR_TADA_NO_BUCKET");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (!s_no_bucket && n_tokens == 1 && !use_kv_k && !use_kv_v) {
         talker_result br = run_talker_kv_bucket(c, embeds, n_past, need_logits);
         if (br.hidden)
             return br;
@@ -1794,12 +1846,89 @@ static bool fm_solve_rank_candidates(tada_context* c, const float* all_noise, in
         }
     }
 
+    // Candidate selection (#192). The reconstruction ("likelihood") scorer above
+    // looks at the ACOUSTIC dims only, so it is blind to — and can even PREFER —
+    // a candidate whose gray-code *duration* is an outlier (good acoustics, bad
+    // timing). That is exactly how best-of-N picked a token with a 43-frame gap
+    // and derailed "…four hours" into "…and forth", making cand>1 worse than a
+    // single draw. So the DEFAULT selector is duration_median (a Python-provided
+    // scorer): decode each candidate's per-token duration (time_before +
+    // time_after) and keep the one closest to the median of the N. Per token the
+    // candidates share the same text, so the median duration is the robust pick
+    // and drops the FM noise lottery's timing outliers — which is the whole
+    // point of drawing >1 candidate. Measured: cand=4 likelihood → "and forth";
+    // cand=4 duration_median → verbatim "four hours".
+    // cand>1 candidate selection (#192). IMPORTANT: cand>1 is an inherently
+    // unstable per-token lottery — no scorer beats cand=1 on all inputs (that
+    // is why cand=1 is the default num_acoustic_candidates). Measured on
+    // 1b/q4_k, best-of-4:
+    //   likelihood       reconstruction (acoustic) only — picks a timing
+    //                    outlier: "four hours" -> "and forth".
+    //   duration_median  closest-to-median duration only — fixes "four hours"
+    //                    but can pick an acoustically bad draw elsewhere
+    //                    ("hello world" -> "elleworld").
+    //   hybrid           duration-inlier then best reconstruction — fixes
+    //                    "hello world"/"count" but not "four hours".
+    // The cand>1 DEFAULT is duration_median: it repairs the #192 reported case
+    // and the FM noise lottery's timing collapse (the whole reason to draw >1),
+    // which is what cand>1 is for. CRISPASR_TADA_SCORER=likelihood|hybrid A/Bs
+    // the others. For guaranteed-best quality, use cand=1 (the default).
+    static const int s_scorer = []() {
+        const char* e = std::getenv("CRISPASR_TADA_SCORER");
+        if (e && strcmp(e, "likelihood") == 0)
+            return 1;
+        if (e && strcmp(e, "hybrid") == 0)
+            return 0;
+        return 2; // duration_median (cand>1 default)
+    }();
+
+    const int nbits = (int)c->hp.num_time_bits;
+    std::vector<int> dur(N);
+    for (int cnd = 0; cnd < N; cnd++) {
+        const float* s = states.data() + (size_t)cnd * lat;
+        dur[cnd] = decode_gray_code(s + ad, nbits) + decode_gray_code(s + ad + nbits, nbits);
+    }
+    std::vector<int> sorted_dur = dur;
+    std::sort(sorted_dur.begin(), sorted_dur.end());
+    const int median = sorted_dur[N / 2];
+
     int best = 0;
-    double best_err = err[0];
-    for (int cnd = 1; cnd < N; cnd++) {
-        if (err[cnd] < best_err) {
-            best_err = err[cnd];
-            best = cnd;
+    if (s_scorer == 2) {
+        // Pure duration_median: closest to median (ties → lower recon error).
+        int best_gap = INT_MAX;
+        double best_err = 3.4e38;
+        for (int cnd = 0; cnd < N; cnd++) {
+            int g = std::abs(dur[cnd] - median);
+            if (g < best_gap || (g == best_gap && err[cnd] < best_err)) {
+                best_gap = g;
+                best_err = err[cnd];
+                best = cnd;
+            }
+        }
+    } else {
+        // Likelihood (s_scorer==1) over all candidates, or hybrid (default):
+        // best recon error among duration inliers (|dur-median| within a tight
+        // band that drops a ~43-vs-~13 gap but keeps normal variation).
+        const int band = std::max(6, median);
+        double best_err = 3.4e38;
+        best = -1;
+        for (int cnd = 0; cnd < N; cnd++) {
+            if (s_scorer == 0 && std::abs(dur[cnd] - median) > band)
+                continue;
+            if (err[cnd] < best_err) {
+                best_err = err[cnd];
+                best = cnd;
+            }
+        }
+        if (best < 0) { // degenerate: all outside band — take closest-to-median
+            int best_gap = INT_MAX;
+            for (int cnd = 0; cnd < N; cnd++) {
+                int g = std::abs(dur[cnd] - median);
+                if (g < best_gap) {
+                    best_gap = g;
+                    best = cnd;
+                }
+            }
         }
     }
     std::copy(states.data() + (size_t)best * lat, states.data() + (size_t)(best + 1) * lat, best_out);
@@ -1976,7 +2105,7 @@ struct tada_context* tada_init_from_file(const char* path_model, struct tada_con
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, params.n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend)
         c->backend = c->backend_cpu;
 
@@ -2713,12 +2842,46 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // Starts at prefill_len when batched prefill ran, otherwise at 0.
     const int loop_start = do_batch_prefill ? prefill_len : 0;
 
-    // Main AR loop: runs until EOS or max_tokens.
-    // After the batched prefill, the loop starts at prefill_len and continues
-    // until EOS is predicted. The initial all_ids contains the fixed input
-    // tokens; the loop extends it one token at a time as the model generates.
+    // Match Python's _generate() behaviour (#192): run for exactly
+    // num_prompt steps, never auto-regressively generate text tokens,
+    // never stop early on EOS.  Python's generate() calls _generate with
+    // num_steps = input_ids.shape[-1] + num_extra_steps where num_extra_steps
+    // defaults to 0, and input_ids already carries shift (5) trailing EOTs
+    // baked in by _add_bos_eos (num_eos_tokens == shift_acoustic).  Those
+    // trailing EOTs *are* the text→acoustic tail: they run the extra decode
+    // steps that flush acoustic features for the final real tokens.  So the
+    // faithful default is extra_steps = 0 (total_steps == num_prompt).  An
+    // earlier fix added extra = shift here on top of the already-present EOTs,
+    // over-generating by 5 steps and appending trailing junk frames after the
+    // last word (ASR "…four hours" → "…for out").  The real bug it chased was
+    // the early EOS-stop below (now removed), not a missing tail.
+    // CRISPASR_TADA_EXTRA_STEPS overrides (default 0 = exact Python).
+    static const int s_extra_steps = []() {
+        const char* e = std::getenv("CRISPASR_TADA_EXTRA_STEPS");
+        return e && e[0] ? atoi(e) : -1;
+    }();
+    const int extra_steps = (s_extra_steps >= 0) ? s_extra_steps : 0;
+    const int total_steps = num_prompt + extra_steps;
+
+    // §215b STEP-0 instrumentation: measure whether the talker (AR backbone,
+    // run twice/step for CFG) is dispatch-bound + a dominant fraction of per-step
+    // wall time — the precondition for a batched-CFG (B=2) port paying off.
+    // Gated CRISPASR_TADA_TALKER_TIMING=1 (measurement only, no graph change).
+    static const bool s_talker_timing = []() {
+        const char* e = std::getenv("CRISPASR_TADA_TALKER_TIMING");
+        return e && e[0] && e[0] != '0';
+    }();
+    int64_t t_talker_pos_us = 0, t_talker_neg_us = 0, t_loop_us = 0;
+    int n_talker_pos = 0, n_talker_neg = 0;
+    // Isolate the one-time lazy bucket/graph BUILD (folded into the first call of
+    // each pass) so the steady-state per-call cost — the only thing a B=2 batch
+    // can shrink — is reported separately from cold build amortization.
+    int64_t t_talker_pos_first_us = 0, t_talker_neg_first_us = 0;
+    const int64_t t_loop_start_us = s_talker_timing ? ggml_time_us() : 0;
+
+    // Main AR + FM loop: runs for exactly total_steps steps.
     bool done = false;
-    for (int step = loop_start; step < (int)all_ids.size() && !done; step++) {
+    for (int step = loop_start; step < total_steps && !done; step++) {
         if ((int)acoustic_features.size() >= max_tokens)
             break;
 
@@ -2737,7 +2900,15 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         }
 
         // LLM forward (positive — uses real tokens)
+        const int64_t t_pos0 = s_talker_timing ? ggml_time_us() : 0;
         talker_result tr = run_talker_kv(ctx, emb, 1, n_past, need_logits);
+        if (s_talker_timing) {
+            const int64_t dt = ggml_time_us() - t_pos0;
+            if (n_talker_pos == 0)
+                t_talker_pos_first_us = dt;
+            t_talker_pos_us += dt;
+            n_talker_pos++;
+        }
         free(emb);
         if (!tr.hidden) {
             fprintf(stderr, "tada: talker failed at step %d\n", step);
@@ -2757,7 +2928,15 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             float* neg_emb =
                 build_step_embedding(ctx, neg_token, cur_acoustic.data(), cur_mask, cur_t_before, cur_t_after);
             if (neg_emb) {
+                const int64_t t_neg0 = s_talker_timing ? ggml_time_us() : 0;
                 talker_result neg_tr = run_talker_kv(ctx, neg_emb, 1, n_past, false, ctx->kv_neg_k, ctx->kv_neg_v);
+                if (s_talker_timing) {
+                    const int64_t dt = ggml_time_us() - t_neg0;
+                    if (n_talker_neg == 0)
+                        t_talker_neg_first_us = dt;
+                    t_talker_neg_us += dt;
+                    n_talker_neg++;
+                }
                 free(neg_emb);
                 neg_hidden = neg_tr.hidden; // caller frees
             }
@@ -2909,19 +3088,18 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             fm_dump_records.push_back(std::move(fm_rec));
         }
 
-        // Next token prediction. Greedy by default (library); the CLI/C-ABI
-        // enable upstream sampling (repetition penalty + temperature + top-k/
-        // top-p). After the last fixed-input token, push generated tokens to
-        // all_ids so the loop extends until EOS.
+        // Auto-regressive text generation — matches Python exactly (#192).
+        // Python samples the next token at every step >= len(input_ids)-1,
+        // appends it to input_ids, and uses it as input for the next step.
+        // It NEVER stops on EOS — the loop runs for the full num_steps.
+        // The generated token feeds back into the LLM, affecting the hidden
+        // state that conditions the FM.  Removing this (feeding fixed EOTs
+        // instead) produces different hidden states and worse acoustics.
         if (need_logits && tr.logits) {
             int next = tada_sample_token(ctx->params, tr.logits, (int)hp.vocab_size, all_ids, pad_id, sampler_rng);
-            if (next == eot) {
-                if (ctx->params.verbosity >= 1)
-                    fprintf(stderr, "tada: EOS at step %d\n", step);
-                done = true; // stop after this step's acoustic state is updated
-            } else {
-                all_ids.push_back(next);
-            }
+            all_ids.push_back(next);
+            if (next == eot && ctx->params.verbosity >= 1)
+                fprintf(stderr, "tada: text head predicts EOS at step %d (continuing)\n", step);
         }
         free(tr.logits);
 
@@ -2991,6 +3169,38 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         }
 
         free(tr.hidden);
+    }
+
+    if (s_talker_timing) {
+        t_loop_us = ggml_time_us() - t_loop_start_us;
+        const double loop_ms = t_loop_us / 1e3;
+        const double pos_ms = t_talker_pos_us / 1e3;
+        const double neg_ms = t_talker_neg_us / 1e3;
+        const double talker_ms = pos_ms + neg_ms;
+        const int n_steps = n_talker_pos > 0 ? n_talker_pos : 1;
+        // Steady-state (exclude the first, build-inflated call of each pass).
+        const double pos_first_ms = t_talker_pos_first_us / 1e3;
+        const double neg_first_ms = t_talker_neg_first_us / 1e3;
+        const double pos_ss_ms = n_talker_pos > 1 ? (pos_ms - pos_first_ms) / (n_talker_pos - 1)
+                                                  : pos_ms / (n_talker_pos > 0 ? n_talker_pos : 1);
+        const double neg_ss_ms = n_talker_neg > 1 ? (neg_ms - neg_first_ms) / (n_talker_neg - 1)
+                                                  : neg_ms / (n_talker_neg > 0 ? n_talker_neg : 1);
+        // Steady-state talker per step and its share of a per-step loop time that
+        // ALSO excludes the cold first step (loop minus both first calls, /N-1).
+        const double talker_ss_step_ms = pos_ss_ms + neg_ss_ms;
+        const double loop_ss_step_ms =
+            n_steps > 1 ? (loop_ms - pos_first_ms - neg_first_ms) / (n_steps - 1) : loop_ms / n_steps;
+        fprintf(stderr,
+                "tada §215b talker timing: loop=%.1fms over %d steps (%.3f ms/step) | "
+                "talker=%.1fms (%.1f%% of loop) | pos=%.1fms/%d (%.3f ms/call, first=%.1f, ss=%.3f) | "
+                "neg=%.1fms/%d (%.3f ms/call, first=%.1f, ss=%.3f)\n"
+                "tada §215b STEADY-STATE: talker=%.3f ms/step (%.1f%% of %.3f ms/step loop) "
+                "[batchable body ~2x neg_ss=%.3f]\n",
+                loop_ms, n_steps, loop_ms / n_steps, talker_ms, loop_ms > 0 ? 100.0 * talker_ms / loop_ms : 0.0, pos_ms,
+                n_talker_pos, n_talker_pos > 0 ? pos_ms / n_talker_pos : 0.0, pos_first_ms, pos_ss_ms, neg_ms,
+                n_talker_neg, n_talker_neg > 0 ? neg_ms / n_talker_neg : 0.0, neg_first_ms, neg_ss_ms,
+                talker_ss_step_ms, loop_ss_step_ms > 0 ? 100.0 * talker_ss_step_ms / loop_ss_step_ms : 0.0,
+                loop_ss_step_ms, 2.0 * neg_ss_ms);
     }
 
     if (acoustic_features.empty()) {
@@ -3113,8 +3323,10 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     }
 
     for (size_t i = 0; i < decode_feats.size(); i++) {
-        // Insert (time - 1) zero frames before this feature
-        int n_zeros = std::max(0, all_times[i] - 1);
+        // Insert (time - 1) zero frames before this feature. all_times and
+        // decode_feats are normally the same length (one duration per acoustic
+        // frame); guard the index so a length mismatch can't read out of bounds.
+        int n_zeros = (i < all_times.size()) ? std::max(0, all_times[i] - 1) : 0;
         for (int z = 0; z < n_zeros; z++) {
             for (int d = 0; d < ad; d++)
                 expanded.push_back(0.0f);

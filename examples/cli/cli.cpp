@@ -10,6 +10,7 @@
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
+#include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -411,6 +412,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
             return false;
         }
         params.lcs_min_length = v;
+    } else if (arg == "--context") {
+        params.context = ARGV_NEXT;
     } else if (arg == "--hotwords") {
         params.hotwords = ARGV_NEXT;
     } else if (arg == "--hotwords-file") {
@@ -435,6 +438,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         } else {
             fprintf(stderr, "warning: cannot open hotwords file '%s'\n", path.c_str());
         }
+    } else if (arg == "--prefix-text") {
+        params.prefix_text = ARGV_NEXT;
     } else if (arg == "--hotwords-boost") {
         params.hotwords_boost = std::stof(ARGV_NEXT);
     } else if (arg == "--warmup") {
@@ -443,6 +448,18 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.no_warmup = true;
     } else if (arg == "--parakeet-decoder") {
         params.parakeet_decoder = ARGV_NEXT;
+    } else if (arg == "--att-context") {
+        // Issue #257: parakeet/canary local-attention window "L,R" (encoder
+        // frames, 1 ≈ 80 ms) — NeMo change_attention_model. Bounds long-audio
+        // encoder memory to O(T·window). "-1,-1" = full attention.
+        const std::string v = ARGV_NEXT;
+        int l = INT_MIN, r = INT_MIN;
+        if (std::sscanf(v.c_str(), "%d,%d", &l, &r) == 2) {
+            params.att_context_left = l;
+            params.att_context_right = r;
+        } else {
+            fprintf(stderr, "crispasr: --att-context expects \"L,R\" (e.g. 128,128 or -1,-1), got '%s'\n", v.c_str());
+        }
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {
@@ -501,6 +518,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.show_alternatives = true;
     } else if (arg == "--alt-n") {
         params.n_alternatives = std::stoi(ARGV_NEXT);
+    } else if (arg == "--return-logits") {
+        params.return_logits = true;
     } else if (arg == "--stream") {
         params.stream = true;
     } else if (arg == "--mic") {
@@ -538,6 +557,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_text = ARGV_NEXT;
     } else if (arg == "--tts-output") {
         params.tts_output = ARGV_NEXT;
+    } else if (arg == "--tts-stream") {
+        params.tts_stream = true;
     } else if (arg == "--voice") {
         params.tts_voice = ARGV_NEXT;
     } else if (arg == "--tts-steps") {
@@ -549,6 +570,18 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         // Also drive the native-knob path (f5 ode_steps, chatterbox cfm_steps),
         // which reads tts_num_steps; previously only vibevoice honoured this.
         params.tts_num_steps = params.tts_steps;
+    } else if (arg == "--tts-cfg-scale") {
+        params.tts_cfg_scale = std::stof(ARGV_NEXT);
+        if (params.tts_cfg_scale < 0.0f)
+            params.tts_cfg_scale = 0.0f;
+        if (params.tts_cfg_scale > 10.0f)
+            params.tts_cfg_scale = 10.0f;
+    } else if (arg == "--tts-speed") {
+        params.tts_speed = std::stof(ARGV_NEXT);
+        if (params.tts_speed <= 0.0f)
+            params.tts_speed = 1.0f;
+        if (params.tts_speed > 4.0f)
+            params.tts_speed = 4.0f;
     } else if (arg == "--codec-model") {
         params.tts_codec_model = ARGV_NEXT;
         std::string auto_base;
@@ -571,6 +604,18 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.make_ref_aligner = ARGV_NEXT;
     } else if (arg == "--make-ref-encoder") {
         params.make_ref_encoder = ARGV_NEXT;
+    } else if (arg == "--align") {
+        params.align = true;
+    } else if (arg == "--align-output") {
+        params.align_output = ARGV_NEXT;
+    } else if (arg == "--align-format") {
+        params.align_format = ARGV_NEXT;
+    } else if (arg == "--align-only") {
+        params.align_only = true;
+    } else if (arg == "--align-granularity") {
+        params.align_granularity = ARGV_NEXT;
+    } else if (arg == "--text-file") {
+        params.text_file = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -594,6 +639,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_consent_attestation = "CLI --i-have-rights flag";
     } else if (arg == "--no-spoken-disclaimer") {
         params.tts_no_spoken_disclaimer = true;
+    } else if (arg == "--no-watermark") {
+        params.tts_no_watermark = true;
     } else if (arg == "--cors-origin") {
         params.server_cors_origin = ARGV_NEXT;
     } else if (arg == "--chat-model") {
@@ -814,6 +861,18 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.split_on_punct ? "true" : "false");
     fprintf(stderr, "  -ml N,     --max-len N            [%-7d] maximum segment length in characters\n",
             params.max_len);
+    fprintf(stderr,
+            "             --hotwords LIST       [%-7s] comma-separated keyword list to bias recognition "
+            "(granite: KWB prompt)\n",
+            params.hotwords.empty() ? "" : params.hotwords.c_str());
+    fprintf(stderr,
+            "             --context TEXT        [%-7s] hotword/context text injected into the prompt "
+            "(vibevoice-asr only)\n",
+            params.context.empty() ? "" : "set");
+    fprintf(stderr,
+            "             --prefix-text TEXT    [%-7s] granite incremental decoding: seed the transcript so "
+            "the model continues from it\n",
+            params.prefix_text.empty() ? "" : "set");
     fprintf(stderr, "  -sow,      --split-on-word        [%-7s] split on word rather than on token\n",
             params.split_on_word ? "true" : "false");
     fprintf(stderr, "  -bo N,     --best-of N            [%-7d] number of best candidates to keep\n", params.best_of);
@@ -945,6 +1004,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --no-auto-aligner      [%-7s] for --backend canary, skip the implicit "
             "`-am auto --force-aligner` default (SubtitleEdit #10775)\n",
             params.no_auto_aligner ? "true" : "false");
+    fprintf(stderr,
+            "             --return-logits         [%-7s] write dense CTC logits as a sidecar "
+            ".ctc-logits.json when supported\n",
+            params.return_logits ? "true" : "false");
     fprintf(
         stderr,
         "  --lid-backend NAME                [%-7s] language-detect backend: whisper|silero|firered (for non-native "
@@ -1089,6 +1152,11 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "             --chunk-overlap F      [%-7.1f] overlap context (sec) at chunk boundaries\n",
             params.chunk_overlap_seconds);
     fprintf(stderr,
+            "             --att-context L,R      [%-7s] parakeet/canary local-attention window in encoder "
+            "frames (~80ms ea) — true windowed attn (O(T*window) mem, NeMo rel_pos_local_attn); "
+            "-1,-1 = full. CRISPASR_FC_WINDOWED_ATTN=0 forces legacy masked-full\n",
+            "model");
+    fprintf(stderr,
             "             --lcs-dedup VAL        [%-7s] sub-word LCS dedup across chunk boundaries: auto|on|off\n",
             params.lcs_dedup.c_str());
     fprintf(stderr,
@@ -1099,14 +1167,18 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "\nSpeech-to-speech (S2S) options:\n");
     fprintf(stderr, "             --s2s                   [%-7s] speech-to-speech mode: audio input → audio output\n",
             params.s2s ? "true" : "false");
-    fprintf(stderr, "             --s2s-output FNAME      [%-7s] output WAV path (default: s2s_output.wav)\n",
+    fprintf(stderr,
+            "             --s2s-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: s2s_output.wav)\n",
             params.s2s_output.c_str());
 
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");
     fprintf(stderr,
-            "             --tts \"TEXT\"            synthesise TEXT and write WAV to --tts-output (24 kHz mono)\n");
-    fprintf(stderr, "             --tts-output FNAME      [%-7s] output WAV path (default: tts_output.wav)\n",
+            "             --tts \"TEXT\"            synthesise TEXT and write audio to --tts-output (24 kHz mono)\n");
+    fprintf(stderr,
+            "             --tts-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: tts_output.wav)\n",
             params.tts_output.c_str());
+    fprintf(stderr, "             --tts-stream            stream s16le mono PCM to stdout per sentence (pipe to a "
+                    "player); logs stay on stderr\n");
     fprintf(stderr,
             "             --voice PATH            [%-7s] voice prompt: GGUF voice pack or reference WAV\n"
             "                                                 (.wav → 1.5B WAV cloning; .gguf → voice pack)\n",
@@ -1115,7 +1187,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --i-have-rights                    required for voice cloning (.wav); attests consent\n"
             "                                                 of the cloned speaker or that it is your own voice\n"
             "             --no-spoken-disclaimer              skip audible AI-disclosure prefix on voice-cloned\n"
-            "                                                 output (watermark + C2PA provenance still applied)\n");
+            "                                                 output (watermark + C2PA provenance still applied)\n"
+            "             --no-watermark                     disable AI-content watermark on TTS output; marking\n"
+            "                                                 responsibility then rests with the operator\n");
     fprintf(stderr,
             "             --ref-text \"TEXT\"        reference transcription (qwen3-tts/f5-tts; auto-transcribed "
             "if omitted)\n");
@@ -1126,7 +1200,19 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(
         stderr,
         "             --make-ref                create a TADA voice reference GGUF (with --voice <audio.wav>\n"
-        "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n");
+        "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n"
+        "                                       (TADA also clones inline: --tts \"…\" --voice ref.wav --ref-text "
+        "\"…\")\n");
+    fprintf(stderr,
+            "             --align                   forced-alignment word timestamps via the TADA aligner\n"
+            "                                                 (--voice <audio.wav> --ref-text \"transcript\"\n"
+            "                                                 [--align-format srt|json|plain] [--align-output f])\n"
+            "             --align-only              standalone CTC forced alignment (issue #217)\n"
+            "                                                 (-am <aligner.gguf> -f <audio> --ref-text \"text\"\n"
+            "                                                 or --text-file <file.txt|file.srt>)\n"
+            "             --align-granularity G     [auto   ] align-only output units: auto|word|segment\n"
+            "                                                 (segment = re-timed input SRT cues / .txt lines;\n"
+            "                                                 auto = segment for .srt input, word otherwise)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -1141,13 +1227,14 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --g2p-dict SOURCE        [%-7s] G2P dict: 'olaph' (MIT), 'open-dict' (CC-BY-SA), or path to "
             "file\n",
             params.g2p_dict.empty() ? "olaph" : params.g2p_dict.c_str());
-    fprintf(stderr, "             --watermark-model PATH           AudioSeal GGUF for neural watermarking "
-                    "(upgrades built-in spread-spectrum)\n");
+    fprintf(stderr, "             --watermark-model PATH|auto      AudioSeal GGUF for neural watermarking "
+                    "('auto' downloads it; upgrades built-in spread-spectrum)\n");
     fprintf(stderr, "             --detect-watermark PATH          read WAV file and detect AI watermark "
                     "(prints confidence + exits)\n");
     fprintf(stderr, "             --c2pa-cert PATH                 X.509 cert for C2PA Content Credentials signing\n"
-                    "             --c2pa-key PATH                  private key for C2PA signing "
-                    "(generate both with scripts/generate-c2pa-cert.sh)\n");
+                    "             --c2pa-key PATH                  private key for C2PA signing. When built with "
+                    "C2PA and no cert is given, WAV/MP3 output is signed by default with a bundled self-signed "
+                    "cert (AAC/Opus can't embed C2PA). Provide your own CA-issued cert for a trusted identity\n");
     fprintf(stderr, "             --cors-origin ORIGIN     server: opt-in CORS for browser clients "
                     "('*' for any, or scheme://host[:port])\n");
     fprintf(stderr, "             --chat-model PATH        server: enable POST /v1/chat/completions backed by "
@@ -1159,8 +1246,20 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --chat-gpu-layers N      [%-7d] server: GPU layers for the chat model "
             "(-1 = all, 0 = CPU only)\n",
             params.chat_n_gpu_layers);
-    fprintf(stderr, "             --tts-steps N            [%-7d] DPM-Solver++ steps (10-20, vibevoice only)\n",
+    fprintf(stderr,
+            "             --tts-steps N            [%-7d] diffusion/ODE steps (vibevoice 10-20; irodori 40; "
+            "chatterbox/f5/tada)\n",
             params.tts_steps);
+    fprintf(
+        stderr,
+        "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada/irodori; "
+        "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
+        "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
+        "default");
+    fprintf(stderr,
+            "             --tts-speed X            [%-7.2f] speaking-rate multiplier (omnivoice/f5/piper/melotts/"
+            "fastpitch): >1 faster/shorter, <1 slower/longer\n",
+            params.tts_speed);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",
@@ -2018,6 +2117,12 @@ int main(int argc, char** argv) {
 
     if (params.use_gpu && params.gpu_backend != "cpu") {
         ggml_backend_load_all();
+        // Issue #214 — propagate --gpu-backend preference so every
+        // backend's init picks the right GPU device instead of the
+        // highest-priority one (CUDA over Vulkan).
+        if (!params.gpu_backend.empty()) {
+            crispasr_set_gpu_backend_pref(params.gpu_backend.c_str());
+        }
     }
 
     // Issue #128 — resolve --hf-repo / --hf-file early, before any
@@ -2109,7 +2214,14 @@ int main(int argc, char** argv) {
         return crispasr_run_backend(params);
     }
 
-    if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty()) {
+    // Issue #217: --align-only is a standalone verb that needs only an aligner
+    // model + audio + text — no ASR backend.
+    if (params.align_only) {
+        return crispasr_run_backend(params);
+    }
+
+    if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty() &&
+        !params.make_ref && !params.align) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;

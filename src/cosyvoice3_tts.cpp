@@ -38,6 +38,7 @@
 #include "core/fft.h"
 #include "core/mel.h"
 #include "core/wav_reader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "chatterbox_campplus.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -969,7 +970,7 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
     // CUDA machines.  All stages use the shared backend scheduler below and
     // can therefore follow their GPU-resident weights, with CPU retained as
     // the fallback for unsupported operations.
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend) {
         if (params.use_gpu && params.verbosity >= 1) {
             fprintf(stderr, "cosyvoice3_tts: GPU backend unavailable, falling back to CPU\n");
@@ -5514,7 +5515,14 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     std::vector<float> x_init = cv3_seeded_gaussian((size_t)T_mel_total * (size_t)mel, /*seed*/ 0);
 
     // ---- 7. Run flow Euler → mel ----
-    int flow_steps = (int)ctx->flow.hp.cfm_n_steps;
+    // §235: audible synthesis defaults to 6 CFM Euler steps — perceptual parity
+    // with the upstream 10 (log-mel corr vs 10-step: 6→0.9925, confirmed across
+    // short/numbers/long + a human listen, 2026-07-11), for ~−40% flow work
+    // (~−19% of the synthesis wall). hp.cfm_n_steps (10) is preserved for the
+    // diff harness / cv3_extract_* stages (which pin 10 to match PyTorch); the
+    // min() also respects a model GGUF that ships fewer steps. Override with
+    // COSYVOICE3_FLOW_STEPS.
+    int flow_steps = std::min((int)ctx->flow.hp.cfm_n_steps, 6);
     if (const char* env_steps = std::getenv("COSYVOICE3_FLOW_STEPS")) {
         char* end = nullptr;
         const long parsed = std::strtol(env_steps, &end, 10);

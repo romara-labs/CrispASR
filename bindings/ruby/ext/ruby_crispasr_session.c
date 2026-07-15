@@ -71,6 +71,7 @@ extern int                     crispasr_session_set_max_speech_tokens(struct Cri
 extern int                     crispasr_session_set_length_scale(struct CrispasrSession* s, float scale);
 extern int                     crispasr_session_set_best_of(struct CrispasrSession* s, int n);
 extern int                     crispasr_session_set_beam_size(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_return_logits(struct CrispasrSession* s, int enable);
 extern int                     crispasr_session_set_grammar_text(struct CrispasrSession* s, const char* gbnf_text,
                                                                   const char* root_rule, float penalty);
 extern int                     crispasr_session_set_fallback_thresholds(struct CrispasrSession* s,
@@ -108,7 +109,22 @@ extern const char*  crispasr_session_result_word_text(struct crispasr_session_re
 extern int64_t      crispasr_session_result_word_t0(struct crispasr_session_result* r, int i_seg, int i_word);
 extern int64_t      crispasr_session_result_word_t1(struct crispasr_session_result* r, int i_seg, int i_word);
 extern float        crispasr_session_result_word_p(struct crispasr_session_result* r, int i_seg, int i_word);
+extern float        crispasr_session_result_segment_no_speech_prob(struct crispasr_session_result* r, int i_seg);
+// Per-frame CTC logits (opted in via set_return_logits) for backends with a
+// dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc); frame-major:
+// logits[t * n_logit_vocab + v]. Raw pre-softmax for Omni & wav2vec2;
+// log-probabilities for canary-ctc. _logits is NULL when none captured. Owned by
+// the result, freed with crispasr_session_result_free.
+extern int          crispasr_session_result_n_logit_frames(struct crispasr_session_result* r);
+extern int          crispasr_session_result_n_logit_vocab(struct crispasr_session_result* r);
+extern const float* crispasr_session_result_logits(struct crispasr_session_result* r);
 extern void         crispasr_session_result_free(struct crispasr_session_result* r);
+// issue #208: chunked-encode transcribe + long-form progress poll.
+extern struct crispasr_session_result* crispasr_session_transcribe_chunked_lang(struct CrispasrSession* s,
+                                                                                const float* pcm, int n_samples,
+                                                                                int chunk_seconds, int overlap_seconds,
+                                                                                const char* language);
+extern int          crispasr_get_progress(void);
 
 // --- Punctuation (PLAN #59) ---
 extern void*        crispasr_punc_init(const char* model_path);
@@ -284,6 +300,12 @@ extern int crispasr_cache_dir_abi(const char* cache_dir_override, char* out_buf,
 
 // Session extras
 extern int crispasr_session_available_backends(char* out_csv, int out_cap);
+extern int crispasr_session_detected_language(struct CrispasrSession* s, char* out_buf, int out_cap);
+// CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
+// maps an id to its model-owned raw piece (do not free) or "" when out of
+// range / unsupported.
+extern int         crispasr_session_n_vocab(struct CrispasrSession* s);
+extern const char* crispasr_session_token_text(struct CrispasrSession* s, int id);
 extern struct CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 extern struct CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const void* params);
 extern struct crispasr_session_result* crispasr_session_transcribe_vad(struct CrispasrSession* s, const float* pcm, int n_samples,
@@ -498,6 +520,16 @@ static VALUE rb_session_set_beam_size(VALUE self, VALUE handle, VALUE n) {
     return Qnil;
 }
 
+// Opt in to capturing the per-frame CTC logits (backends with a dense CTC grid:
+// Omni CTC, wav2vec2/hubert/data2vec, canary-ctc). Off by default so the normal
+// path pays no copy; read them back with transcribe_with_logits.
+static VALUE rb_session_set_return_logits(VALUE self, VALUE handle, VALUE enable) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_return_logits(s, RTEST(enable) ? 1 : 0);
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_return_logits failed (rc=%d)", rc);
+    return Qnil;
+}
+
 // set_grammar_text(handle, gbnf_text, root_rule, penalty)
 // Pass nil or "" for gbnf_text to clear the grammar.
 static VALUE rb_session_set_grammar_text(VALUE self, VALUE handle, VALUE gbnf, VALUE root, VALUE penalty) {
@@ -670,7 +702,10 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
 
     struct crispasr_session_result* r = crispasr_session_transcribe(s, pcm, (int)n);
     free(pcm);
-    if (!r) rb_raise(rb_eRuntimeError, "transcription failed");
+    if (!r) {
+        crispasr_session_set_return_logits(s, 0);
+        rb_raise(rb_eRuntimeError, "transcription failed");
+    }
 
     int n_segs = crispasr_session_result_n_segments(r);
     VALUE segments = rb_ary_new_capa(n_segs);
@@ -680,6 +715,8 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
         rb_hash_aset(seg, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(text ? text : ""));
         rb_hash_aset(seg, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_segment_t0(r, i)));
         rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
+        rb_hash_aset(seg, ID2SYM(rb_intern("no_speech_prob")),
+                     DBL2NUM((double)crispasr_session_result_segment_no_speech_prob(r, i)));
 
         int n_words = crispasr_session_result_n_words(r, i);
         VALUE words = rb_ary_new_capa(n_words);
@@ -697,6 +734,149 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
     }
     crispasr_session_result_free(r);
     return segments;
+}
+
+// CrispASR::Session.transcribe_with_logits(handle, pcm_array)
+//   -> [segments, logits]. segments matches transcribe(); logits is nil for
+//   non-CTC backends (or an empty grid) or a hash
+//   { n_frames:, n_vocab:, data: [Float, ...] } holding the frame-major grid
+//   (data[t * n_vocab + v]; raw logits for Omni & wav2vec2, log-probabilities
+//   for canary-ctc). Opts the session into logit
+//   capture for this call (mirrors set_return_logits(true)).
+static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE pcm_arr) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    crispasr_session_set_return_logits(s, 1);
+    long n = RARRAY_LEN(pcm_arr);
+    float* pcm = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!pcm) rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        pcm[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+
+    struct crispasr_session_result* r = crispasr_session_transcribe(s, pcm, (int)n);
+    free(pcm);
+    if (!r) rb_raise(rb_eRuntimeError, "transcription failed");
+
+    int n_segs = crispasr_session_result_n_segments(r);
+    VALUE segments = rb_ary_new_capa(n_segs);
+    for (int i = 0; i < n_segs; i++) {
+        VALUE seg = rb_hash_new();
+        const char* text = crispasr_session_result_segment_text(r, i);
+        rb_hash_aset(seg, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(text ? text : ""));
+        rb_hash_aset(seg, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_segment_t0(r, i)));
+        rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
+        rb_hash_aset(seg, ID2SYM(rb_intern("no_speech_prob")),
+                     DBL2NUM((double)crispasr_session_result_segment_no_speech_prob(r, i)));
+
+        int n_words = crispasr_session_result_n_words(r, i);
+        VALUE words = rb_ary_new_capa(n_words);
+        for (int j = 0; j < n_words; j++) {
+            VALUE w = rb_hash_new();
+            const char* wt = crispasr_session_result_word_text(r, i, j);
+            rb_hash_aset(w, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(wt ? wt : ""));
+            rb_hash_aset(w, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_word_t0(r, i, j)));
+            rb_hash_aset(w, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_word_t1(r, i, j)));
+            rb_hash_aset(w, ID2SYM(rb_intern("p")), DBL2NUM((double)crispasr_session_result_word_p(r, i, j)));
+            rb_ary_push(words, w);
+        }
+        rb_hash_aset(seg, ID2SYM(rb_intern("words")), words);
+        rb_ary_push(segments, seg);
+    }
+
+    // Lift the CTC logits (Omni CTC, wav2vec2/hubert/data2vec, or canary-ctc)
+    // into a Ruby array before the result — which owns the float buffer — is
+    // freed. Mirrors the synthesize
+    // PCM marshalling.
+    VALUE logits = Qnil;
+    int n_frames = crispasr_session_result_n_logit_frames(r);
+    int n_vocab = crispasr_session_result_n_logit_vocab(r);
+    const float* lg = crispasr_session_result_logits(r);
+    if (n_frames > 0 && n_vocab > 0 && lg) {
+        long total = (long)n_frames * (long)n_vocab;
+        VALUE data = rb_ary_new_capa(total);
+        for (long i = 0; i < total; i++) rb_ary_push(data, DBL2NUM((double)lg[i]));
+        logits = rb_hash_new();
+        rb_hash_aset(logits, ID2SYM(rb_intern("n_frames")), INT2NUM(n_frames));
+        rb_hash_aset(logits, ID2SYM(rb_intern("n_vocab")), INT2NUM(n_vocab));
+        rb_hash_aset(logits, ID2SYM(rb_intern("data")), data);
+    }
+    crispasr_session_result_free(r);
+    crispasr_session_set_return_logits(s, 0);
+
+    VALUE out = rb_ary_new_capa(2);
+    rb_ary_push(out, segments);
+    rb_ary_push(out, logits);
+    return out;
+}
+
+// CrispASR::Session.ctc_vocab(handle) -> [String, ...] or nil
+//   The Omni CTC vocabulary as raw pieces indexed by token id (vocab[id]).
+//   Pieces keep their word-boundary marker intact (v2 uses a literal space, v1
+//   uses U+2581), so a consumer can detokenize a greedy CTC decode over the
+//   transcribe_with_logits grid. nil for backends without a CTC vocab.
+static VALUE rb_session_ctc_vocab(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int n = crispasr_session_n_vocab(s);
+    if (n <= 0) return Qnil;
+    VALUE vocab = rb_ary_new_capa(n);
+    for (int i = 0; i < n; i++) {
+        const char* p = crispasr_session_token_text(s, i);
+        rb_ary_push(vocab, rb_utf8_str_new_cstr(p ? p : ""));
+    }
+    return vocab;
+}
+
+// CrispASR::Session.transcribe_chunked(handle, pcm, chunk_seconds, overlap_seconds, language)
+// issue #208: chunked-encode transcribe. Forces the Parakeet backend through its
+// bounded overlapping-window long-form path (inert on other backends). chunk<=0
+// keeps the per-model default window; overlap<0 keeps the default. Poll
+// CrispASR::Session.get_progress (0..100) to render a progress bar.
+static VALUE rb_session_transcribe_chunked(VALUE self, VALUE handle, VALUE pcm_arr, VALUE chunk_s, VALUE overlap_s,
+                                           VALUE language) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    long n = RARRAY_LEN(pcm_arr);
+    float* pcm = (float*)malloc(sizeof(float) * (size_t)n);
+    for (long i = 0; i < n; i++)
+        pcm[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+
+    const char* lang = NIL_P(language) ? NULL : StringValueCStr(language);
+    struct crispasr_session_result* r =
+        crispasr_session_transcribe_chunked_lang(s, pcm, (int)n, NUM2INT(chunk_s), NUM2INT(overlap_s), lang);
+    free(pcm);
+    if (!r) rb_raise(rb_eRuntimeError, "chunked transcription failed");
+
+    int n_segs = crispasr_session_result_n_segments(r);
+    VALUE segments = rb_ary_new_capa(n_segs);
+    for (int i = 0; i < n_segs; i++) {
+        VALUE seg = rb_hash_new();
+        const char* text = crispasr_session_result_segment_text(r, i);
+        rb_hash_aset(seg, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(text ? text : ""));
+        rb_hash_aset(seg, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_segment_t0(r, i)));
+        rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
+        rb_hash_aset(seg, ID2SYM(rb_intern("no_speech_prob")),
+                     DBL2NUM((double)crispasr_session_result_segment_no_speech_prob(r, i)));
+
+        int n_words = crispasr_session_result_n_words(r, i);
+        VALUE words = rb_ary_new_capa(n_words);
+        for (int j = 0; j < n_words; j++) {
+            VALUE w = rb_hash_new();
+            const char* wt = crispasr_session_result_word_text(r, i, j);
+            rb_hash_aset(w, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(wt ? wt : ""));
+            rb_hash_aset(w, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_word_t0(r, i, j)));
+            rb_hash_aset(w, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_word_t1(r, i, j)));
+            rb_hash_aset(w, ID2SYM(rb_intern("p")), DBL2NUM((double)crispasr_session_result_word_p(r, i, j)));
+            rb_ary_push(words, w);
+        }
+        rb_hash_aset(seg, ID2SYM(rb_intern("words")), words);
+        rb_ary_push(segments, seg);
+    }
+    crispasr_session_result_free(r);
+    return segments;
+}
+
+// CrispASR::Session.get_progress -> Integer (0..100, or -1 idle). issue #208:
+// long-form progress, updated in lockstep with transcribe_chunked windows.
+static VALUE rb_session_get_progress(VALUE self) {
+    return INT2NUM(crispasr_get_progress());
 }
 
 // CrispASR::Session.vad_segments(vad_model_path, pcm, sample_rate, threshold, min_speech_ms, min_silence_ms, n_threads)
@@ -1095,6 +1275,16 @@ static VALUE rb_session_available_backends(VALUE self) {
     return rb_utf8_str_new_cstr(buf);
 }
 
+// detected_language(handle) -> String. The acoustic language Whisper detected
+// on the last transcribe (ISO-639-1); other backends return the source-language
+// hint, or "unknown".
+static VALUE rb_session_detected_language(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    char buf[32] = {0};
+    crispasr_session_detected_language(s, buf, sizeof(buf));
+    return rb_utf8_str_new_cstr(buf);
+}
+
 static VALUE rb_session_open_explicit(VALUE self, VALUE model_path, VALUE backend, VALUE n_threads) {
     struct CrispasrSession* s = crispasr_session_open_explicit(
         StringValueCStr(model_path), StringValueCStr(backend), NUM2INT(n_threads));
@@ -1356,6 +1546,10 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "is_voice_design",      rb_session_is_voice_design,  1);
     rb_define_singleton_method(mSession, "synthesize",           rb_session_synthesize,       2);
     rb_define_singleton_method(mSession, "transcribe",           rb_session_transcribe,       2);
+    rb_define_singleton_method(mSession, "transcribe_with_logits", rb_session_transcribe_with_logits, 2);
+    rb_define_singleton_method(mSession, "ctc_vocab",              rb_session_ctc_vocab,             1);
+    rb_define_singleton_method(mSession, "transcribe_chunked",   rb_session_transcribe_chunked, 5);
+    rb_define_singleton_method(mSession, "get_progress",         rb_session_get_progress,     0);
     rb_define_singleton_method(mSession, "vad_segments",         rb_session_vad_segments,    -1);
     rb_define_singleton_method(mSession, "align_words",          rb_session_align_words,      4);
     rb_define_singleton_method(mSession, "clear_phoneme_cache",  rb_session_clear_phoneme_cache, 1);
@@ -1381,6 +1575,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_length_scale",          rb_session_set_length_scale,          2);
     rb_define_singleton_method(mSession, "set_best_of",               rb_session_set_best_of,               2);
     rb_define_singleton_method(mSession, "set_beam_size",             rb_session_set_beam_size,             2);
+    rb_define_singleton_method(mSession, "set_return_logits",         rb_session_set_return_logits,         2);
     rb_define_singleton_method(mSession, "set_grammar_text",          rb_session_set_grammar_text,          4);
     rb_define_singleton_method(mSession, "set_fallback_thresholds",   rb_session_set_fallback_thresholds,   5);
     rb_define_singleton_method(mSession, "set_alt_n",                 rb_session_set_alt_n,                 2);
@@ -1405,6 +1600,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "kokoro_lang_has_native_voice", rb_kokoro_lang_has_native_voice, 1);
     rb_define_singleton_method(mSession, "translate_text", rb_session_translate_text, 5);
     rb_define_singleton_method(mSession, "available_backends", rb_session_available_backends, 0);
+    rb_define_singleton_method(mSession, "detected_language",  rb_session_detected_language, 1);
     rb_define_singleton_method(mSession, "open_explicit", rb_session_open_explicit, 3);
     rb_define_singleton_method(mSession, "vad_slices", rb_vad_slices, -1);
     rb_define_singleton_method(mSession, "enhance_audio_rnnoise", rb_enhance_audio_rnnoise, 1);

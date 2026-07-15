@@ -20,6 +20,7 @@
 #include "core/kaldi_fbank.h"
 #include "core/lfr.h"
 #include "core/sanm.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include <algorithm>
 #include <cassert>
@@ -748,11 +749,9 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
         compute_encoder_pe(ctx->model, T_lfr + 256);
     }
 
-    // §176s: reuse cached encoder graph when T_lfr matches previous call.
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_lfr == T_lfr) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;
@@ -2079,7 +2078,7 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();

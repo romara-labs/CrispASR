@@ -25,12 +25,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2  # 6.0.3 regressed WASM ISel (voxtral_tts crash); pin last-good
 
       - name: Build WASM Examples
         # Enable for real build later in whisper.cpp

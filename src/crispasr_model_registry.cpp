@@ -42,6 +42,13 @@ struct ExtraList {
 constexpr Entry k_registry[] = {
     {"whisper", "ggml-base.bin",
      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "~147 MB", nullptr, nullptr},
+    // AudioSeal (Meta FAIR) — optional NEURAL watermark model (MIT code + weights).
+    // Not a transcription/TTS backend: resolved by the name "audioseal" when the
+    // user passes `--watermark-model auto`. CrispASR's built-in zero-dependency
+    // spread-spectrum watermark stays the always-on default; this is the opt-in
+    // SOTA upgrade (imperceptible + robust neural watermark). #260.
+    {"audioseal", "audioseal.gguf",
+     "https://huggingface.co/cstr/audioseal-GGUF/resolve/main/audioseal.gguf", "~89 MB", nullptr, nullptr},
     {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "~458 MB", nullptr, nullptr},
@@ -49,6 +56,12 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
+     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-q8_0.gguf", "~4.1 GB", nullptr, nullptr},
+    // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
+    // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
+    {"ark-asr", "ark-asr-3b-q4_k.gguf",
+     "https://huggingface.co/cstr/ark-asr-3b-GGUF/resolve/main/ark-asr-3b-q4_k.gguf", "~2.2 GB", nullptr, nullptr},
     // LiquidAI LFM2.5-Audio-1.5B: FastConformer + LFM2 hybrid
     // conv+attention backbone. ASR (+ TTS/speech-to-speech planned).
     // English base model — Q5_K recommended (Q4_K too aggressive for EN).
@@ -92,6 +105,15 @@ constexpr Entry k_registry[] = {
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // Qwen3-ASR-1.7B fine-tuned for Japanese anime/galgame speech (Apache-2.0).
+    // Same architecture as qwen3-1.7b; uses the standard qwen3 backend.
+    {"qwen3-ja-anime", "qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-asr-1.7b-ja-anime-GGUF/resolve/main/qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
+    // higgs-audio-v3-stt: Whisper-large-v3 encoder + Qwen3-1.7B decoder (Apache-2.0).
+    {"higgs-stt", "higgs-stt-q4_k.gguf",
+     "https://huggingface.co/cstr/higgs-audio-v3-stt-GGUF/resolve/main/higgs-stt-q4_k.gguf",
+     "~2.3 GB", nullptr, nullptr},
     // Mega-ASR: Qwen3-ASR-1.7B with the upstream robustness LoRA merged
     // offline. It uses the standard qwen3 backend at runtime; the upstream
     // router is not required for this always-on robust path.
@@ -186,6 +208,24 @@ constexpr Entry k_registry[] = {
     {"cohere", "cohere-asr-ja-v0.1-q8_0.gguf",
      "https://huggingface.co/TransWithAI/cohere-transcribe-ja-v0.1-GGUF/resolve/main/cohere-asr-ja-v0.1-q8_0.gguf",
      "~2.4 GB", nullptr, nullptr},
+    // cohere-transcribe-arabic — Arabic model (CohereLabs/cohere-transcribe-arabic-07-2026,
+    // Apache-2.0; #231). q4_k-imatrix is the recommended Arabic variant (Arabic
+    // CC0 Common Voice calibration; matches F16 transcript where plain q4_k drifts).
+    {"cohere", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    // `--backend cohere-ar` (or `-m auto --backend cohere-ar`) short alias →
+    // recommended Arabic imatrix GGUF. Routes to the cohere runtime via the
+    // factory alias in crispasr_backend.cpp. Still pass `-l ar`.
+    {"cohere-ar", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-transcribe-arabic-q4_k.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-transcribe-arabic-q8_0.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q8_0.gguf",
+     "~2.4 GB", nullptr, nullptr},
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
      "~212 MB", nullptr, nullptr},
@@ -236,6 +276,12 @@ constexpr Entry k_registry[] = {
     {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
      "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
      nullptr, nullptr},
+    {"moss-transcribe", "moss-transcribe-preview-2b-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Transcribe-preview-2B-GGUF/resolve/main/moss-transcribe-preview-2b-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
+    {"moss-diarize", "moss-transcribe-diarize-0.9b-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Transcribe-Diarize-GGUF/resolve/main/moss-transcribe-diarize-0.9b-q4_k.gguf",
+     "~1.2 GB", nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~658 MB", nullptr, nullptr},
     {"omniasr-300m", "omniasr-ctc-300m-v2-q4_k.gguf",
@@ -266,6 +312,14 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/firered-asr2-aed-GGUF/resolve/main/firered-asr2-aed-q4_k.gguf", "~918 MB", nullptr, nullptr},
     {"kyutai-stt", "kyutai-stt-1b-q4_k.gguf",
      "https://huggingface.co/cstr/kyutai-stt-1b-GGUF/resolve/main/kyutai-stt-1b-q4_k.gguf", "~636 MB", nullptr, nullptr},
+    {"kyutai-stt-2.6b", "kyutai-stt-2.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/kyutai-stt-2.6b-en-GGUF/resolve/main/kyutai-stt-2.6b-q4_k.gguf", "~1.5 GB",
+     nullptr, nullptr},
+    {"voxtral-tts", "voxtral-4b-tts-q4_k.gguf",
+     "https://huggingface.co/cstr/voxtral-4b-tts-GGUF/resolve/main/voxtral-4b-tts-q4_k.gguf", "~2.5 GB", nullptr,
+     nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (base model mistralai/Voxtral-4B-TTS-2603; see "
+     "https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)"},
     {"glm-asr", "glm-asr-nano-q4_k.gguf",
      "https://huggingface.co/cstr/glm-asr-nano-GGUF/resolve/main/glm-asr-nano-q4_k.gguf", "~1.2 GB", nullptr, nullptr},
     {"moonshine", "moonshine-tiny-q4_k.gguf",
@@ -297,6 +351,124 @@ constexpr Entry k_registry[] = {
     {"fastconformer-ctc", "stt-en-fastconformer-ctc-large-q4_k.gguf",
      "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
      "~83 MB", nullptr, nullptr},
+    // FastConformer-CTC models double as compact CTC forced aligners
+    // (-am <name>): the GGUF arch tag is canary-ctc, so crispasr_aligner's
+    // default dispatch loads them directly. The *-aligner-* aliases below
+    // mirror the wav2vec2-aligner-<lang> naming for discoverability.
+    {"fastconformer-aligner", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    // CTC branches of the nvidia/stt_*_fastconformer_hybrid_large[_pc] fleet
+    // (all CC-BY-4.0; pt is excluded upstream-NC): per-language ASR + forced
+    // alignment, ~82 MB q4_k each. _pc variants add punctuation/capitalisation
+    // (fa and kk-ru are non-pc). en-pc complements the uncased en standalone.
+    {"fastconformer-ctc-en-pc", "stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en-pc", "stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-es", "stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-es-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-es", "stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-es-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-fr", "stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-fr", "stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-it", "stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-it-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-it", "stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-it-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-nl", "stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-nl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-nl", "stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-nl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-pl", "stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-pl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-pl", "stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-pl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ru", "stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ru", "stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ua", "stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ua-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ua", "stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ua-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-hr", "stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-hr", "stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-be", "stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-be-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-be", "stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-be-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ar", "stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ar-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ar", "stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ar-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-fa", "stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fa-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-fa", "stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fa-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ka", "stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ka-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ka", "stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ka-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-hy", "stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hy-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-hy", "stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hy-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-uz", "stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-uz-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-uz", "stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-uz-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-kk-ru", "stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-kk-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-kk-ru", "stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-kk-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    // CTC branch of nvidia/stt_de_fastconformer_hybrid_large_pc (CC-BY-4.0):
+    // German ASR + forced alignment with punctuation/capitalisation.
+    {"fastconformer-ctc-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
+    {"fastconformer-aligner-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
     // nvidia/parakeet-ctc-{0.6b,1.1b} — same FastConformer-CTC architecture
     // as the stt_en_fastconformer_ctc_* family (24 / 42 layers respectively),
     // English-only, lowercase + light-punct output. Filename heuristic
@@ -318,15 +490,16 @@ constexpr Entry k_registry[] = {
     {"titanet", "titanet-large.gguf",
      "https://huggingface.co/cstr/titanet-large-GGUF/resolve/main/titanet-large.gguf",
      "~45 MB", nullptr, nullptr},
-    // parakeet-ja: F16 is the auto-download default — Q4_K of this
+    // parakeet-ja: Q8_0 is the auto-download default — its TDT output is
+    // byte-identical to F16 in our tests at half the size. Q4_K of this
     // model is quantisation-sensitive (joint.pred / decoder.embed
-    // dimensions fall back to q4_0 inside q4_k mode) and the talker
-    // enters a fixed-point loop after ~8 tokens. The Q4_K file is
-    // available at the same repo for users who pin disk space, but
-    // we'd rather have correct output by default.
-    {"parakeet-ja", "parakeet-tdt-0.6b-ja.gguf",
-     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja.gguf",
-     "~1.24 GB", nullptr, nullptr},
+    // dimensions fall back to q4_0 inside q4_k mode) and the TDT decode
+    // enters a fixed-point repetition loop; CTC decode over the same q4_k
+    // file is clean (--parakeet-decoder ctc). All files at the repo carry
+    // the hybrid model's CTC head since 2026-07 (#89 / #221d).
+    {"parakeet-ja", "parakeet-tdt-0.6b-ja-q8_0.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja-q8_0.gguf",
+     "~710 MB", nullptr, nullptr},
     // parakeet-v2 — English-only TDT (1024-vocab BPE, pred_layers=2).
     // The original Open ASR Leaderboard topper before v3 spread capacity
     // to 25 languages; often stronger on plain English. Same FastConformer
@@ -390,6 +563,28 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone + 32 RVQ audio codebooks
+    // + a 1.6B transformer codec companion (kept F16 — quantising the codec
+    // degrades audio earlier than the backbone). Default download is the Q4_K
+    // backbone (~5 GB) paired with the F16 codec. (URLs populated at ship after
+    // the GGUF upload — see Phase 6.)
+    {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
+     "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
+     "~5 GB",
+     "moss-tts-v1.5-codec.gguf",
+     "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-codec.gguf",
+     "~3.4 GB"},
+    // MOSS-TTS-Local-Transformer-v1.5 (4B, arch "moss-tts-local"): Qwen3-4B
+    // backbone + MOSS-Audio-Tokenizer-v2 codec (48 kHz stereo, decode-only
+    // companion). Apache-2.0. Default = F16 backbone: the acceptance target
+    // (P5 round-trip overlap 0.969). Q4_K exists but its long trajectory runs away
+    // (intrinsic quantized-AR drift) — F16 is the reliable config, fits a 16 GB GPU.
+    {"moss-tts-local", "moss-tts-local-v1.5-f16.gguf",
+     "https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF/resolve/main/moss-tts-local-v1.5-f16.gguf",
+     "~9.1 GB",
+     "moss-tts-local-v1.5-codec.gguf",
+     "https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF/resolve/main/moss-tts-local-v1.5-codec.gguf",
+     "~2.1 GB"},
     // gwen-tts-0.6B: Vietnamese-optimized Qwen3-TTS-0.6B-Base finetune
     // (MIT, g-group-ai-lab). Same architecture as qwen3-tts-0.6B-Base,
     // trained on ~1000h Vietnamese TikTok audio. Supports all 10 Qwen3-TTS
@@ -450,6 +645,20 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // OmniVoice: k2-fsa/OmniVoice — Qwen3-0.6B backbone with masked
+    // iterative multi-codebook TTS (8 codebooks × 1025 vocab, 600+
+    // languages). Uses HiggsAudioV2 audio tokenizer for encode/decode.
+    // cstr/omnivoice-GGUF also hosts base quants omnivoice-{q8_0,q4_k}.gguf and a
+    // smaller TTS-ONLY omnivoice-tokenizer-q8_0.gguf (320 MB) — the Q8 tokenizer
+    // decodes fine but voice-clone ENCODE needs F16 (RVQ nearest-neighbor is
+    // quant-sensitive), so the default tokenizer stays f16.
+    {"omnivoice", "omnivoice-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-f16.gguf",
+     "~1.2 GB",
+     "omnivoice-tokenizer-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-tokenizer-f16.gguf",
+     "~400 MB"},
+    //
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —
     // "Built with Llama"). Talker = Llama-3.2-3B-Instruct + 7×4096
@@ -474,26 +683,26 @@ constexpr Entry k_registry[] = {
      "~1.7 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     {"tada-tts-1b", "tada-tts-1b-q4_k.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
      "~1.7 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     {"tada-1b", "tada-tts-1b-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-f16.gguf",
      "~3.1 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
     {"tada", "tada-tts-3b-ml-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
      "~6.6 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     // lex-au's German Orpheus-3B fine-tune. Already published as a Q8_0
     // GGUF on HF (`lex-au/Orpheus-3b-German-FT-Q8_0.gguf`, 3.52 GB) — the
     // repo name itself ends in `.gguf`, lex-au's convention. License
@@ -637,6 +846,30 @@ constexpr Entry k_registry[] = {
     {"f5-tts", "f5-tts-v1-base-f16.gguf",
      "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
      "~953 MB", nullptr, nullptr},
+    // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
+    // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
+    {"irodori-tts", "irodori-tts-500m-v3-q4_k.gguf",
+     "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/irodori-tts-500m-v3-q4_k.gguf",
+     "~852 MB",
+     "dacvae-ja-32dim-f16.gguf",
+     "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/dacvae-ja-32dim-f16.gguf",
+     "~135 MB"},
+    // Irodori-TTS v3 600M VoiceDesign: caption encoder for style/emotion
+    // conditioning via text descriptions. Same codec companion.
+    {"irodori-tts-voicedesign", "irodori-tts-600m-v3-voicedesign-q4_k.gguf",
+     "https://huggingface.co/cstr/irodori-tts-voicedesign-GGUF/resolve/main/irodori-tts-600m-v3-voicedesign-q4_k.gguf",
+     "~526 MB",
+     "dacvae-ja-32dim-f16.gguf",
+     "https://huggingface.co/cstr/irodori-tts-voicedesign-GGUF/resolve/main/dacvae-ja-32dim-f16.gguf",
+     "~135 MB"},
+    // BananaMind-TTS: Tacotron-lite + HiFi-GAN vocoder. Lightweight
+    // (~50 MB) single-speaker TTS, EN and DE variants.
+    {"bananamind-tts", "bananamind-tts-en-q8_0.gguf",
+     "https://huggingface.co/cstr/bananamind-tts-GGUF/resolve/main/bananamind-tts-en-q8_0.gguf",
+     "~38 MB", nullptr, nullptr},
+    {"bananamind-tts-de", "bananamind-tts-de-q8_0.gguf",
+     "https://huggingface.co/cstr/bananamind-tts-GGUF/resolve/main/bananamind-tts-de-q8_0.gguf",
+     "~38 MB", nullptr, nullptr},
     // CTC forced aligner — used by `-am auto` to attach word-level
     // timestamps (LLM-decode backends, or any backend when paired
     // with `--force-aligner` / `-fa`). Q4_K is the recommended quant
@@ -668,6 +901,11 @@ constexpr Entry k_registry[] = {
     {"m2m100", "m2m100-418m-q8_0.gguf",
      "https://huggingface.co/cstr/m2m100-418m-GGUF/resolve/main/m2m100-418m-q8_0.gguf",
      "~502 MB", nullptr, nullptr},
+    // f16 build — exact HF translation parity (q8_0 has rare quant-floor
+    // decode flips on borderline words). Same faithful SP-BPE tokenizer.
+    {"m2m100-f16", "m2m100-418m-f16.gguf",
+     "https://huggingface.co/cstr/m2m100-418m-GGUF/resolve/main/m2m100-418m-f16.gguf",
+     "~980 MB", nullptr, nullptr},
     // WMT21 dense-24-wide-en-x (facebook, MIT) — same m2m100
     // architecture as the 418M base, scaled up to 4.7B params and
     // narrower in coverage (English → 7 target languages, won the
@@ -784,11 +1022,6 @@ constexpr Entry k_registry[] = {
     // Audio-LID family — speech-signal language identification.
     // Silero + Ecapa run through the module-level `detect_language_pcm`;
     // FireRed requires the session-level `Session::detect_language` (Phase 6).
-    // `lid-silero` is the recommended default: 95 languages, ~16 MB, Apache-2.0.
-    // Converted from deepghs/silero-lang95-onnx via models/convert-silero-lid-to-gguf.py.
-    {"lid-silero", "silero-lid-95-f16.gguf",
-     "https://huggingface.co/cstr/silero-lid-95-GGUF/resolve/main/silero-lid-95-f16.gguf",
-     "~16 MB", nullptr, nullptr},
     // ECAPA-TDNN LID: speechbrain/lang-id-voxlingua107-ecapa (Apache-2.0),
     // 107 languages, attentive statistical pooling. ~42 MB F16.
     // Converted via models/convert-ecapa-tdnn-lid-to-gguf.py.
@@ -928,8 +1161,18 @@ constexpr ExtraCompanion k_tada_3b_extras[] = {
     {nullptr, nullptr},
 };
 
+// dots.tts: the CAM++ speaker encoder (15 MB) rides along so that `--voice`
+// voice cloning works after `-m auto --auto-download` — discover_speaker()
+// finds it as a sibling of the core model. Negligible vs the 4.6 GB core.
+constexpr ExtraCompanion k_dots_tts_extras[] = {
+    {"dots-tts-soar-spk-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-spk-f16.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
+    {"dots-tts", k_dots_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"qwen3-tts", k_qwen3_tts_base_extras},

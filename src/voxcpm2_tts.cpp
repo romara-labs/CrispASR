@@ -20,6 +20,7 @@ static int g_cpu_n_threads = 4;
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/torch_rng.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -101,13 +102,21 @@ static double vox_now_ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared CPU backend for tiny ggml graph matmuls. Note: tried switching to
-// ggml_backend_init_best (Metal/CUDA) here but the current matmul_mv_ggml
-// allocates input tensors in a CPU-side mem buffer that Metal can't read
-// → SIGSEGV on first kernel dispatch. The proper fix is the per-step graph
-// refactor (build_locdit_graph, build_tslm_step_graph) with
-// ggml_backend_tensor_set / ggml_backend_alloc_ctx_tensors — those WILL
-// pick up Metal automatically once they're in place.
+// Dedicated CPU backend for the remaining tiny scalar-ish helper matmuls
+// (matmul_mv_ggml et al.). These allocate their inputs in a CPU-side mem buffer
+// (ggml_init no_alloc=false), so they MUST stay on this CPU backend — a Metal
+// backend cannot dereference those host pointers.
+//
+// §176n (2026-07-12): the heavy pipeline no longer depends on that. The per-step
+// FUSED graphs (build_tslm_step_graph / build_ralm_step_graph / build_locdit_graph
+// + the VAE encode/decode graphs) are gated `VOXCPM2_USE_GRAPH=1` (default ON) and
+// run on `ctx->backend` via ggml_gallocr + ggml_backend_tensor_set, so they DO
+// pick up Metal automatically when use_gpu is set. Verified on M1: basic +
+// voice-clone synthesis run fully on Metal (VAE-encode graph, AR loop, VAE
+// decode), no SIGSEGV, ASR round-trip correct, ~3.75x faster than CPU. The old
+// "init_best here → SIGSEGV" note referred to routing THESE CPU helpers through
+// Metal, which is neither needed nor a win (30 tiny matvecs/step would be
+// launch-bound). See PLAN §176n / LEARNINGS.
 // ---------------------------------------------------------------------------
 
 static ggml_backend_t g_cpu_backend = nullptr;
@@ -374,6 +383,12 @@ struct voxcpm2_context {
 
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
+
+    // Single-entry VAE-encode memo (see vae_encode_cached)
+    const float* vae_cache_pcm = nullptr;
+    int vae_cache_n_samples = -1;
+    int vae_cache_T = 0;
+    std::vector<float> vae_cache_feat;
 
     // Helper: return gpu_weights for graph build (GPU-resident) or weights
     // for legacy paths (always CPU-accessible).
@@ -4568,19 +4583,6 @@ static int vae_enc_block(voxcpm2_context* ctx, int blk_idx, int in_ch, int out_c
 // (matching Python `feat.view(D, -1, P).permute(1, 2, 0)`).
 // On failure (encoder weights missing) returns an empty vector and sets
 // *out_T_patches = 0.
-// Process-wide VAE encode cache. The diff harness calls extract_stage once per
-// stage and several stages need ref_feat — the encoder takes ~30 s on CPU so
-// re-running it 5-10 times serialises into multiple minutes. Cache keyed on
-// (ctx, ref pointer, ref length).
-struct vox_vae_cache_key {
-    voxcpm2_context* ctx;
-    const float* pcm;
-    int n_samples;
-    bool operator==(const vox_vae_cache_key& o) const {
-        return ctx == o.ctx && pcm == o.pcm && n_samples == o.n_samples;
-    }
-};
-
 static std::vector<float> vae_encode_uncached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                               int* out_T_patches);
 // VOXCPM2_USE_GRAPH=1 GPU encoder (PLAN §181) + its dispatcher; defined after
@@ -4589,20 +4591,23 @@ static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pc
 static std::vector<float> vae_encode_dispatch(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                               int* out_T_patches);
 
+// Per-context VAE encode cache. The diff harness calls extract_stage once per
+// stage and several stages need ref_feat — the encoder takes ~30 s on CPU so
+// re-running it 5-10 times serialises into multiple minutes. Cache keyed on
+// (ref pointer, ref length) and stored in the context so its lifetime matches
+// it (a stale entry can't outlive the context and hit a later one that reuses
+// the same addresses — same single-model assumption as PR #244).
 static const std::vector<float>& vae_encode_cached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                                    int* out_T_patches) {
-    static vox_vae_cache_key cached_key{nullptr, nullptr, -1};
-    static std::vector<float> cached;
-    static int cached_T = 0;
-    vox_vae_cache_key key{ctx, pcm, n_samples};
-    if (!(key == cached_key)) {
-        cached = vae_encode_dispatch(ctx, pcm, n_samples, &cached_T);
-        cached_key = key;
+    if (ctx->vae_cache_pcm != pcm || ctx->vae_cache_n_samples != n_samples) {
+        ctx->vae_cache_feat = vae_encode_dispatch(ctx, pcm, n_samples, &ctx->vae_cache_T);
+        ctx->vae_cache_pcm = pcm;
+        ctx->vae_cache_n_samples = n_samples;
     }
     if (out_T_patches) {
-        *out_T_patches = cached_T;
+        *out_T_patches = ctx->vae_cache_T;
     }
-    return cached;
+    return ctx->vae_cache_feat;
 }
 
 static std::vector<float> vae_encode(voxcpm2_context* ctx, const float* pcm, int n_samples, int* out_T_patches) {
@@ -6321,7 +6326,7 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
         return nullptr;
     }
     if (params.use_gpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
         if (!ctx->backend) {
             if (params.verbosity >= 1) {
                 fprintf(stderr, "voxcpm2: best backend unavailable, falling back to CPU\n");

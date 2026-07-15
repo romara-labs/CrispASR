@@ -13,6 +13,7 @@
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -587,6 +588,9 @@ static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx
     const int n_heads = hp.enc_n_heads;
     const int head_dim = hp.enc_head_dim;
     const int n_mels = hp.n_mels;
+    // Gated per-stage encoder snapshots (mel + per-block + pre-proj final) for
+    // the crispasr-diff / transcribe.cpp comparison. No overhead when unset.
+    const bool dump_stages = std::getenv("CRISPASR_COHERE_DUMP_STAGES") != nullptr;
 
     struct ggml_init_params params = {
         .mem_size = ctx->compute_meta.size(),
@@ -755,7 +759,37 @@ static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx
         cur = ggml_norm(ctx0, cur, 1e-5f);
         cur = ggml_mul_inplace(ctx0, cur, layer.out_norm_w);
         cur = ggml_add_inplace(ctx0, cur, layer.out_norm_b);
+
+        // Per-block encoder dump (gated). ggml_cont escapes the in-place norm
+        // aliasing so the snapshot is not overwritten by buffer reuse. Used to
+        // bisect encoder divergence against transcribe.cpp (see §231: a corrupt
+        // GGUF zeroed layers 20/24 → block output collapsed to 0 from there).
+        if (dump_stages) {
+            struct ggml_tensor* bdbg = ggml_cont(ctx0, cur);
+            char bn[32];
+            snprintf(bn, sizeof(bn), "enc_block_%d", il);
+            ggml_set_name(bdbg, bn);
+            ggml_set_output(bdbg);
+            ggml_build_forward_expand(gf, bdbg);
+        }
     }
+
+    // Full-T pre-projection encoder output (gated), the direct analog of
+    // transcribe.cpp's enc.final [T,1280] for numeric comparison.
+    if (dump_stages) {
+        struct ggml_tensor* enc_final_dbg = ggml_cont(ctx0, cur);
+        ggml_set_name(enc_final_dbg, "enc_final_preproj");
+        ggml_set_output(enc_final_dbg);
+        ggml_build_forward_expand(gf, enc_final_dbg);
+    }
+
+    // DEBUG: full-T pre-projection encoder output (analog of transcribe.cpp's
+    // enc.final [T,1280]). ggml_cont forces a fresh buffer so the preceding
+    // in-place norm ops can't be overwritten by downstream buffer reuse.
+    struct ggml_tensor* enc_final_dbg = ggml_cont(ctx0, cur);
+    ggml_set_name(enc_final_dbg, "enc_final_preproj");
+    ggml_set_output(enc_final_dbg);
+    ggml_build_forward_expand(gf, enc_final_dbg);
 
     // Encoder-decoder projection
     cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.enc_proj_w, cur), model.enc_proj_b);
@@ -1075,6 +1109,7 @@ static ggml_tensor* ct_get_tensor_fmt(cohere_model& model, const char* fmt, int 
 // ---------------------------------------------------------------------------
 
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/audio_chunking.h"
 #include "core/gguf_loader.h"
@@ -1423,6 +1458,7 @@ static void cohere_fft_r2c(const float* in, int N, float* out) {
 // ---------------------------------------------------------------------------
 
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1463,7 +1499,13 @@ static std::vector<float> cohere_compute_features(const cohere_hparams& hp, cons
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
-    p.drop_last_frame = true; // NeMo returns feat_len = floor(n_samples/hop) frames
+    // NeMo FilterbankFeatures returns feat_len = floor(n_samples/hop) + 1 (the
+    // centered first frame adds one). Dropping the last frame made T_mel one
+    // short, which flips T_enc down by one whenever floor(n/hop) is a multiple
+    // of the 8x subsampling (e.g. an 11 s clip -> 138 vs the reference's 139).
+    // Verified against the transformers reference mel (128, 1105) for an
+    // 11.04 s clip.
+    p.drop_last_frame = false;
 
     auto mel =
         core_mel::compute(pe.data(), n_samples, fe_window_data, win, fe_mel_fb_data, n_freqs, cohere_fft_r2c, p, T_out);
@@ -1897,7 +1939,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
             }
         }
         if (!ctx->ggml_backend) {
-            ctx->ggml_backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+            ctx->ggml_backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
         }
         if (!ctx->ggml_backend) {
             fprintf(stderr, "cohere: failed to initialize any ggml backend\n");
@@ -1967,9 +2009,11 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     if (using_gpu) {
         ggml_backend_t backends[] = {ctx->ggml_backend, ctx->ggml_backend_cpu};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 2, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     } else {
         ggml_backend_t backends[] = {ctx->ggml_backend};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
 
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + 1024);
@@ -2038,20 +2082,7 @@ int cohere_str_to_token(struct cohere_context* ctx, const char* s) {
 // ---------------------------------------------------------------------------
 
 static std::vector<float> ct_get_f32(const ggml_tensor* t) {
-    const int n = (int)ggml_nelements(t);
-    std::vector<float> res(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, res.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (int i = 0; i < n; i++)
-            res[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "ct_get_f32: unsupported type %d\n", (int)t->type);
-        abort();
-    }
-    return res;
+    return core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // ---------------------------------------------------------------------------
@@ -2306,6 +2337,17 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 return nullptr;
             }
             ggml_backend_tensor_set(mel_t, mel_c.data(), 0, mel_c.size() * sizeof(float));
+            if (const char* mp = std::getenv("CRISPASR_COHERE_DUMP_MEL")) {
+                FILE* mf = std::fopen(mp, "wb");
+                if (mf) {
+                    int32_t nm = hp.n_mels, tm = T_mel_c; // mel_c layout: [n_mels, T] (n_mels contiguous)
+                    std::fwrite(&nm, 4, 1, mf);
+                    std::fwrite(&tm, 4, 1, mf);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), mf);
+                    std::fclose(mf);
+                    fprintf(stderr, "cohere: dumped mel [n_mels=%d, T=%d] to %s\n", nm, tm, mp);
+                }
+            }
 
             int H1c = (T_mel_c + 2 - 3) / 2 + 1;
             int H2c = (H1c + 2 - 3) / 2 + 1;
@@ -2341,6 +2383,45 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 ggml_backend_sched_set_eval_callback(ctx->ggml_alloc, nullptr, nullptr);
             }
 
+            // Per-stage encoder snapshots for crispasr-diff / transcribe.cpp
+            // comparison (CRISPASR_COHERE_DUMP_STAGES=<dir>). Writes raw
+            // [ne0,ne1] f32 (2 int32 dims + data): crisp.mel.bin, crisp.enc_final.bin,
+            // crisp.block<N>.bin — matching transcribe.cpp's TRANSCRIBE_DUMP_DIR.
+            if (const char* sd = std::getenv("CRISPASR_COHERE_DUMP_STAGES")) {
+                auto dump_named = [&](const char* tname, const char* fname) {
+                    struct ggml_tensor* t = ggml_graph_get_tensor(gf_enc, tname);
+                    if (!t)
+                        return;
+                    std::vector<float> v((size_t)t->ne[0] * t->ne[1]);
+                    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+                    char path[1024];
+                    std::snprintf(path, sizeof(path), "%s/%s", sd, fname);
+                    if (FILE* f = std::fopen(path, "wb")) {
+                        int32_t d0 = (int32_t)t->ne[0], d1 = (int32_t)t->ne[1];
+                        std::fwrite(&d0, 4, 1, f);
+                        std::fwrite(&d1, 4, 1, f);
+                        std::fwrite(v.data(), sizeof(float), v.size(), f);
+                        std::fclose(f);
+                    }
+                };
+                char mpath[1024];
+                std::snprintf(mpath, sizeof(mpath), "%s/crisp.mel.bin", sd);
+                if (FILE* f = std::fopen(mpath, "wb")) {
+                    int32_t d0 = (int32_t)hp.n_mels, d1 = (int32_t)T_mel_c;
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), f);
+                    std::fclose(f);
+                }
+                dump_named("enc_final_preproj", "crisp.enc_final.bin");
+                for (int bi = 0; bi < hp.enc_n_layers; bi++) {
+                    char tn[32], fn[48];
+                    std::snprintf(tn, sizeof(tn), "enc_block_%d", bi);
+                    std::snprintf(fn, sizeof(fn), "crisp.block%d.bin", bi);
+                    dump_named(tn, fn);
+                }
+            }
+
             // Extract T_enc for this chunk
             struct ggml_tensor* enc_out_t = ggml_graph_get_tensor(gf_enc, "enc_out");
             if (!enc_out_t) {
@@ -2350,6 +2431,59 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
             int T_enc_c = enc_out_t->ne[1];
             T_enc_total += T_enc_c;
             T_enc_chunks.push_back(T_enc_c);
+
+            // Debug: dump mel + pre-proj encoder output as raw [ne0,ne1] f32
+            // (2 int32 header dims + data) to compare against transcribe.cpp's
+            // enc.mel.in / enc.final dumps. CRISPASR_COHERE_DUMP_STAGES=dir.
+            if (const char* sd = std::getenv("CRISPASR_COHERE_DUMP_STAGES")) {
+                auto dump_named = [&](const char* tname, const char* fname) {
+                    struct ggml_tensor* t = ggml_graph_get_tensor(gf_enc, tname);
+                    if (!t)
+                        return;
+                    std::vector<float> v((size_t)t->ne[0] * t->ne[1]);
+                    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+                    char path[1024];
+                    std::snprintf(path, sizeof(path), "%s/%s", sd, fname);
+                    if (FILE* f = std::fopen(path, "wb")) {
+                        int32_t d0 = (int32_t)t->ne[0], d1 = (int32_t)t->ne[1];
+                        std::fwrite(&d0, 4, 1, f);
+                        std::fwrite(&d1, 4, 1, f);
+                        std::fwrite(v.data(), sizeof(float), v.size(), f);
+                        std::fclose(f);
+                        fprintf(stderr, "cohere: dumped %s [%d,%d] -> %s\n", tname, d0, d1, path);
+                    }
+                };
+                // mel_c is host-side [n_mels, T_mel] (ggml col-major).
+                char mpath[1024];
+                std::snprintf(mpath, sizeof(mpath), "%s/crisp.mel.bin", sd);
+                if (FILE* f = std::fopen(mpath, "wb")) {
+                    int32_t d0 = (int32_t)hp.n_mels, d1 = (int32_t)T_mel_c;
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), f);
+                    std::fclose(f);
+                    fprintf(stderr, "cohere: dumped mel [%d,%d] -> %s\n", d0, d1, mpath);
+                }
+                dump_named("enc_final_preproj", "crisp.enc_final.bin");
+                dump_named("enc_block_0", "crisp.block0.bin");
+                dump_named("enc_block_23", "crisp.block23.bin");
+            }
+
+            // Debug: dump post-enc_proj encoder output to compare against the
+            // reference cross-attention context (CRISPASR_COHERE_DUMP_ENCOUT=path).
+            if (const char* dp = std::getenv("CRISPASR_COHERE_DUMP_ENCOUT")) {
+                std::vector<float> eo((size_t)enc_out_t->ne[0] * enc_out_t->ne[1]);
+                ggml_backend_tensor_get(enc_out_t, eo.data(), 0, eo.size() * sizeof(float));
+                FILE* f = std::fopen(dp, "wb");
+                if (f) {
+                    int32_t d0 = (int32_t)enc_out_t->ne[0], d1 = (int32_t)enc_out_t->ne[1];
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(eo.data(), sizeof(float), eo.size(), f);
+                    std::fclose(f);
+                    fprintf(stderr, "cohere: dumped enc_out [%d, %d] to %s\n", d0, d1, dp);
+                }
+            }
 
             // Extract cross-KV from this chunk's encoder graph into CPU vectors.
             // K shape: [head_dim, T_enc_c, n_heads] (raw F32 from encoder graph)
@@ -2489,6 +2623,10 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
     const char* pnc_tok = ctx->params.no_punctuation ? "<|nopnc|>" : "<|pnc|>";
     std::vector<int> prompt = {
+        // decoder_start_token_id = 13764 ("▁"). The reference processor prepends
+        // it to decoder_input_ids; omitting it shifts every decoder position by
+        // one and gives every prompt token the wrong positional embedding.
+        tid("▁"),
         tid("<|startofcontext|>"),
         tid("<|startoftranscript|>"),
         tid("<|emo:undefined|>"),

@@ -96,6 +96,10 @@ struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_context* ct
 
 // Vocabulary helpers
 int parakeet_n_vocab(struct parakeet_context* ctx);
+// Issue #257: 1 iff the model's vocab is predominantly Japanese script (JA-only
+// model). Detects JA by content, not vocab size (small English vocabs were
+// misclassified). Drives the JA-specific short-chunk decode path.
+int parakeet_vocab_is_japanese(struct parakeet_context* ctx);
 int parakeet_blank_id(struct parakeet_context* ctx);
 const char* parakeet_token_to_str(struct parakeet_context* ctx, int token_id);
 
@@ -120,6 +124,11 @@ void parakeet_set_maes(struct parakeet_context* ctx, bool enable, int num_steps,
 
 // CTC decode mode (hybrid TDT+CTC models only).
 void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc);
+// Issue #257: local (windowed) attention window in encoder frames — NeMo's
+// change_attention_model("rel_pos_local_attn", [left, right]). Bounds long-audio
+// encoder memory to O(T·window). left/right < 0 = full attention. Applies to the
+// next transcribe.
+void parakeet_set_att_context(struct parakeet_context* ctx, int left, int right);
 bool parakeet_has_ctc(struct parakeet_context* ctx);
 
 // CTC-WS hotword phrase boost (PLAN #98). Builds an Aho-Corasick trie

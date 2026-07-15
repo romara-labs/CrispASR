@@ -2,9 +2,10 @@ package whisper
 
 // Minimal TTS + S2S surface for the Go binding. Exposes the unified
 // CrispASR Session API for TTS-capable backends (kokoro, vibevoice,
-// qwen3-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
-// melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
-// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio, ...)
+// qwen3-tts, moss-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
+// bananamind-tts, melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
+// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio,
+// dots-tts, ...)
 // and S2S-capable backends (lfm2-audio, mini-omni2), plus the kokoro
 // per-language model + voice resolver (PLAN #56 opt 2b).
 
@@ -50,6 +51,7 @@ int              crispasr_session_set_length_scale(CrispasrSession* s, float sca
 int              crispasr_session_set_g2p_dict(CrispasrSession* s, const char* source);
 int              crispasr_session_set_best_of(CrispasrSession* s, int n);
 int              crispasr_session_set_beam_size(CrispasrSession* s, int n);
+int              crispasr_session_set_return_logits(CrispasrSession* s, int enable);
 int              crispasr_session_set_grammar_text(CrispasrSession* s, const char* gbnf_text,
                                                    const char* root_rule, float penalty);
 int              crispasr_session_set_fallback_thresholds(CrispasrSession* s, float entropy_thold,
@@ -89,8 +91,12 @@ typedef struct crispasr_session_result crispasr_session_result;
 crispasr_session_result* crispasr_session_transcribe(CrispasrSession* s, const float* pcm, int n_samples);
 crispasr_session_result* crispasr_session_transcribe_lang(CrispasrSession* s, const float* pcm, int n_samples,
                                                           const char* language);
+crispasr_session_result* crispasr_session_transcribe_chunked_lang(CrispasrSession* s, const float* pcm, int n_samples,
+                                                                  int chunk_seconds, int overlap_seconds,
+                                                                  const char* language);
 crispasr_session_result* crispasr_session_transcribe_vad(CrispasrSession* s, const float* pcm, int n_samples,
                                                          int sample_rate, const char* vad_model_path, void* opts);
+int          crispasr_get_progress(void);
 int          crispasr_session_result_n_segments(crispasr_session_result* r);
 const char*  crispasr_session_result_segment_text(crispasr_session_result* r, int i);
 long long    crispasr_session_result_segment_t0(crispasr_session_result* r, int i);
@@ -100,6 +106,15 @@ const char*  crispasr_session_result_word_text(crispasr_session_result* r, int i
 long long    crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 long long    crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
+float        crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg);
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
+// Omni & wav2vec2; log-probabilities for canary-ctc. _logits returns NULL when
+// none captured.
+int          crispasr_session_result_n_logit_frames(crispasr_session_result* r);
+int          crispasr_session_result_n_logit_vocab(crispasr_session_result* r);
+const float* crispasr_session_result_logits(crispasr_session_result* r);
 void         crispasr_session_result_free(crispasr_session_result* r);
 
 // --- Punctuation (PLAN #59) ---
@@ -292,6 +307,12 @@ int crispasr_registry_list_backends_abi(char* out_csv, int out_cap);
 
 // --- Session extras ---
 int crispasr_session_available_backends(char* out_csv, int out_cap);
+int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap);
+// CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
+// maps an id to its raw piece (word-boundary marker intact) or "" when out of
+// range / unsupported. Pairs with the result logits accessor for detokenization.
+int          crispasr_session_n_vocab(CrispasrSession* s);
+const char*  crispasr_session_token_text(CrispasrSession* s, int id);
 CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const void* params);
 crispasr_session_result* crispasr_session_transcribe_vad_lang(CrispasrSession* s, const float* pcm, int n_samples,
@@ -312,7 +333,7 @@ import (
 	"unsafe"
 )
 
-// CrispasrSession is a TTS/S2S-capable session (kokoro, vibevoice, qwen3-tts, orpheus, parler-tts, pocket-tts, tada, lfm2-audio, mini-omni2).
+// CrispasrSession is a TTS/S2S-capable session (kokoro, vibevoice, qwen3-tts, moss-tts, orpheus, parler-tts, pocket-tts, tada, lfm2-audio, mini-omni2).
 type CrispasrSession struct {
 	handle *C.CrispasrSession
 }
@@ -478,8 +499,9 @@ func (s *CrispasrSession) SetFrequencyPenalty(penalty float32) error {
 	return nil
 }
 
-// SetTTSSteps sets the diffusion / CFM step count for diffusion-based TTS
-// backends (chatterbox today). Other backends silently no-op.
+// SetTTSSteps sets the diffusion / CFM / masked-iterative step count for
+// step-based TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori,
+// omnivoice). Higher = better fidelity, slower. Other backends silently no-op.
 func (s *CrispasrSession) SetTTSSteps(steps int) error {
 	rc := C.crispasr_session_set_tts_steps(s.handle, C.int(steps))
 	if rc != 0 && rc != -2 {
@@ -626,6 +648,24 @@ func (s *CrispasrSession) SetBeamSize(n int) error {
 	rc := C.crispasr_session_set_beam_size(s.handle, C.int(n))
 	if rc != 0 {
 		return errors.New("crispasr_session_set_beam_size failed")
+	}
+	return nil
+}
+
+// SetReturnLogits opts in to capturing the per-frame CTC logits on
+// subsequent transcribe calls (backends with a dense CTC grid: Omni CTC,
+// wav2vec2/hubert/data2vec, canary-ctc). Off by default: capture
+// copies an NFrames × NVocab float grid per call, so leave it off unless a
+// consumer (e.g. forced alignment) needs the logits. Retrieve them with
+// TranscribeWithLogits.
+func (s *CrispasrSession) SetReturnLogits(on bool) error {
+	enable := C.int(0)
+	if on {
+		enable = 1
+	}
+	rc := C.crispasr_session_set_return_logits(s.handle, enable)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_return_logits failed")
 	}
 	return nil
 }
@@ -1017,14 +1057,30 @@ type TranscribeSegment struct {
 	T0    int64 // centiseconds
 	T1    int64
 	Words []TranscribeWord
+	// NoSpeechProb is Whisper's per-segment no-speech probability (the
+	// <|nospeech|> posterior) in [0, 1]. Whisper-only; other backends leave
+	// the -1.0 "no data" sentinel.
+	NoSpeechProb float32
 }
 
 // TranscribeWord is one word with timing and confidence.
 type TranscribeWord struct {
 	Text string
-	T0   int64   // centiseconds
+	T0   int64 // centiseconds
 	T1   int64
 	P    float32 // confidence
+}
+
+// CtcLogits holds the per-frame CTC logits captured from a CTC backend (Omni
+// CTC, wav2vec2/hubert/data2vec, or canary-ctc). Data is frame-major:
+// Data[t*NVocab + v] is the score for vocabulary entry v at encoder frame t, so
+// len(Data) == NFrames*NVocab. The Omni and wav2vec2 grids are raw logits
+// (pre-softmax); the canary-ctc grid is log-probabilities. Produced only by
+// TranscribeWithLogits; other backends yield no grid.
+type CtcLogits struct {
+	NVocab  int
+	NFrames int
+	Data    []float32
 }
 
 // Transcribe runs ASR on 16 kHz mono float32 PCM.
@@ -1055,6 +1111,66 @@ func (s *CrispasrSession) TranscribeLang(pcm []float32, lang string) (*Transcrib
 	return extractResult(r), nil
 }
 
+// TranscribeWithLogits transcribes 16 kHz mono float32 PCM and also returns the
+// per-frame CTC logits captured for this call. It opts logit capture in for
+// the duration (no prior SetReturnLogits needed). The returned *CtcLogits is
+// nil for backends that don't produce a dense CTC grid or when the transcript
+// is empty.
+func (s *CrispasrSession) TranscribeWithLogits(pcm []float32) (*TranscribeResult, *CtcLogits, error) {
+	if s.handle == nil {
+		return nil, nil, errors.New("session is closed")
+	}
+	if len(pcm) == 0 {
+		return &TranscribeResult{}, nil, nil
+	}
+	if err := s.SetReturnLogits(true); err != nil {
+		return nil, nil, err
+	}
+	defer s.SetReturnLogits(false)
+	pcmPtr := (*C.float)(unsafe.Pointer(&pcm[0]))
+	r := C.crispasr_session_transcribe(s.handle, pcmPtr, C.int(len(pcm)))
+	if r == nil {
+		return nil, nil, errors.New("transcription failed")
+	}
+	defer C.crispasr_session_result_free(r)
+	return extractResult(r), extractLogits(r), nil
+}
+
+// TranscribeChunked runs chunked-encode ASR (issue #208): it forces the
+// Parakeet backend through its bounded overlapping-window long-form path so
+// long audio transcribes in bounded time without dropping sections. Inert
+// (== TranscribeLang) on non-Parakeet backends. chunkSeconds <= 0 keeps the
+// per-model default window; overlapSeconds < 0 keeps the default overlap.
+// Poll GetProgress() (0..100) from another goroutine to render progress.
+func (s *CrispasrSession) TranscribeChunked(pcm []float32, chunkSeconds, overlapSeconds int, lang string) (*TranscribeResult, error) {
+	if s.handle == nil {
+		return nil, errors.New("session is closed")
+	}
+	pcmPtr := (*C.float)(nil)
+	if len(pcm) > 0 {
+		pcmPtr = (*C.float)(unsafe.Pointer(&pcm[0]))
+	}
+	var clang *C.char
+	if lang != "" {
+		clang = C.CString(lang)
+		defer C.free(unsafe.Pointer(clang))
+	}
+	r := C.crispasr_session_transcribe_chunked_lang(s.handle, pcmPtr, C.int(len(pcm)),
+		C.int(chunkSeconds), C.int(overlapSeconds), clang)
+	if r == nil {
+		return nil, errors.New("chunked transcription failed")
+	}
+	defer C.crispasr_session_result_free(r)
+	return extractResult(r), nil
+}
+
+// GetProgress polls long-form (chunked) transcription progress: 0..100, or -1
+// when idle. Updated in lockstep with TranscribeChunked windows (issue #208),
+// so a UI goroutine can render a progress bar without a callback.
+func GetProgress() int {
+	return int(C.crispasr_get_progress())
+}
+
 // TranscribeVAD transcribes with VAD segmentation.
 // vadModelPath can be empty for auto-download of default Silero model.
 func (s *CrispasrSession) TranscribeVAD(pcm []float32, sampleRate int, vadModelPath string) (*TranscribeResult, error) {
@@ -1083,6 +1199,7 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 		seg.Text = C.GoString(C.crispasr_session_result_segment_text(r, C.int(i)))
 		seg.T0 = int64(C.crispasr_session_result_segment_t0(r, C.int(i)))
 		seg.T1 = int64(C.crispasr_session_result_segment_t1(r, C.int(i)))
+		seg.NoSpeechProb = float32(C.crispasr_session_result_segment_no_speech_prob(r, C.int(i)))
 		nWords := int(C.crispasr_session_result_n_words(r, C.int(i)))
 		seg.Words = make([]TranscribeWord, nWords)
 		for j := 0; j < nWords; j++ {
@@ -1094,6 +1211,44 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 		}
 	}
 	return result
+}
+
+// extractLogits lifts out the CTC logits attached to a result (see
+// CtcLogits) into a Go-owned slice before the result is freed. The C buffer is
+// owned by the result, so the data is copied out here. Returns nil unless the
+// session opted in via SetReturnLogits and the backend produced a grid.
+func extractLogits(r *C.crispasr_session_result) *CtcLogits {
+	nFrames := int(C.crispasr_session_result_n_logit_frames(r))
+	nVocab := int(C.crispasr_session_result_n_logit_vocab(r))
+	ptr := C.crispasr_session_result_logits(r)
+	if nFrames <= 0 || nVocab <= 0 || ptr == nil {
+		return nil
+	}
+	n := nFrames * nVocab
+	data := make([]float32, n)
+	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), n)
+	copy(data, src)
+	return &CtcLogits{NVocab: nVocab, NFrames: nFrames, Data: data}
+}
+
+// CtcVocab returns the Omni CTC vocabulary as raw pieces indexed by token id
+// (vocab[id]). Pieces keep their word-boundary marker intact (the v2 Omni vocab
+// uses a literal space, v1 uses U+2581), so a consumer can detokenize a greedy
+// CTC decode over the grid from TranscribeWithLogits. Returns nil for backends
+// that don't expose a CTC vocab.
+func (s *CrispasrSession) CtcVocab() []string {
+	if s.handle == nil {
+		return nil
+	}
+	n := int(C.crispasr_session_n_vocab(s.handle))
+	if n <= 0 {
+		return nil
+	}
+	vocab := make([]string, n)
+	for i := 0; i < n; i++ {
+		vocab[i] = C.GoString(C.crispasr_session_token_text(s.handle, C.int(i)))
+	}
+	return vocab
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,10 +1362,10 @@ func VADSegments(vadModelPath string, pcm []float32, sampleRate int, threshold f
 type DiarizeMethod int
 
 const (
-	DiarizeEnergy    DiarizeMethod = 0 // stereo-only, energy-based
-	DiarizeXCorr     DiarizeMethod = 1 // stereo-only, cross-correlation
-	DiarizeVADTurns  DiarizeMethod = 2 // mono-friendly, gap-based
-	DiarizePyannote  DiarizeMethod = 3 // pyannote v3 segmentation model
+	DiarizeEnergy   DiarizeMethod = 0 // stereo-only, energy-based
+	DiarizeXCorr    DiarizeMethod = 1 // stereo-only, cross-correlation
+	DiarizeVADTurns DiarizeMethod = 2 // mono-friendly, gap-based
+	DiarizePyannote DiarizeMethod = 3 // pyannote v3 segmentation model
 )
 
 // DiarizeSeg is one input/output segment for diarization.
@@ -1275,9 +1430,10 @@ func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 // SpeakerEmbedder wraps a pluggable speaker-embedding model.
 //
 // Known aliases (case-insensitive):
-//   "auto" / "titanet"                            -> TitaNet-Large (192-d)
-//   "indextts" / "indextts-bigvgan" / "ecapa"     -> IndexTTS-BigVGAN ECAPA-TDNN (512-d)
-//   any .gguf path                                -> TitaNet (or IndexTTS if "indextts" in name)
+//
+//	"auto" / "titanet"                            -> TitaNet-Large (192-d)
+//	"indextts" / "indextts-bigvgan" / "ecapa"     -> IndexTTS-BigVGAN ECAPA-TDNN (512-d)
+//	any .gguf path                                -> TitaNet (or IndexTTS if "indextts" in name)
 //
 // Always call Close() — the C-side context owns model weights.
 type SpeakerEmbedder struct {
@@ -1611,6 +1767,15 @@ func AvailableBackends() []string {
 	return out
 }
 
+// DetectedLanguage returns the acoustic language Whisper detected on the last
+// transcribe as an ISO-639-1 code (e.g. "en"). Whisper-only; other backends
+// return the session's source-language hint, or "unknown".
+func (s *Session) DetectedLanguage() string {
+	var buf [32]C.char
+	C.crispasr_session_detected_language(s.handle, &buf[0], 32)
+	return C.GoString(&buf[0])
+}
+
 func splitCSV(s string) []string {
 	var out []string
 	start := 0
@@ -1670,7 +1835,10 @@ func DetectBackendFromGGUF(path string) (string, error) {
 	defer C.free(unsafe.Pointer(cpath))
 	var out [128]C.char
 	rc := C.crispasr_detect_backend_from_gguf(cpath, &out[0], 128)
-	if rc != 0 {
+	// rc > 0 = detected (strlen of name); rc == 0 = valid GGUF but no backend
+	// mapping (empty name); rc < 0 = error. The prior `rc != 0` reported every
+	// successful detection as a failure.
+	if rc < 0 {
 		return "", fmt.Errorf("detect_backend_from_gguf failed for %s", path)
 	}
 	return C.GoString(&out[0]), nil

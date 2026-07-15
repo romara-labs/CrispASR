@@ -6,9 +6,11 @@
 
 #include "omniasr.h"
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -140,6 +142,15 @@ struct omniasr_context {
     std::vector<int32_t>* capture_token_ids = nullptr;
     std::vector<float>* capture_token_probs = nullptr;
 
+    // Per-call capture for the raw CTC logits (model_type 0). When
+    // capture_ctc_logits is non-null the greedy CTC path copies its
+    // [n_vocab * n_frames] logit grid (frame-major: logits[t*V + v]) here and
+    // records the shape. Used by omniasr_transcribe_with_logits for downstream
+    // forced alignment; nullptr on the normal greedy path.
+    std::vector<float>* capture_ctc_logits = nullptr;
+    int* capture_ctc_n_vocab = nullptr;
+    int* capture_ctc_n_frames = nullptr;
+
     // Sticky per-call seed override for best-of-N sampling. 0 = derive
     // deterministically from the encoder output (repeated calls with the
     // same audio give identical samples). Non-zero lets the caller inject
@@ -212,14 +223,7 @@ static void dump_tensor(ggml_tensor* t, const char* name, const char* dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     int n = (int)ggml_nelements(t);
-    std::vector<float> data(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, data.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<uint16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(uint16_t));
-        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(tmp.data()), data.data(), n);
-    }
+    std::vector<float> data = core_cpu::to_f32(t); // F32/F16/quantized-safe
     FILE* f = fopen(path, "wb");
     if (f) {
         fwrite(data.data(), sizeof(float), n, f);
@@ -442,7 +446,7 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
 
     // Load weights
     if (params.use_gpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
     }
     if (!ctx->backend) {
         ctx->backend = ggml_backend_cpu_init();
@@ -928,6 +932,17 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     ggml_backend_tensor_get(logits_t, logits.data(), 0, V * T * sizeof(float));
     ggml_free(ctx0);
 
+    // Optional raw-logits capture for forced alignment (opt-in via
+    // omniasr_transcribe_with_logits). Copy, not move: the greedy decode
+    // below still consumes `logits`.
+    if (ctx->capture_ctc_logits) {
+        *ctx->capture_ctc_logits = logits;
+        if (ctx->capture_ctc_n_vocab)
+            *ctx->capture_ctc_n_vocab = V;
+        if (ctx->capture_ctc_n_frames)
+            *ctx->capture_ctc_n_frames = T;
+    }
+
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "omniasr: logits [%d, %d], CTC decoding...\n", V, T);
 
@@ -992,6 +1007,47 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     perf.t_total_us = ggml_time_us() - t_total0;
     omniasr_perf_print(perf, n_samples, ctx->params.verbosity);
     return out;
+}
+
+extern "C" char* omniasr_transcribe_with_logits(struct omniasr_context* ctx, const float* samples, int n_samples,
+                                                float** out_logits, int* out_n_vocab, int* out_n_frames) {
+    if (out_logits)
+        *out_logits = nullptr;
+    if (out_n_vocab)
+        *out_n_vocab = 0;
+    if (out_n_frames)
+        *out_n_frames = 0;
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+
+    // Only the non-autoregressive CTC head exposes a dense per-frame logit
+    // grid. The LLM variant decodes token-by-token — there is no [V, T] grid to
+    // hand back — so fall through to plain transcribe with empty logits.
+    if (ctx->model.hp.model_type != 0)
+        return omniasr_transcribe(ctx, samples, n_samples);
+
+    std::vector<float> logits;
+    int V = 0, T = 0;
+    ctx->capture_ctc_logits = &logits;
+    ctx->capture_ctc_n_vocab = &V;
+    ctx->capture_ctc_n_frames = &T;
+    char* text = omniasr_transcribe(ctx, samples, n_samples);
+    ctx->capture_ctc_logits = nullptr;
+    ctx->capture_ctc_n_vocab = nullptr;
+    ctx->capture_ctc_n_frames = nullptr;
+
+    if (out_logits && !logits.empty()) {
+        float* buf = (float*)malloc(logits.size() * sizeof(float));
+        if (buf) {
+            memcpy(buf, logits.data(), logits.size() * sizeof(float));
+            *out_logits = buf;
+            if (out_n_vocab)
+                *out_n_vocab = V;
+            if (out_n_frames)
+                *out_n_frames = T;
+        }
+    }
+    return text;
 }
 
 // ===========================================================================
@@ -1707,6 +1763,10 @@ extern "C" const char* omniasr_token_text(struct omniasr_context* ctx, int id) {
     if (!ctx || id < 0 || id >= (int)ctx->model.vocab.size())
         return "";
     return ctx->model.vocab[id].c_str();
+}
+
+extern "C" int omniasr_n_vocab(struct omniasr_context* ctx) {
+    return ctx ? (int)ctx->model.vocab.size() : 0;
 }
 
 extern "C" void omniasr_set_seed(struct omniasr_context* ctx, uint64_t seed) {

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits> // INT_MIN (att_context_* sentinels) — issue #257
 #include <string>
 #include <thread>
 #include <vector>
@@ -112,6 +113,7 @@ struct whisper_params {
     int flush_after = 0;
     bool show_alternatives = false;
     int32_t n_alternatives = 3;
+    bool return_logits = false;
     std::string aligner_model;
     // PLAN issue #62: when true, the CTC forced aligner runs even on
     // backends that already produce native timestamps — replacing
@@ -148,8 +150,22 @@ struct whisper_params {
     bool warmup = false;    // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
     bool no_warmup = false; // --no-warmup: skip the always-on server warmup (e.g. crashes on some Vulkan drivers, #165)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
-    std::string hotwords;         // comma-separated hotword list (PLAN #98)
-    float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
+    // Issue #257: parakeet/canary local-attention window (encoder frames, 1 = ~80 ms)
+    // — NeMo change_attention_model("rel_pos_local_attn", [L,R]); bounds long-audio
+    // encoder memory to O(T·window). INT_MIN = unset (use the model default);
+    // negative = full attention. Set via --att-context "L,R".
+    int att_context_left = INT_MIN;
+    int att_context_right = INT_MIN;
+    std::string hotwords;        // comma-separated hotword list (PLAN #98)
+    float hotwords_boost = 2.0f; // per-token log-prob boost for hotword prefix matches
+    // Free-form hotword/context text injected into the vibevoice-asr prompt
+    // (only backend that reads this so far). Matches the `context_info` param
+    // in microsoft/VibeVoice's vibevoice_asr_processor.py.
+    std::string context;
+    // #205: granite-speech incremental decoding — seed the assistant turn with a
+    // previously-decoded transcript so the model continues from it instead of
+    // re-decoding (model-card `prefix_text`). Output is the continuation only.
+    std::string prefix_text;
     std::string lid_backend;
     std::string lid_model;
     // Post-ASR text LID: when set, after transcription completes, run
@@ -285,6 +301,23 @@ struct whisper_params {
     std::string make_ref_aligner; // aligner GGUF path (auto-discovered if empty)
     std::string make_ref_encoder; // encoder GGUF path (auto-discovered if empty)
 
+    // Forced alignment / word timestamps via the TADA aligner (reuses the
+    // make-ref encoder+aligner). Input: --voice <audio> + --ref-text "<text>".
+    bool align = false;
+    std::string align_output;         // output path (default: stdout)
+    std::string align_format = "srt"; // srt | json | plain
+
+    // Issue #217: standalone CTC forced alignment mode.
+    // Input: audio file + text (--ref-text or --text-file).
+    // Runs the CTC aligner (canary-ctc / wav2vec2 / qwen3-fa) without
+    // requiring an ASR model or transcription step.
+    bool align_only = false;
+    std::string text_file; // path to .txt or .srt (text extracted, timestamps stripped)
+    // Output granularity: "word" = one entry per aligned word; "segment" =
+    // one entry per input SRT cue (or per non-empty .txt line), re-timed
+    // from the word alignment; "auto" = segment for .srt input, word otherwise.
+    std::string align_granularity = "auto"; // auto | word | segment
+
     // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
     // When set, loads the GGUF and uses it for watermark embed/detect
     // instead of the built-in spread-spectrum watermark.
@@ -313,6 +346,13 @@ struct whisper_params {
     // Machine-readable provenance (watermark + C2PA) is always retained.
     // CLI: --no-spoken-disclaimer   Server: "spoken_disclaimer": false
     bool tts_no_spoken_disclaimer = false;
+
+    // Turn off the imperceptible AI-content watermark on TTS output.
+    // Equivalent to the CRISPASR_NO_WATERMARK env var; both emit a one-time
+    // warning that AI-usage marking responsibility then rests with the operator.
+    // On by default — see docs/issue-260/PLAN.md for the regulatory background.
+    // CLI: --no-watermark
+    bool tts_no_watermark = false;
 
     // Server mode: directory containing voice profiles for /v1/audio/speech.
     // Each profile is a sibling pair: <name>.wav + <name>.txt (the WAV is
@@ -359,6 +399,12 @@ struct whisper_params {
     // Playback uses the same watermarked PCM that is written to --tts-output.
     bool tts_play = false;
     int tts_play_device = -1;
+
+    // --tts-stream: stream synthesized audio to stdout as raw signed-16-bit
+    // little-endian mono PCM (at the backend's sample rate), emitting each
+    // sentence chunk as it is produced instead of writing one WAV at the end.
+    // For piping into a player, e.g. `… --tts-stream | ffplay -f s16le -ar 48000 -`.
+    bool tts_stream = false;
 
     // G2P phonemizer dictionary source:
     //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)

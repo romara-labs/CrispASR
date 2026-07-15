@@ -26,6 +26,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -33,6 +34,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/crispasr_lcs.h"
 #include "core/fastconformer.h"
@@ -172,6 +174,11 @@ struct canary_model {
 
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8)
+    core_conformer::PwRepackBuf pw_q8;
+    // Fused Q/K/V weight concat (issue #81, CRISPASR_FC_FUSED_QKV)
+    core_conformer::PwRepackBuf qkv_fused;
 
     std::map<std::string, ggml_tensor*> tensors;
 };
@@ -507,6 +514,7 @@ static void canary_fft_r2c(const float* in, int N, float* out) {
 // Delegates to core_mel::compute() with the NeMo cluster's parameters; only
 // the FFT function pointer differs between parakeet/canary/canary_ctc/cohere.
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -671,28 +679,27 @@ static std::vector<float> canary_encode_mel(canary_context* ctx, const float* me
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
-    // §176s: reuse cached encoder graph when T_mel matches.
-    ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
-        gf = ctx->cached_enc_gf;
-    } else {
-        if (ctx->cached_enc_ctx) {
-            ggml_free(ctx->cached_enc_ctx);
-            ctx->cached_enc_ctx = nullptr;
-            ctx->cached_enc_gf = nullptr;
-        }
-        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
-        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
-        ctx->cached_enc_ctx = ggml_init(aip);
-        gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
-        ctx->cached_enc_gf = gf;
-        ctx->cached_enc_T_mel = T_mel;
+    // #215e UAF fix: rebuild the encoder graph every invocation. A cached graph's
+    // tensor->buffer pointers go stale when the sched's gallocr regrows for a
+    // larger interleaved graph (decoder/adapter). The graph-build is fast (~0.1 ms);
+    // the sched alloc + compute dominate. Same fix as moss_transcribe (#215).
+    if (ctx->cached_enc_ctx) {
+        ggml_free(ctx->cached_enc_ctx);
+        ctx->cached_enc_ctx = nullptr;
+        ctx->cached_enc_gf = nullptr;
     }
+    ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+    ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+    ctx->cached_enc_ctx = ggml_init(aip);
+    ggml_cgraph* gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+    ctx->cached_enc_gf = gf;
+    ctx->cached_enc_T_mel = T_mel;
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1168,17 +1175,20 @@ static void canary_fold_batchnorm(canary_model& model) {
         for (int c = 0; c < d; c++)
             s[c] = bn_w[c] / sqrtf(bn_var[c] + eps);
 
-        std::vector<ggml_fp16_t> w_f16((size_t)K * d);
-        ggml_backend_tensor_get(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
-        std::vector<float> w_f32((size_t)K * d);
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f32[i] = ggml_fp16_to_fp32(w_f16[i]);
+        std::vector<float> w_f32 = core_cpu::to_f32(e.conv_dw_w); // F32/F16/quantized-safe read
         for (int c = 0; c < d; c++)
             for (int ki = 0; ki < K; ki++)
                 w_f32[ki + c * K] *= s[c];
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
-        ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        // Write back in the tensor's native dtype — an F32 conv_dw_w (--f32-encoder
+        // GGUFs / diff-harness validation) must NOT be clobbered with F16 (c9a4de65).
+        if (e.conv_dw_w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(e.conv_dw_w, w_f32.data(), 0, w_f32.size() * sizeof(float));
+        } else {
+            std::vector<ggml_fp16_t> w_f16(w_f32.size());
+            for (size_t i = 0; i < w_f16.size(); i++)
+                w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
+            ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        }
 
         // Fold into existing dw_b: b'[c] = (dw_b[c] - mean[c]) * s[c] + bn_b[c]
         for (int c = 0; c < d; c++)
@@ -1194,11 +1204,11 @@ static void canary_fold_batchnorm(canary_model& model) {
 // ===========================================================================
 
 static ggml_backend_t pick_backend() {
-    // ggml_backend_init_best() tries all compiled backends in priority
+    // crispasr_init_gpu_backend() tries all compiled backends in priority
     // order (CUDA > Metal > Vulkan > CPU) and returns the first one
     // that initialises. This replaces the old Metal/CUDA-specific
     // #ifdef chain and adds Vulkan support for free.
-    ggml_backend_t b = ggml_backend_init_best();
+    ggml_backend_t b = crispasr_init_gpu_backend();
     return b ? b : ggml_backend_cpu_init();
 }
 
@@ -1265,6 +1275,7 @@ extern "C" int canary_run_encoder_staged(struct canary_context* ctx, const float
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 24576, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 24576 + ggml_graph_overhead_custom(24576, false));
@@ -1361,6 +1372,18 @@ extern "C" struct canary_context* canary_init_from_file(const char* path_model, 
         return nullptr;
     }
     canary_fold_batchnorm(ctx->model);
+
+    // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
+    // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "canary");
+        core_conformer::fuse_qkv(layers, ctx->backend, m.qkv_fused, "canary");
+    }
     return ctx;
 }
 
@@ -1379,6 +1402,8 @@ extern "C" void canary_free(struct canary_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
+    ctx->model.qkv_fused.free();
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)

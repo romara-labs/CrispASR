@@ -88,7 +88,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `model` | Ignored (uses the loaded model) |
 | `language` | ISO-639-1 code (default: server's `-l` setting) |
 | `prompt` | Initial prompt / context |
-| `response_format` | `json` (default), `verbose_json`, `text`, `srt`, `vtt` |
+| `response_format` | `json` (default), `verbose_json`, `diarized_json`, `text`, `srt`, `vtt` |
 | `temperature` | Sampling temperature (default: 0.0) |
 | `seed` | RNG seed for sampling (`0` = non-deterministic) |
 | `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
@@ -117,6 +117,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `grammar_rule` | Root rule name for the grammar |
 | `best_of` | Whisper best-of-N sampling candidates |
 | `beam_size` | Whisper beam search width |
+| `return_logits` | `true`/`false` — for supported dense CTC backends, include `ctc_logits` in JSON responses (`n_frames`, `n_vocab`, frame-major `data`, optional `vocab`) |
 | `entropy_thold` | Entropy threshold for decoder fallback |
 | `logprob_thold` | Log-probability threshold for decoder fallback |
 | `no_speech_thold` | No-speech probability threshold |
@@ -129,8 +130,18 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `split_on_word` | `true`/`false` — split segments on word boundaries |
 | `max_len` | Maximum segment length in characters |
 | `chunk_seconds` | Maximum chunk duration for long audio (default: 30) |
+| `chunk_overlap` | Overlap context (seconds) around chunk boundaries |
 
 The `/inference` endpoint accepts the same CrispASR extension fields.
+
+> **Parakeet segmentation (issue #257).** Backends that chunk internally
+> (parakeet/canary — full-attention FastConformer) now receive the whole clip
+> instead of dispatcher-pre-sliced pieces (per-slice transcribe corrupts this
+> encoder). With an explicit `chunk_seconds=N`, the non-JA Parakeet response is
+> split into **~N-second segments** of the complete transcript (each with
+> `start`/`end`/`words`); without it, one coherent segment (or the silence-split
+> longform above the memory cap). VAD, when requested, still provides
+> silence-bounded slices. Matches the CLI's `--chunk-seconds` behaviour.
 
 ### Server startup flags (resident post-processors)
 
@@ -163,6 +174,47 @@ curl http://localhost:8080/v1/audio/transcriptions \
   -F "diarize=true" \
   -F "diarize_method=pyannote"
 ```
+
+### Diarized JSON format (#206)
+
+`response_format=diarized_json` returns OpenAI-compatible verbose JSON
+extended with per-segment speaker labels. Speaker strings are normalised
+to single letters (`A`, `B`, `C`, …). Each segment includes a `type`
+field for compatibility with transcription clients that expect the
+diarized schema.
+
+```bash
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@DIALOGUE.ogg" \
+  -F "response_format=diarized_json" \
+  -F "diarize=true" \
+  -F "diarize_method=pyannote"
+```
+
+Response structure:
+
+```json
+{
+  "task": "transcribe",
+  "language": "en",
+  "duration": 245.029,
+  "text": "Full transcript text...",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.00,
+      "end": 26.10,
+      "text": "I'll tell you basically what this is about...",
+      "speaker": "A",
+      "type": "transcript.text.segment"
+    }
+  ]
+}
+```
+
+When `diarize` is not enabled, all segments default to speaker `"A"`.
+Word-level timestamps are included in each segment when the backend
+provides them.
 
 ### Translation example
 
@@ -230,9 +282,16 @@ curl http://localhost:8080/v1/audio/speech \
 | `cfg_scale` | backend default | Classifier-free-guidance scale. For tada the acoustic CFG (Python `acoustic_cfg`, default 1.6). Also chatterbox/f5. Per request. |
 | `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
-| `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), or `f32` (crispasr-specific raw float32 for downstream DSP). |
+| `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
 | `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
 | `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
+
+> **Watermarking.** Every response is watermarked by default. There is **no
+> per-request watermark toggle** — the mark is disabled only at the process
+> level by starting the server with `--no-watermark` (or `CRISPASR_NO_WATERMARK=1`),
+> which turns it off for **all** responses and logs a one-time warning that the
+> AI-content marking responsibility then rests with the operator. See
+> [`tts.md`](tts.md#disabling-the-watermark-operator-opt-out).
 
 **Returns:**
 
@@ -241,6 +300,7 @@ curl http://localhost:8080/v1/audio/speech \
 | 200 | `audio/wav` | RIFF WAV, 16-bit PCM int16, 24 kHz mono |
 | 200 | `audio/pcm` | Raw int16 LE bytes (OpenAI `pcm`) |
 | 200 | `application/octet-stream` | Raw float32 PCM (`f32`) |
+| 200 | `audio/mpeg` / `audio/aac` / `audio/ogg` | Compressed `mp3` / `aac` / `opus` (Ogg Opus) via glint |
 | 400 | `application/json` | OpenAI error shape: `{"error": {"message", "type", "code", "param"}}`. Codes: `missing_required_field`, `input_too_long`, `invalid_json`, `invalid_speed`, `unsupported_response_format`. |
 | 500 | `application/json` | Synthesis returned empty (e.g. unknown voice). `code=synthesis_failed`. |
 | 503 | `application/json` | Model still loading. |
@@ -367,14 +427,15 @@ curl http://localhost:8080/v1/audio/speech-to-speech \
 
 The intermediate ASR transcript (if the backend produces one) is
 returned in the `X-Transcript` response header (URL-encoded). Output
-audio is watermarked automatically, same as TTS.
+audio is watermarked by default, same as TTS (process-level opt-out via
+`--no-watermark` / `CRISPASR_NO_WATERMARK`).
 
 ### Deferred
 
 | Feature | Status |
 |---|---|
 | Streaming response (chunked / SSE) | Pending — see PLAN §70 (couples with chunked-VAE for the full latency win). |
-| `mp3` / `opus` / `aac` / `flac` encoding | Not implemented — needs lame/opusenc/etc. as build deps. |
+| `mp3` / `aac` / `opus` encoding | **Done** — encoded in-tree by glint, no build deps (`response_format=mp3\|aac\|opus`; `opus` = Ogg Opus). `flac` output still pending. |
 | `POST /v1/voices` (multipart upload for runtime provisioning) | Pending — security review (size limits, content-type validation, disk quota). |
 | `DELETE /v1/voices/{name}` | Pending alongside upload. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |

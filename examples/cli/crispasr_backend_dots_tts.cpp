@@ -46,6 +46,24 @@ static std::string discover_vocoder(const std::string& model_path) {
     return "";
 }
 
+// Look for a sibling CAM++ speaker-encoder GGUF next to the main model.
+static std::string discover_speaker(const std::string& model_path) {
+    auto sep = model_path.find_last_of("/\\");
+    const std::string dir = (sep == std::string::npos) ? std::string(".") : model_path.substr(0, sep);
+    static const char* candidates[] = {
+        "dots-tts-soar-spk-f16.gguf",
+        "dots-tts-soar-spk.gguf",
+        "dots-tts-spk-f16.gguf",
+    };
+    for (const char* name : candidates) {
+        std::string p = dir + "/" + name;
+        if (file_exists(p)) {
+            return p;
+        }
+    }
+    return "";
+}
+
 class DotsTtsBackend : public CrispasrBackend {
 public:
     DotsTtsBackend() = default;
@@ -70,9 +88,12 @@ public:
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         cp.seed = p.seed;
 
-        if (p.temperature > 0.0f) {
+        if (p.temperature > 0.0f)
             cp.temperature = p.temperature;
-        }
+        if (p.tts_steps > 0)
+            cp.ode_steps = p.tts_steps;
+        if (p.tts_cfg_scale > 0.0f)
+            cp.cfg_scale = p.tts_cfg_scale;
 
         ctx_ = dots_tts_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
@@ -107,6 +128,26 @@ public:
             fprintf(stderr, "crispasr[dots-tts]: WARNING: vocoder GGUF not found — synthesis will fail\n");
         }
 
+        // Voice cloning (optional): --voice <ref.wav> conditions synthesis on a
+        // CAM++ speaker embedding. Needs the speaker-encoder GGUF (sibling, or
+        // the registry companion). Without --voice, synthesis is text-only.
+        if (!p.tts_voice.empty()) {
+            // Speaker-encoder GGUF: --codec-model override (if it names a spk
+            // file), else the sibling dots-tts-soar-spk-*.gguf next to the core.
+            std::string spk_path = discover_speaker(p.model);
+            if (spk_path.empty()) {
+                fprintf(stderr, "crispasr[dots-tts]: WARNING: --voice given but speaker encoder GGUF not found "
+                                "(expected dots-tts-soar-spk-f16.gguf beside the model) — ignoring voice prompt\n");
+            } else if (dots_tts_set_speaker_path(ctx_, spk_path.c_str()) != 0 ||
+                       dots_tts_set_voice_prompt(ctx_, p.tts_voice.c_str()) != 0) {
+                fprintf(stderr, "crispasr[dots-tts]: WARNING: failed to apply voice prompt '%s'\n",
+                        p.tts_voice.c_str());
+            } else if (!p.no_prints) {
+                fprintf(stderr, "crispasr[dots-tts]: voice = '%s' (encoder '%s')\n", p.tts_voice.c_str(),
+                        spk_path.c_str());
+            }
+        }
+
         return true;
     }
 
@@ -119,6 +160,11 @@ public:
             dots_tts_set_temperature(ctx_, params.temperature);
         }
         dots_tts_set_seed(ctx_, params.seed);
+
+        // Per-call voice gating: the spoken AI-disclaimer is synthesized with a
+        // cleared params.tts_voice → neutral voice. Re-enable for the cloned
+        // (non-empty tts_voice) call. No-op when no reference voice was loaded.
+        dots_tts_set_voice_enabled(ctx_, params.tts_voice.empty() ? 0 : 1);
 
         int n = 0;
         float* pcm = dots_tts_synthesize(ctx_, text.c_str(), &n);

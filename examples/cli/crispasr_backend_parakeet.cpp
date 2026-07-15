@@ -9,6 +9,7 @@
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
 #include "core/asr_context_bias.h"
+#include "core/asr_segment_group.h" // issue #257: output-segment grouping
 
 #include "parakeet.h"
 
@@ -72,7 +73,10 @@ public:
         }
         // Issue #89: JA-only models (vocab=3072) collapse past ~12 s on
         // real audio. Auto-chunk at 10 s instead of the global 30 s default.
-        is_ja_model_ = (parakeet_n_vocab(ctx_) <= 4096);
+        // Issue #257: detect JA by vocab content, not size — small-vocab ENGLISH
+        // models (parakeet-tdt-1.1b, vocab ~1024) were misclassified as Japanese
+        // and forced onto the JA short-chunk path, corrupting long/chunked output.
+        is_ja_model_ = parakeet_vocab_is_japanese(ctx_) != 0;
         // CTC decode mode (hybrid TDT+CTC models).
         if (p.parakeet_decoder == "ctc") {
             if (parakeet_has_ctc(ctx_)) {
@@ -110,6 +114,13 @@ public:
         // sampling state from a prior file.
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
         parakeet_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+
+        // Issue #257: local-attention window (--att-context "L,R") — NeMo
+        // rel_pos_local_attn, bounds long-audio encoder VRAM. INT_MIN = unset
+        // (keep the model default loaded from the GGUF / env).
+        if (params.att_context_left != INT_MIN && params.att_context_right != INT_MIN) {
+            parakeet_set_att_context(ctx_, params.att_context_left, params.att_context_right);
+        }
 
         // MAES beam search (env: CRISPASR_PARAKEET_MAES=1, or --decode maes).
         // Requires beam_size > 1. Configurable via env vars.
@@ -203,7 +214,47 @@ public:
         //   CRISPASR_PARAKEET_STREAM_CHUNK / _OVERLAP : streamed encoder window.
         // CLI escape hatches (no env needed): --chunk-seconds N forces the
         // dispatcher's N-second chunk+merge; --vad forces the VAD path.
-        int stream_threshold_s = is_ja_model_ ? 0 : 300;
+        // JA: single-pass is NeMo-exact and safe up to ~12 s (issue #89 —
+        // past that the encoder collapses on real speech); with the VAD
+        // slice cap at 12 s every slice decodes single-pass. Longer inputs
+        // (explicit --chunk-seconds 0) still stream.
+        // Issue #257: honor CLI --chunk-seconds / --chunk-overlap. The dispatcher
+        // stops slicing us when --chunk-seconds is explicit (CAP_INTERNAL_CHUNKING,
+        // non-JA), so we receive the whole audio here and drive the library's
+        // internal encoder-frame streaming (one coherent decode over concatenated
+        // encoder output) instead of the dispatcher's per-slice transcribe+merge,
+        // which corrupts this full-attention encoder.
+        //
+        // Two things are DECOUPLED here (they were conflated before, which both
+        // truncated text and produced one giant segment — issue #257 reports):
+        //   1. ENCODER window — kept at the model's quality default (30 s for
+        //      non-JA), NOT the requested chunk length. Small encoder windows
+        //      shift this full-attention FastConformer's per-feature statistics
+        //      and make the TDT decoder emit a sparse/truncated token path (see
+        //      parakeet_transcribe_streamed): --chunk-seconds 7 was dropping the
+        //      tail. The 30 s window keeps text complete AND bounds encoder VRAM
+        //      (no O(T^2) single-pass blow-up). Power users can still force the
+        //      encoder window via CRISPASR_PARAKEET_STREAM_CHUNK.
+        //   2. OUTPUT segmentation — the coherent decode's words/tokens are then
+        //      grouped into ~chunk_seconds segments (core_segment::group_by_window)
+        //      so -ojf/-osrt emit per-segment offsets like whisper/cohere/granite,
+        //      instead of one blob. No overlap/merge → no boundary duplicates.
+        // JA keeps the dispatcher's VAD/12 s slicing (no CAP_INTERNAL_CHUNKING).
+        if (!is_ja_model_ && params.chunk_seconds_explicit && params.chunk_seconds > 0) {
+            const int seg_seconds = std::max(2, params.chunk_seconds); // output segment length
+            int enc_window = 0;                                        // 0 → library quality default (30 s non-JA)
+            if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
+                enc_window = std::max(2, atoi(e));
+            const int ov = std::max(0, (int)(params.chunk_overlap_seconds + 0.5f));
+            parakeet_result* rc = parakeet_transcribe_streamed(ctx_, samples, n_samples, t_offset_cs, enc_window, ov);
+            if (!rc)
+                return out;
+            out = split_result_into_segments(rc, t_offset_cs, seg_seconds);
+            parakeet_result_free(rc);
+            return out;
+        }
+
+        int stream_threshold_s = is_ja_model_ ? 12 : 300;
         bool longform_enabled = !is_ja_model_;
         int stream_chunk_s = 0; // 0 = let the C library pick per-model
         int stream_overlap_s = 2;
@@ -273,6 +324,84 @@ public:
             seg.t1 = seg.tokens.back().t1;
         }
         return seg;
+    }
+
+    // Issue #257: split ONE coherent parakeet decode into ~seg_seconds output
+    // segments, snapped to word boundaries. The decode is unchanged (full
+    // context → complete, uncorrupted text); we only group the resulting words
+    // and tokens into multiple crispasr_segments so -ojf/-osrt emit per-segment
+    // offsets like the whisper/cohere/granite backends. Contiguous (no overlap)
+    // → the whole transcript is covered exactly once, no boundary duplicates.
+    static std::vector<crispasr_segment> split_result_into_segments(const parakeet_result* r, int64_t fallback_t0_cs,
+                                                                    int seg_seconds) {
+        std::vector<crispasr_segment> out;
+        if (!r)
+            return out;
+        // No word timings (e.g. empty / all-blank decode) → one segment.
+        if (r->n_words <= 0) {
+            crispasr_segment seg = result_to_segment(r, fallback_t0_cs);
+            if (!seg.text.empty() || !seg.tokens.empty())
+                out.push_back(std::move(seg));
+            return out;
+        }
+
+        std::vector<int64_t> word_t0;
+        word_t0.reserve(r->n_words);
+        for (int i = 0; i < r->n_words; i++)
+            word_t0.push_back(r->words[i].t0);
+        const std::vector<int> starts = core_segment::group_by_window(word_t0, (int64_t)seg_seconds * 100);
+
+        int ti = 0; // token cursor (r->tokens is time-ordered)
+        for (size_t si = 0; si < starts.size(); si++) {
+            const int w_begin = starts[si];
+            const int w_end = (si + 1 < starts.size()) ? starts[si + 1] : r->n_words;
+
+            crispasr_segment seg;
+            std::string text;
+            for (int wi = w_begin; wi < w_end; wi++) {
+                const auto& w = r->words[wi];
+                // parakeet word.text has the leading space dropped and
+                // punctuation attached; re-join with a single space.
+                if (!text.empty())
+                    text += ' ';
+                text += w.text;
+                crispasr_word cw;
+                cw.text = w.text;
+                cw.t0 = w.t0;
+                cw.t1 = w.t1;
+                seg.words.push_back(std::move(cw));
+            }
+            seg.text = std::move(text);
+            seg.t0 = seg.words.front().t0;
+            seg.t1 = seg.words.back().t1;
+
+            // Assign tokens up to the next segment's first word start (the last
+            // segment takes the remainder) so the token stream stays complete.
+            const int64_t next_start = (w_end < r->n_words) ? r->words[w_end].t0 : INT64_MAX;
+            for (; ti < r->n_tokens && r->tokens[ti].t0 < next_start; ti++) {
+                const auto& t = r->tokens[ti];
+                crispasr_token ct;
+                ct.text = t.text;
+                ct.id = t.id;
+                ct.t0 = t.t0;
+                ct.t1 = t.t1;
+                ct.confidence = t.p;
+                seg.tokens.push_back(std::move(ct));
+            }
+            out.push_back(std::move(seg));
+        }
+        // Safety: any trailing tokens (t0 beyond the last word) → last segment.
+        for (; ti < r->n_tokens && !out.empty(); ti++) {
+            const auto& t = r->tokens[ti];
+            crispasr_token ct;
+            ct.text = t.text;
+            ct.id = t.id;
+            ct.t0 = t.t0;
+            ct.t1 = t.t1;
+            ct.confidence = t.p;
+            out.back().tokens.push_back(std::move(ct));
+        }
+        return out;
     }
 
     // Find a silence cut near `target` within [target - window, target] by
@@ -376,6 +505,20 @@ public:
         // (repetition loops). VAD gives silence-bounded segments matching
         // the ~10-15 s utterances the model was trained on.
         return is_ja_model_;
+    }
+
+    int vad_slice_cap_seconds() const override {
+        // Issue #89: on continuous speech (podcasts) VAD merges slices far
+        // past the JA encoder's ~12 s safe single-pass window and the
+        // decode goes sparse (56 % content recall on the reporter's clip).
+        // Capping slices at 12 s + single-pass per slice measured best
+        // (73-81 % vs whisper-large-v3 reference, NeMo's own long-form
+        // paths score 15-46 % on the same audio). Non-JA models are exact
+        // in single-pass and don't need a cap.
+        int cap = is_ja_model_ ? 12 : 0;
+        if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
+            cap = std::max(0, atoi(e));
+        return cap;
     }
 
     void shutdown() override {
