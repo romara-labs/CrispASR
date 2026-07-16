@@ -1214,7 +1214,8 @@ static float duration_estimate(const std::string & target_text,
 // Result is truncated to int (Python int() semantics) and floored to 1.
 static int duration_estimate_tokens(const std::string & target_text,
                                     const std::string & ref_text,
-                                    int                 ref_audio_tokens) {
+                                    int                 ref_audio_tokens,
+                                    float               speed = 1.0f) {
     std::string rt;
     int         rd;
     if (ref_audio_tokens > 0 && !ref_text.empty()) {
@@ -1226,6 +1227,9 @@ static int duration_estimate_tokens(const std::string & target_text,
     }
     float est    = duration_estimate(target_text, rt, (float) rd);
     int   tokens = (int) est;
+    if (speed > 0.0f && speed != 1.0f) {
+        tokens = (int) std::lround((double) tokens / speed);
+    }
     if (tokens < 1) {
         tokens = 1;
     }

@@ -13,13 +13,21 @@
 #include "audio-postproc.h"
 #include "backend.h"
 #include "bpe.h"
+#include "duration-estimator.h"
 #include "ov-error.h"
 #include "pipeline-codec.h"
 #include "pipeline-tts.h"
+#include "maskgit-tts.h"
+#include "text-chunker.h"
 #include "version.h"
 #include "voice-design.h"
 
+#include "core/audio_resample.h"
+#include "core/wav_reader.h"
+
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -207,6 +215,7 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->on_chunk                = nullptr;
     p->on_chunk_user_data      = nullptr;
     p->postproc                = true;
+    p->speed                   = 1.0f;
 }
 
 struct ov_context * ov_init(const struct ov_init_params * params) {
@@ -332,6 +341,204 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
     }
 }
 
+enum ov_status ov_set_codec_path(struct ov_context * ov, const char * codec_path) {
+    if (!ov || !codec_path || !*codec_path) {
+        ov_set_error("ov_set_codec_path: ov or codec_path is NULL/empty");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+
+    try {
+        if (ov->codec_loaded) {
+            pipeline_codec_free(&ov->pc);
+            ov->codec_loaded = false;
+        }
+        if (!pipeline_codec_load(&ov->pc, codec_path, ov->bp)) {
+            ov_set_error("ov_set_codec_path: pipeline_codec_load failed for '%s'", codec_path);
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        ov->codec_loaded = true;
+        return OV_STATUS_OK;
+    } catch (const std::exception & e) {
+        ov_set_error("ov_set_codec_path: %s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
+        return OV_STATUS_GENERATE_FAILED;
+    }
+}
+
+void ov_set_n_threads(struct ov_context * ov, int n_threads) {
+    if (!ov || n_threads <= 0 || !ov->bp.cpu_backend) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ov->bp.cpu_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        auto set_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_fn) {
+            set_fn(ov->bp.cpu_backend, n_threads);
+        }
+    }
+}
+
+void ov_codes_free(int32_t * codes) {
+    std::free(codes);
+}
+
+enum ov_status ov_synthesize_codes(struct ov_context * ov,
+                                   const struct ov_tts_params * params,
+                                   int32_t ** out_codes,
+                                   int * out_n_codes) {
+    if (out_codes) {
+        *out_codes = nullptr;
+    }
+    if (out_n_codes) {
+        *out_n_codes = 0;
+    }
+    if (!ov || !params || !out_codes || !out_n_codes) {
+        ov_set_error("ov_synthesize_codes: ov, params or output is NULL");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (params->abi_version > OV_ABI_VERSION) {
+        ov_set_error("ov_synthesize_codes: params ABI %d is newer than %d", params->abi_version, OV_ABI_VERSION);
+        return OV_STATUS_INVALID_PARAMS;
+    }
+
+    try {
+        const std::string text(params->text ? params->text : "");
+        const std::string lang(params->lang ? params->lang : "");
+        std::string ref_text(params->ref_text ? params->ref_text : "");
+        if (params->preprocess_prompt && !ref_text.empty()) {
+            ref_text = add_punctuation(ref_text);
+        }
+
+        std::string instruct;
+        if (!pipeline_tts_resolve_instruct(&ov->vd, text, params->instruct ? params->instruct : "", &instruct)) {
+            ov_set_error("ov_synthesize_codes: instruct could not be resolved");
+            return OV_STATUS_INSTRUCT_INVALID;
+        }
+
+        MaskgitConfig mg_cfg;
+        mg_cfg.num_step             = params->mg_num_step;
+        mg_cfg.guidance_scale      = params->mg_guidance_scale;
+        mg_cfg.t_shift              = params->mg_t_shift;
+        mg_cfg.layer_penalty_factor = params->mg_layer_penalty_factor;
+        mg_cfg.position_temperature = params->mg_position_temperature;
+        mg_cfg.class_temperature    = params->mg_class_temperature;
+        mg_cfg.seed                 = params->mg_seed;
+        if (const char * e = std::getenv("OMNIVOICE_GUIDANCE")) {
+            mg_cfg.guidance_scale = (float) std::atof(e);
+        }
+        if (const char * e = std::getenv("OMNIVOICE_POS_TEMP")) {
+            mg_cfg.position_temperature = (float) std::atof(e);
+        }
+        if (const char * e = std::getenv("OMNIVOICE_CLASS_TEMP")) {
+            mg_cfg.class_temperature = (float) std::atof(e);
+        }
+        if (const char * e = std::getenv("OMNIVOICE_NUM_STEPS")) {
+            const int n = std::atoi(e);
+            if (n > 0) {
+                mg_cfg.num_step = n;
+            }
+        }
+
+        std::vector<float> ref_audio;
+        std::vector<int32_t> ref_codes;
+        const int32_t * ref_ptr = params->ref_audio_tokens;
+        int ref_T = params->ref_T;
+        if (params->ref_audio_24k && params->ref_n_samples > 0) {
+            if (!ov->codec_loaded) {
+                ov_set_error("ov_synthesize_codes: raw reference requires a loaded codec");
+                return OV_STATUS_INVALID_PARAMS;
+            }
+            ref_audio.assign(params->ref_audio_24k, params->ref_audio_24k + params->ref_n_samples);
+            ref_preprocess_audio(ref_audio, 24000, params->preprocess_prompt);
+            ref_codes = pipeline_codec_encode(&ov->pc, ref_audio.data(), (int) ref_audio.size(), params->dump_dir);
+            if (ref_codes.empty()) {
+                ov_set_error("ov_synthesize_codes: reference encoding failed");
+                return OV_STATUS_GENERATE_FAILED;
+            }
+            ref_T = (int) ref_codes.size() / ov->pt.lm.num_audio_codebook;
+            ref_ptr = ref_codes.data();
+        }
+
+        if (params->ref_audio_24k && params->ref_audio_tokens) {
+            ov_set_error("ov_synthesize_codes: reference audio and tokens are mutually exclusive");
+            return OV_STATUS_INVALID_PARAMS;
+        }
+
+        int T = params->T_override > 0 ? params->T_override : duration_estimate_tokens(text, ref_text, ref_T);
+        const float speed = (params->abi_version >= 4 && params->speed > 0.0f) ? params->speed : 1.0f;
+        if (params->T_override <= 0 && speed != 1.0f) {
+            T = std::max(1, (int) std::lround((double) T / speed));
+        }
+
+        std::vector<int32_t> codes = pipeline_tts_generate(&ov->pt, &ov->tok, text, lang, instruct, T,
+                                                            params->denoise, mg_cfg, ref_text, ref_ptr, ref_T,
+                                                            params->dump_dir, nullptr);
+        if (codes.empty()) {
+            ov_set_error("ov_synthesize_codes: generation produced no codes");
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        int32_t * dst = (int32_t *) std::malloc(codes.size() * sizeof(int32_t));
+        if (!dst) {
+            ov_set_error("ov_synthesize_codes: out of memory");
+            return OV_STATUS_OOM;
+        }
+        std::memcpy(dst, codes.data(), codes.size() * sizeof(int32_t));
+        *out_codes = dst;
+        *out_n_codes = (int) codes.size();
+        return OV_STATUS_OK;
+    } catch (const std::exception & e) {
+        ov_set_error("ov_synthesize_codes: %s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
+        return OV_STATUS_GENERATE_FAILED;
+    }
+}
+
+enum ov_status ov_decode_codes(struct ov_context * ov,
+                               const int32_t * codes,
+                               int n_codes,
+                               struct ov_audio * out) {
+    if (out) {
+        ov_audio_free(out);
+    }
+    if (!ov || !codes || n_codes <= 0 || !out) {
+        ov_set_error("ov_decode_codes: invalid parameters");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!ov->codec_loaded) {
+        ov_set_error("ov_decode_codes: codec not loaded");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    const int K = ov->pt.lm.num_audio_codebook;
+    if (K <= 0 || n_codes % K != 0) {
+        ov_set_error("ov_decode_codes: code count %d is not divisible by K=%d", n_codes, K);
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    try {
+        const int T = n_codes / K;
+        std::vector<float> audio = pipeline_codec_decode(&ov->pc, codes, K, T);
+        if (audio.empty()) {
+            ov_set_error("ov_decode_codes: codec decode failed");
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        float * samples = (float *) std::malloc(audio.size() * sizeof(float));
+        if (!samples) {
+            ov_set_error("ov_decode_codes: out of memory");
+            return OV_STATUS_OOM;
+        }
+        std::memcpy(samples, audio.data(), audio.size() * sizeof(float));
+        out->samples = samples;
+        out->n_samples = (int) audio.size();
+        out->sample_rate = ov->pc.sample_rate;
+        out->channels = 1;
+        return OV_STATUS_OK;
+    } catch (const std::exception & e) {
+        ov_set_error("ov_decode_codes: %s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
+        return OV_STATUS_GENERATE_FAILED;
+    }
+}
+
 int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec) {
     if (!ov || !ov->codec_loaded) {
         ov_set_error("ov_duration_sec_to_tokens: codec not loaded");
@@ -436,6 +643,314 @@ enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
         ov_voice_ref_free(out);
         return OV_STATUS_GENERATE_FAILED;
     }
+}
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
+// Legacy omnivoice_* facade
+// ---------------------------------------------------------------------------
+// Keep the old entry points source-compatible without bringing back a second
+// model implementation. Every operation below delegates to the ov_* runtime
+// above; the wrapper only stores the old setter-style session state.
+struct omnivoice_context_params {
+    int n_threads;
+    int verbosity;
+    bool use_gpu;
+    int num_steps;
+    float guidance_scale;
+    float class_temperature;
+    float position_temperature;
+    float layer_penalty_factor;
+    float t_shift;
+    uint64_t seed;
+    bool flash_attn;
+};
+
+struct omnivoice_context {
+    ov_context * ov = nullptr;
+    std::string model_path;
+    std::string language;
+    std::string instruct;
+    std::string ref_text;
+    std::vector<float> ref_audio_24k;
+    float speed = 1.0f;
+    int num_steps = 32;
+    float guidance_scale = 2.0f;
+    float class_temperature = 0.0f;
+    float position_temperature = 5.0f;
+    float layer_penalty_factor = 5.0f;
+    float t_shift = 0.1f;
+    uint64_t seed = 42;
+};
+
+extern "C" {
+
+struct omnivoice_context_params omnivoice_context_default_params(void) {
+    struct omnivoice_context_params p = {};
+    p.n_threads = 4;
+    p.verbosity = 1;
+    p.use_gpu = true;
+    p.num_steps = 32;
+    p.guidance_scale = 2.0f;
+    p.class_temperature = 0.0f;
+    p.position_temperature = 5.0f;
+    p.layer_penalty_factor = 5.0f;
+    p.t_shift = 0.1f;
+    p.seed = 42;
+    p.flash_attn = true;
+    return p;
+}
+
+struct omnivoice_context * omnivoice_init_from_file(const char * path_model,
+                                                     struct omnivoice_context_params params) {
+    if (!path_model || !*path_model) {
+        ov_set_error("omnivoice_init_from_file: model path is empty");
+        return nullptr;
+    }
+    ov_init_params ip;
+    ov_init_default_params(&ip);
+    ip.model_path = path_model;
+    ip.use_fa = params.flash_attn && params.use_gpu;
+    omnivoice_context * ctx = new (std::nothrow) omnivoice_context();
+    if (!ctx) {
+        ov_set_error("omnivoice_init_from_file: out of memory");
+        return nullptr;
+    }
+    ctx->model_path = path_model;
+    ctx->num_steps = params.num_steps > 0 ? params.num_steps : 32;
+    ctx->guidance_scale = params.guidance_scale > 0.0f ? params.guidance_scale : 2.0f;
+    ctx->class_temperature = params.class_temperature;
+    ctx->position_temperature = params.position_temperature > 0.0f ? params.position_temperature : 5.0f;
+    ctx->layer_penalty_factor = params.layer_penalty_factor > 0.0f ? params.layer_penalty_factor : 5.0f;
+    ctx->t_shift = params.t_shift > 0.0f ? params.t_shift : 0.1f;
+    ctx->seed = params.seed ? params.seed : 42;
+    ctx->ov = ov_init(&ip);
+    if (!ctx->ov) {
+        delete ctx;
+        return nullptr;
+    }
+    ov_set_n_threads(ctx->ov, params.n_threads);
+    return ctx;
+}
+
+int omnivoice_set_tokenizer_path(struct omnivoice_context * ctx, const char * path) {
+    if (!ctx || !ctx->ov || !path) {
+        return -1;
+    }
+    return ov_set_codec_path(ctx->ov, path) == OV_STATUS_OK ? 0 : -1;
+}
+
+int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_path, const char * ref_text) {
+    if (!ctx || !ctx->ov) {
+        return -1;
+    }
+    ctx->ref_audio_24k.clear();
+    ctx->ref_text = ref_text ? ref_text : "";
+    if (!wav_path || !*wav_path) {
+        return 0;
+    }
+    std::vector<float> wav;
+    int sr = 0;
+    if (!crispasr::core::read_wav_mono_pcm16(wav_path, wav, sr) || wav.empty()) {
+        ov_set_error("omnivoice_set_voice_prompt: failed to read '%s'", wav_path);
+        return -1;
+    }
+    if (sr != 24000 && sr > 0) {
+        wav = core_audio::resample_polyphase(wav.data(), (int) wav.size(), sr, 24000);
+    }
+    ctx->ref_audio_24k = std::move(wav);
+    return 0;
+}
+
+int omnivoice_set_language(struct omnivoice_context * ctx, const char * lang) {
+    if (!ctx) {
+        return -1;
+    }
+    ctx->language = lang ? lang : "";
+    return 0;
+}
+
+int omnivoice_set_instruct(struct omnivoice_context * ctx, const char * instruct) {
+    if (!ctx) {
+        return -1;
+    }
+    ctx->instruct = instruct ? instruct : "";
+    return 0;
+}
+
+int omnivoice_set_speed(struct omnivoice_context * ctx, float speed) {
+    if (!ctx) {
+        return -1;
+    }
+    ctx->speed = speed > 0.0f ? speed : 1.0f;
+    return 0;
+}
+
+int omnivoice_set_num_steps(struct omnivoice_context * ctx, int num_steps) {
+    if (!ctx) {
+        return -1;
+    }
+    if (num_steps > 0) {
+        ctx->num_steps = num_steps;
+    }
+    return 0;
+}
+
+int32_t * omnivoice_synthesize_codes(struct omnivoice_context * ctx, const char * text, int * out_n_codes) {
+    if (!ctx || !ctx->ov || !text || !out_n_codes) {
+        return nullptr;
+    }
+    ov_tts_params tp;
+    ov_tts_default_params(&tp);
+    tp.text = text;
+    tp.lang = ctx->language.c_str();
+    tp.instruct = ctx->instruct.c_str();
+    tp.mg_num_step = ctx->num_steps;
+    tp.mg_guidance_scale = ctx->guidance_scale;
+    tp.mg_class_temperature = ctx->class_temperature;
+    tp.mg_position_temperature = ctx->position_temperature;
+    tp.mg_layer_penalty_factor = ctx->layer_penalty_factor;
+    tp.mg_t_shift = ctx->t_shift;
+    tp.mg_seed = ctx->seed;
+    tp.speed = ctx->speed;
+    tp.ref_text = ctx->ref_text.c_str();
+    if (!ctx->ref_audio_24k.empty()) {
+        tp.ref_audio_24k = ctx->ref_audio_24k.data();
+        tp.ref_n_samples = (int) ctx->ref_audio_24k.size();
+    }
+    int32_t * codes = nullptr;
+    int n_codes = 0;
+    if (ov_synthesize_codes(ctx->ov, &tp, &codes, &n_codes) != OV_STATUS_OK) {
+        *out_n_codes = 0;
+        return nullptr;
+    }
+    *out_n_codes = n_codes;
+    return codes;
+}
+
+void omnivoice_codes_free(int32_t * codes) {
+    ov_codes_free(codes);
+}
+
+float * omnivoice_decode_codes(struct omnivoice_context * ctx,
+                               const int32_t * codes,
+                               int n_codes,
+                               int * out_n_samples) {
+    if (!ctx || !ctx->ov || !out_n_samples) {
+        return nullptr;
+    }
+    ov_audio audio = {};
+    if (ov_decode_codes(ctx->ov, codes, n_codes, &audio) != OV_STATUS_OK) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
+    *out_n_samples = audio.n_samples;
+    return audio.samples;
+}
+
+float * omnivoice_synthesize(struct omnivoice_context * ctx, const char * text, int * out_n_samples) {
+    if (!ctx || !ctx->ov || !text || !out_n_samples) {
+        return nullptr;
+    }
+    int n_codes = 0;
+    int32_t * codes = omnivoice_synthesize_codes(ctx, text, &n_codes);
+    if (!codes) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
+    float * pcm = omnivoice_decode_codes(ctx, codes, n_codes, out_n_samples);
+    omnivoice_codes_free(codes);
+    return pcm;
+}
+
+void omnivoice_pcm_free(float * pcm) {
+    std::free(pcm);
+}
+
+void omnivoice_free(struct omnivoice_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ov_free(ctx->ov);
+    delete ctx;
+}
+
+void omnivoice_sync(struct omnivoice_context * /*ctx*/) {
+    // GGML scheduler calls are synchronous; retained as a no-op compatibility
+    // barrier for callers that used the previous backend directly.
+}
+
+void omnivoice_set_n_threads(struct omnivoice_context * ctx, int n_threads) {
+    if (ctx && ctx->ov) {
+        ov_set_n_threads(ctx->ov, n_threads);
+    }
+}
+
+int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_path) {
+    if (!ctx || !ctx->ov || !ref_gguf_path || !*ref_gguf_path) {
+        return -1;
+    }
+    if (!ctx->ov->codec_loaded) {
+        ov_set_error("omnivoice_encode_diff: codec not loaded");
+        return -1;
+    }
+
+    ggml_context * ref_ctx = nullptr;
+    gguf_init_params gp = {};
+    gp.no_alloc = false;
+    gp.ctx = &ref_ctx;
+    gguf_context * ref = gguf_init_from_file(ref_gguf_path, gp);
+    if (!ref || !ref_ctx) {
+        if (ref) {
+            gguf_free(ref);
+        }
+        ov_set_error("omnivoice_encode_diff: cannot open '%s'", ref_gguf_path);
+        return -1;
+    }
+
+    ggml_tensor * wav_t = ggml_get_tensor(ref_ctx, "input_wav24k");
+    ggml_tensor * code_t = ggml_get_tensor(ref_ctx, "codes");
+    if (!wav_t || !code_t || wav_t->type != GGML_TYPE_F32) {
+        gguf_free(ref);
+        ggml_free(ref_ctx);
+        ov_set_error("omnivoice_encode_diff: archive needs F32 input_wav24k and codes tensors");
+        return -1;
+    }
+
+    const int n_samples = (int) ggml_nelements(wav_t);
+    std::vector<int32_t> mine = pipeline_codec_encode(&ctx->ov->pc, (const float *) wav_t->data, n_samples);
+    const size_t n_ref = ggml_nelements(code_t);
+    std::vector<int32_t> expected(n_ref);
+    if (code_t->type == GGML_TYPE_I32) {
+        std::memcpy(expected.data(), code_t->data, n_ref * sizeof(int32_t));
+    } else if (code_t->type == GGML_TYPE_F32) {
+        const float * values = (const float *) code_t->data;
+        for (size_t i = 0; i < n_ref; ++i) {
+            expected[i] = (int32_t) std::lround(values[i]);
+        }
+    } else {
+        gguf_free(ref);
+        ggml_free(ref_ctx);
+        ov_set_error("omnivoice_encode_diff: unsupported codes tensor type");
+        return -1;
+    }
+
+    size_t matches = 0;
+    const size_t n = std::min(mine.size(), expected.size());
+    for (size_t i = 0; i < n; ++i) {
+        matches += mine[i] == expected[i] ? 1u : 0u;
+    }
+    const bool pass = mine.size() == expected.size() && matches == expected.size();
+    std::fprintf(stderr, "omnivoice encode-diff: %zu/%zu exact (%.1f%%) %s\n", matches, expected.size(),
+                 expected.empty() ? 0.0 : 100.0 * (double) matches / (double) expected.size(), pass ? "PASS" : "FAIL");
+    gguf_free(ref);
+    ggml_free(ref_ctx);
+    if (!pass) {
+        ov_set_error("omnivoice_encode_diff: generated codes differ from '%s'", ref_gguf_path);
+        return -1;
+    }
+    return 0;
 }
 
 }  // extern "C"

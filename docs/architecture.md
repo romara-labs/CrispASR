@@ -661,15 +661,22 @@ decoded by a **1.6B pure-transformer codec** to 24 kHz mono.
 
 ### omnivoice
 
-k2-fsa/OmniVoice (Apache-2.0) — masked iterative multi-codebook TTS.
-Qwen3-0.6B LLM backbone with:
+k2-fsa/OmniVoice (Apache-2.0) — the complete realtime masked-iterative
+multi-codebook TTS runtime. It is a two-GGUF pipeline: the Qwen3-0.6B LM
+and the HiggsAudioV2 RVQ codec are loaded together (the codec can be
+discovered beside the LM or supplied with `--codec-model`). Qwen3 backbone
+with:
 - `audio_embeddings`: Embedding(8×1025, 1024) with per-codebook offsets
 - `audio_heads`: Linear(1024, 8×1025) — projects to 8 codebooks × 1025 vocab
 - Generation: SoundStorm-style masked iterative (not autoregressive). 32
   steps, each unmasking top-k highest-confidence positions via Gumbel sampling.
 - Audio tokenizer: HiggsAudioV2 (HuBERT semantic + DAC acoustic, 24 kHz, 75 Hz
-  frame rate). Separate GGUF (`--codec-model`).
-- 600+ languages, zero-shot voice cloning from reference audio.
+  frame rate). The codec encoder and decoder share the same RVQ pipeline,
+  enabling reusable voice-reference tokens.
+- 600+ languages and language-name aliases, zero-shot voice cloning,
+  VoiceDesign style instructions and duration/speed estimation.
+- Buffered and chunked streaming synthesis are exposed through one C ABI,
+  with cooperative cancellation and per-chunk callbacks for realtime callers.
 
 Supports finetunes: `ModelsLab/omnivoice-singing` (same architecture).
 

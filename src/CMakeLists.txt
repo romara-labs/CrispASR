@@ -1425,15 +1425,24 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# omnivoice — k2-fsa/OmniVoice (Qwen3 + masked iterative multi-codebook TTS)
+# omnivoice — OmniVoice (full realtime Qwen3 + RVQ codec pipeline)
 # ---------------------------------------------------------------------------
-add_library(omnivoice STATIC omnivoice.h omnivoice.cpp)
+add_library(omnivoice STATIC
+    omnivoice.h
+    omnivoice/omnivoice.h
+    omnivoice/omnivoice.cpp
+    omnivoice/pipeline-tts.h
+    omnivoice/pipeline-tts.cpp
+    omnivoice/pipeline-codec.h
+    omnivoice/pipeline-codec.cpp
+)
 set_target_properties(omnivoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(omnivoice PUBLIC .)
+target_include_directories(omnivoice PUBLIC . omnivoice)
 target_compile_features   (omnivoice PUBLIC cxx_std_17)
-target_link_libraries     (omnivoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+target_compile_definitions(omnivoice PUBLIC OMNIVOICE_STATIC)
+target_link_libraries     (omnivoice PUBLIC crispasr-core ggml ggml-base ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
 if(NOT MSVC)
-    target_compile_options(omnivoice PRIVATE -O3)
+    target_compile_options(omnivoice PRIVATE -O3 -Wno-missing-declarations -Wno-shadow)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -1,180 +1,189 @@
-// crispasr_backend_omnivoice.cpp — adapter for k2-fsa/OmniVoice TTS.
+// crispasr_backend_omnivoice.cpp — unified realtime OmniVoice adapter.
 //
-// Two-GGUF runtime: the main model (LLM + audio layers, loaded from
-// --model) and a separate HiggsAudioV2 audio tokenizer (loaded via
-// --codec-model, or auto-discovered as a sibling).
-// Voice cloning: --voice ref.wav --ref-text "..."
+// Uses the complete native pipeline: VoiceDesign, 600+ language aliases,
+// reference-audio cloning, cancellation-ready streaming and the standalone
+// RVQ codec. The companion codec can be supplied explicitly or discovered
+// beside the language-model GGUF.
 
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
-#include "crispasr_model_mgr_cli.h"
-#include "crispasr_model_registry.h"
 #include "whisper_params.h"
 
-#include "omnivoice.h"
+#include "core/audio_resample.h"
+#include "core/wav_reader.h"
+#include "omnivoice/omnivoice.h"
 
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
-#include <vector>
 #include <sys/stat.h>
+#include <vector>
 
 namespace {
 
-static bool file_exists(const std::string& path) {
+constexpr int kOmniVoiceGpuSteps = 16;
+
+bool file_exists(const std::string & path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0;
 }
 
-static std::string dir_of(const std::string& p) {
-    auto sep = p.find_last_of("/\\");
-    return (sep == std::string::npos) ? std::string(".") : p.substr(0, sep);
+std::string model_dir(const std::string & path) {
+    const size_t sep = path.find_last_of("/\\");
+    return sep == std::string::npos ? "." : path.substr(0, sep);
 }
 
-static std::string discover_tokenizer(const std::string& model_path) {
-    const std::string dir = dir_of(model_path);
-    static const char* candidates[] = {
+std::string discover_codec(const std::string & model_path) {
+    const std::string dir = model_dir(model_path);
+    static const char * names[] = {
         "omnivoice-tokenizer.gguf",
         "omnivoice-tokenizer-f16.gguf",
+        "omnivoice-tokenizer-BF16.gguf",
         "omnivoice-audio-tokenizer.gguf",
     };
-    for (const char* name : candidates) {
-        std::string p = dir + "/" + name;
-        if (file_exists(p))
-            return p;
+    for (const char * name : names) {
+        const std::string candidate = dir + "/" + name;
+        if (file_exists(candidate)) {
+            return candidate;
+        }
     }
-    return "";
+    return {};
+}
+
+bool is_wav_path(const std::string & path) {
+    return path.size() >= 4 &&
+           (path.compare(path.size() - 4, 4, ".wav") == 0 || path.compare(path.size() - 4, 4, ".WAV") == 0);
+}
+
+bool omnivoice_stream_chunk(const float * samples, int n_samples, void * user_data) {
+    auto * cb = static_cast<CrispasrBackend::crispasr_pcm_stream_callback *>(user_data);
+    if (cb && samples && n_samples > 0) {
+        (*cb)(samples, n_samples, false);
+    }
+    return true;
 }
 
 class OmniVoiceBackend : public CrispasrBackend {
 public:
-    OmniVoiceBackend() = default;
-    ~OmniVoiceBackend() override { OmniVoiceBackend::shutdown(); }
+    ~OmniVoiceBackend() override { shutdown(); }
 
-    const char* name() const override { return "omnivoice"; }
+    const char * name() const override { return "omnivoice"; }
+    uint32_t capabilities() const override { return CAP_TTS | CAP_VOICE_CLONING | CAP_STREAMING; }
 
-    uint32_t capabilities() const override { return CAP_TTS | CAP_VOICE_CLONING; }
-
-    std::vector<crispasr_segment> transcribe(const float* /*samples*/, int /*n_samples*/, int64_t /*t_offset_cs*/,
-                                             const whisper_params& /*params*/) override {
+    std::vector<crispasr_segment> transcribe(const float *, int, int64_t, const whisper_params &) override {
         fprintf(stderr, "crispasr[omnivoice]: transcription is not supported by this backend\n");
         return {};
     }
 
-    bool init(const whisper_params& p) override {
-        omnivoice_context_params cp = omnivoice_context_default_params();
-        cp.n_threads = p.n_threads;
-        cp.verbosity = p.no_prints ? 0 : 1;
-        cp.use_gpu = crispasr_backend_should_use_gpu(p);
-        cp.flash_attn = p.flash_attn;
-        cp.seed = p.seed;
-
-        ctx_ = omnivoice_init_from_file(p.model.c_str(), cp);
-        if (!ctx_) {
-            fprintf(stderr, "crispasr[omnivoice]: failed to load model '%s'\n", p.model.c_str());
+    bool init(const whisper_params & p) override {
+        std::string codec_path = p.tts_codec_model;
+        if (codec_path.empty() || codec_path == "auto" || codec_path == "default") {
+            codec_path = discover_codec(p.model);
+        }
+        if (codec_path.empty()) {
+            fprintf(stderr, "crispasr[omnivoice]: --codec-model <codec.gguf> is required (or place a tokenizer beside the model)\n");
             return false;
         }
 
-        // Resolve audio tokenizer GGUF
-        std::string tok_path = p.tts_codec_model;
-        if (tok_path.empty() || tok_path == "auto" || tok_path == "default") {
-            tok_path = discover_tokenizer(p.model);
-        }
-        if (!tok_path.empty()) {
-            if (omnivoice_set_tokenizer_path(ctx_, tok_path.c_str()) != 0) {
-                fprintf(stderr, "crispasr[omnivoice]: failed to load tokenizer '%s'\n", tok_path.c_str());
-            } else if (!p.no_prints) {
-                fprintf(stderr, "crispasr[omnivoice]: tokenizer loaded from '%s'\n", tok_path.c_str());
-            }
-        } else if (!p.no_prints) {
-            fprintf(stderr, "crispasr[omnivoice]: no audio tokenizer found. Pass --codec-model PATH or place "
-                            "omnivoice-tokenizer.gguf next to the model.\n");
-            fprintf(stderr, "crispasr[omnivoice]: code generation will work; audio decode requires the tokenizer.\n");
-        }
+        ov_init_params ip;
+        ov_init_default_params(&ip);
+        ip.model_path = p.model.c_str();
+        ip.codec_path = codec_path.c_str();
+        ip.use_fa = p.flash_attn && crispasr_backend_should_use_gpu(p);
+        ip.clamp_fp16 = false;
 
-        // Diff-harness: OMNIVOICE_ENCODE_DIFF=<ref.gguf> runs the encode-path
-        // stage diff and exits (#254 voice-clone port validation).
-        if (const char* rp = getenv("OMNIVOICE_ENCODE_DIFF")) {
-            int rc = omnivoice_encode_diff(ctx_, rp);
-            exit(rc == 0 ? 0 : 1);
+        ctx_ = ov_init(&ip);
+        if (!ctx_) {
+            fprintf(stderr, "crispasr[omnivoice]: failed to load model '%s' with codec '%s': %s\n",
+                    p.model.c_str(), codec_path.c_str(), ov_last_error());
+            return false;
         }
-
-        // Language
-        if (!p.language.empty() && p.language != "auto") {
-            omnivoice_set_language(ctx_, p.language.c_str());
-        }
-
-        // Voice cloning
-        if (!p.tts_voice.empty()) {
-            std::string ref_text = p.tts_ref_text;
-            if (omnivoice_set_voice_prompt(ctx_, p.tts_voice.c_str(), ref_text.c_str()) != 0) {
-                fprintf(stderr, "crispasr[omnivoice]: failed to set voice prompt '%s'\n", p.tts_voice.c_str());
-            }
-        }
-
-        // Style instruct
-        if (!p.tts_instruct.empty()) {
-            omnivoice_set_instruct(ctx_, p.tts_instruct.c_str());
-        }
-
-        // Speaking-rate multiplier (--tts-speed): scales the estimated target
-        // length. >1 = faster/shorter, <1 = slower/longer. Handy to trim an
-        // over-long estimate from a slow reference voice (#254).
-        if (p.tts_speed > 0.0f && p.tts_speed != 1.0f) {
-            omnivoice_set_speed(ctx_, p.tts_speed);
-        }
-
-        // Diffusion step count (--tts-steps): stage0 = num_steps × 2 backbone
-        // forwards — the dominant cost. Default 32; lower trades refinement for
-        // speed (ASR-clean to ~16). tts_num_steps is -1 unless the user set it.
-        if (p.tts_num_steps >= 1) {
-            omnivoice_set_num_steps(ctx_, p.tts_num_steps);
-        }
-
         return true;
     }
 
-    std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
-        if (!ctx_ || text.empty())
+    std::vector<float> synthesize(const std::string & text, const whisper_params & params) override {
+        if (!ctx_ || text.empty()) {
             return {};
-
-        // Apply the diffusion step count PER CALL, not just at init: the server
-        // reuses one backend instance and passes tts_num_steps per request, so a
-        // per-request "num_steps" only takes effect if set here. Read live by the
-        // runtime (no reload). tts_num_steps is -1 unless the caller set it. (#254)
-        if (params.tts_num_steps >= 1) {
-            omnivoice_set_num_steps(ctx_, params.tts_num_steps);
         }
-
-        int n_samples = 0;
-        float* pcm = omnivoice_synthesize(ctx_, text.c_str(), &n_samples);
-        if (pcm && n_samples > 0) {
-            std::vector<float> out(pcm, pcm + n_samples);
-            omnivoice_pcm_free(pcm);
-            return out;
+        ov_tts_params tp;
+        ov_tts_default_params(&tp);
+        fill_tts_params(text, params, &tp);
+        ov_audio audio = {};
+        if (ov_synthesize(ctx_, &tp, &audio) != OV_STATUS_OK) {
+            fprintf(stderr, "crispasr[omnivoice]: synthesis failed: %s\n", ov_last_error());
+            return {};
         }
-        // Fall back to code-only output
-        int n_codes = 0;
-        int32_t* codes = omnivoice_synthesize_codes(ctx_, text.c_str(), &n_codes);
-        if (codes && n_codes > 0) {
-            if (!params.no_prints) {
-                fprintf(stderr, "crispasr[omnivoice]: generated %d codes (audio decode requires tokenizer)\n", n_codes);
-            }
-            omnivoice_codes_free(codes);
-        }
-        return {};
+        std::vector<float> out(audio.samples, audio.samples + audio.n_samples);
+        ov_audio_free(&audio);
+        return out;
     }
+
+    void synthesize_streaming(const std::string & text, const whisper_params & params,
+                              crispasr_pcm_stream_callback cb) override {
+        if (!ctx_ || text.empty()) {
+            cb(nullptr, 0, true);
+            return;
+        }
+        ov_tts_params tp;
+        ov_tts_default_params(&tp);
+        fill_tts_params(text, params, &tp);
+        tp.on_chunk = omnivoice_stream_chunk;
+        tp.on_chunk_user_data = &cb;
+        if (ov_synthesize(ctx_, &tp, nullptr) != OV_STATUS_OK) {
+            fprintf(stderr, "crispasr[omnivoice]: streaming synthesis failed: %s\n", ov_last_error());
+        }
+        cb(nullptr, 0, true);
+    }
+
+    int tts_sample_rate() const override { return 24000; }
 
     void shutdown() override {
         if (ctx_) {
-            omnivoice_free(ctx_);
+            ov_free(ctx_);
             ctx_ = nullptr;
         }
     }
 
 private:
-    omnivoice_context* ctx_ = nullptr;
+    void fill_tts_params(const std::string & text, const whisper_params & params, ov_tts_params * tp) {
+        tp->text = text.c_str();
+        tp->lang = (!params.language.empty() && params.language != "auto") ? params.language.c_str() : "";
+        tp->instruct = params.tts_instruct.empty() ? "" : params.tts_instruct.c_str();
+        tp->denoise = true;
+        tp->preprocess_prompt = true;
+        tp->speed = params.tts_speed > 0.0f ? params.tts_speed : 1.0f;
+        tp->mg_seed = (uint64_t) params.seed;
+        tp->ref_text = params.tts_ref_text.empty() ? "" : params.tts_ref_text.c_str();
+        if (params.tts_num_steps > 0) {
+            tp->mg_num_step = params.tts_num_steps;
+        } else if (crispasr_backend_should_use_gpu(params)) {
+            tp->mg_num_step = kOmniVoiceGpuSteps;
+        } else if (params.tts_steps > 0) {
+            tp->mg_num_step = params.tts_steps;
+        }
+        if (params.tts_cfg_scale >= 0.0f) {
+            tp->mg_guidance_scale = params.tts_cfg_scale;
+        }
+
+        ref_audio_24k_.clear();
+        if (!params.tts_voice.empty() && is_wav_path(params.tts_voice)) {
+            std::vector<float> wav;
+            int sr = 0;
+            if (crispasr::core::read_wav_mono_pcm16(params.tts_voice, wav, sr)) {
+                if (sr != 24000 && sr > 0) {
+                    ref_audio_24k_ = core_audio::resample_polyphase(wav.data(), (int) wav.size(), sr, 24000);
+                } else {
+                    ref_audio_24k_ = std::move(wav);
+                }
+                tp->ref_audio_24k = ref_audio_24k_.data();
+                tp->ref_n_samples = (int) ref_audio_24k_.size();
+            } else {
+                fprintf(stderr, "crispasr[omnivoice]: failed to load reference WAV '%s'\n", params.tts_voice.c_str());
+            }
+        }
+    }
+
+    ov_context * ctx_ = nullptr;
+    std::vector<float> ref_audio_24k_;
 };
 
 } // namespace

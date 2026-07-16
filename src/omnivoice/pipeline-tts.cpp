@@ -757,6 +757,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                                                        int                   T_override,
                                                        float                 chunk_duration_sec,
                                                        float                 chunk_threshold_sec,
+                                                       float                 speed,
                                                        bool                  denoise,
                                                        bool                  postproc,
                                                        const MaskgitConfig & mg_cfg,
@@ -775,7 +776,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
 
     // Estimated tokens for the full text. Chunking trigger uses the same
     // estimator as the single-shot path for consistency with upstream.
-    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T);
+    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T, speed);
 
     int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
     bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
@@ -847,7 +848,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
             int                 this_T        = first_no_ref ? 0 : prompt_T;
             const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
 
-            int Ti = duration_estimate_tokens(ct, this_ref_text, this_T);
+            int Ti = duration_estimate_tokens(ct, this_ref_text, this_T, speed);
 
             // Dump intermediate tensors only for chunk 0 so cossim tests
             // compare matching chunks across Python and C++.
@@ -972,6 +973,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
                                                      int                   T_override,
                                                      float                 chunk_duration_sec,
                                                      float                 chunk_threshold_sec,
+                                                     float                 speed,
                                                      bool                  denoise,
                                                      const MaskgitConfig & mg_cfg,
                                                      const std::string &   ref_text,
@@ -1055,7 +1057,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
 
     // Same chunking decision as the buffered path: single shot below the
     // threshold, otherwise split on punctuation and chain chunks.
-    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T);
+    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T, speed);
 
     int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
     bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
@@ -1112,7 +1114,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
             int                 this_T        = first_no_ref ? 0 : prompt_T;
             const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
 
-            int          Ti             = duration_estimate_tokens(ct, this_ref_text, this_T);
+            int          Ti             = duration_estimate_tokens(ct, this_ref_text, this_T, speed);
             const char * chunk_dump_dir = (i == 0) ? dump_dir : NULL;
 
             ov_log(OV_LOG_INFO, "[TTS-Stream] Chunk %zu/%zu: chars=%d T=%d ref_T=%d", i + 1, chunks.size(),
@@ -1350,6 +1352,25 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     mg_cfg.class_temperature    = params->mg_class_temperature;
     mg_cfg.seed                 = params->mg_seed;
 
+    // Keep the diagnostic knobs from the original runtime available on the
+    // unified ABI. They are intentionally process-local overrides used for
+    // CFG/temperature/step bisects and do not alter the normal defaults.
+    if (const char * e = std::getenv("OMNIVOICE_GUIDANCE")) {
+        mg_cfg.guidance_scale = (float) std::atof(e);
+    }
+    if (const char * e = std::getenv("OMNIVOICE_POS_TEMP")) {
+        mg_cfg.position_temperature = (float) std::atof(e);
+    }
+    if (const char * e = std::getenv("OMNIVOICE_CLASS_TEMP")) {
+        mg_cfg.class_temperature = (float) std::atof(e);
+    }
+    if (const char * e = std::getenv("OMNIVOICE_NUM_STEPS")) {
+        const int n = std::atoi(e);
+        if (n > 0) {
+            mg_cfg.num_step = n;
+        }
+    }
+
     // Cancel context threaded into the long-form helpers. NULL callback
     // disables polling; triggered starts at false and flips on the first
     // poll that returns true.
@@ -1392,7 +1413,7 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     if (params->on_chunk) {
         ov_status rc = tts_synthesize_long_stream_internal(
             pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
-            params->chunk_threshold_sec, params->denoise, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T,
+            params->chunk_threshold_sec, params->abi_version >= 4 ? params->speed : 1.0f, params->denoise, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T,
             synth_ref_rms, params->dump_dir, &cc, params->on_chunk, params->on_chunk_user_data);
         if (cc.triggered) {
             ov_set_error("ov_synthesize : cancelled by ov_cancel_cb");
@@ -1415,7 +1436,7 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
 
     std::vector<float> audio =
         tts_synthesize_long_internal(pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
-                                     params->chunk_threshold_sec, params->denoise, postproc, mg_cfg, synth_ref_text,
+                                     params->chunk_threshold_sec, params->abi_version >= 4 ? params->speed : 1.0f, params->denoise, postproc, mg_cfg, synth_ref_text,
                                      synth_ref_tokens, synth_ref_T, synth_ref_rms, params->dump_dir, &cc);
 
     if (cc.triggered) {

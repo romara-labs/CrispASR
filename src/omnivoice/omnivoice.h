@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 3
+#define OV_ABI_VERSION 4
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -247,12 +247,17 @@ struct ov_tts_params {
     // either way. Tail field: kept last for ABI growth, read only when
     // abi_version >= 3. The streaming path always post filters.
     bool postproc;
+
+    // Speaking-rate multiplier for the duration estimator. Values above 1
+    // produce shorter/faster utterances; values below 1 produce longer ones.
+    // Tail field: read only when abi_version >= 4.
+    float speed;
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,
 // chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
 // preprocess_prompt true, MaskGIT defaults as above, every reference
-// pointer NULL, dump_dir NULL, cancel NULL, postproc true.
+// pointer NULL, dump_dir NULL, cancel NULL, postproc true, speed 1.0.
 OV_API void ov_tts_default_params(struct ov_tts_params * p);
 
 // Run the full TTS synthesis. Resolves the instruct against the bundled
@@ -262,6 +267,22 @@ OV_API void ov_tts_default_params(struct ov_tts_params * p);
 // failure returns a negative ov_status describing the cause and leaves
 // `out` empty. Requires a codec-loaded handle.
 OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out);
+
+// Load or replace the companion audio-tokenizer GGUF after ov_init.
+OV_API enum ov_status ov_set_codec_path(struct ov_context * ov, const char * codec_path);
+OV_API void ov_set_n_threads(struct ov_context * ov, int n_threads);
+
+// Generate or decode the packed [K, T] audio-code matrix without forcing an
+// end-to-end call. Buffers are malloc-owned and released with ov_codes_free.
+OV_API enum ov_status ov_synthesize_codes(struct ov_context * ov,
+                                          const struct ov_tts_params * params,
+                                          int32_t ** out_codes,
+                                          int * out_n_codes);
+OV_API void ov_codes_free(int32_t * codes);
+OV_API enum ov_status ov_decode_codes(struct ov_context * ov,
+                                      const int32_t * codes,
+                                      int n_codes,
+                                      struct ov_audio * out);
 
 // Convert a duration in seconds to a frame count using the bundled codec
 // frame rate (sample_rate / hop_length). Clamps to a minimum of one

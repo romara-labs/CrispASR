@@ -6879,6 +6879,10 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
     if (s->qwen3_tts_ctx)
         return qwen3_tts_set_codec_path(s->qwen3_tts_ctx, path);
 #endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx)
+        return omnivoice_set_tokenizer_path(s->omnivoice_ctx, path);
+#endif
 #ifdef CA_HAVE_MOSS_TTS
     if (s->moss_tts_ctx)
         return moss_tts_set_codec_path(s->moss_tts_ctx, path) ? 0 : -1;
@@ -7049,6 +7053,13 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         if (rc == 0)
             s->qwen3_tts_voice_loaded = true;
         return rc;
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx) {
+        if (!ends_with_wav(path))
+            return -2;
+        return omnivoice_set_voice_prompt(s->omnivoice_ctx, path, ref_text_or_null);
     }
 #endif
 #ifdef CA_HAVE_MOSS_TTS
