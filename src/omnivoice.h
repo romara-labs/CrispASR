@@ -46,6 +46,7 @@ int omnivoice_set_language(struct omnivoice_context * ctx, const char * lang);
 int omnivoice_set_instruct(struct omnivoice_context * ctx, const char * instruct);
 int omnivoice_set_speed(struct omnivoice_context * ctx, float speed);
 int omnivoice_set_num_steps(struct omnivoice_context * ctx, int num_steps);
+int omnivoice_set_seed(struct omnivoice_context * ctx, uint64_t seed);
 
 int32_t * omnivoice_synthesize_codes(struct omnivoice_context * ctx, const char * text, int * out_n_codes);
 void      omnivoice_codes_free(int32_t * codes);

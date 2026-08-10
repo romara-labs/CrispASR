@@ -7,8 +7,11 @@
 #include "crispasr_cache.h"
 #include "crispasr_model_registry.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
+#include <sys/stat.h>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -113,7 +116,7 @@ CrispasrResolvePreview crispasr_preview_model_cli(const std::string& model_arg, 
 
 std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                        const std::string& cache_dir_override, bool auto_download,
-                                       const std::string& preferred_quant) {
+                                       const std::string& preferred_quant, const std::string& accepted_license) {
     std::string effective_model_arg = model_arg;
     std::string effective_quant = preferred_quant;
     std::string auto_base;
@@ -126,7 +129,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     // "auto"/"default" and already-on-disk paths: library handles them.
     if (effective_model_arg == "auto" || effective_model_arg == "default") {
         return crispasr_resolve_model(effective_model_arg, backend_name, quiet, cache_dir_override, auto_download,
-                                      effective_quant);
+                                      effective_quant, accepted_license);
     }
 
     // Concrete path: check existence ourselves so we can interpose the
@@ -134,6 +137,33 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     FILE* f = fopen(effective_model_arg.c_str(), "rb");
     if (f) {
         fclose(f);
+        return effective_model_arg;
+    }
+    const int open_errno = errno;
+
+    // fopen failed. Distinguish "no such entry" (maybe a registry model *name*
+    // to download — handled below) from "the entry exists but we can't open
+    // it" (a dangling/unreadable symlink, a permission problem, an unmounted
+    // volume). For the latter, do NOT silently substitute a downloadable
+    // default: that masks a real "your file is unreadable" error as "loaded
+    // some other model" (observed with a -m pointing at a symlink whose target
+    // was offline — the whisper default ggml-base.bin was loaded instead).
+    // Surface a clear error and return the path so the load layer fails on it.
+    bool entry_exists = false;
+#if !defined(_WIN32)
+    struct stat lst;
+    if (lstat(effective_model_arg.c_str(), &lst) == 0)
+        entry_exists = true; // the path names a real filesystem entry
+#endif
+    if (entry_exists || open_errno == EACCES || open_errno == EPERM) {
+        fprintf(stderr, "crispasr: cannot open model file '%s': %s\n", effective_model_arg.c_str(),
+                std::strerror(open_errno));
+#if !defined(_WIN32)
+        if (entry_exists && S_ISLNK(lst.st_mode))
+            fprintf(stderr, "  (it is a symlink — its target may be missing or on an unmounted/unreadable volume)\n");
+#endif
+        fprintf(stderr, "  Refusing to substitute a downloadable default for an explicit --model path.\n"
+                        "  Fix the file/permissions, or pass -m auto to download a model.\n");
         return effective_model_arg;
     }
 
@@ -161,8 +191,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     const std::string cached_path = crispasr_cache::dir(cache_dir_override) + "/" + match.filename;
     if (crispasr_cache::file_present(cached_path)) {
         if (!match.license.empty()) {
-            const bool is_nc = match.license.find("NC") != std::string::npos ||
-                               match.license.find("NonCommercial") != std::string::npos;
+            const bool is_nc = crispasr_license_requires_acceptance(match.license);
             if (is_nc)
                 fprintf(stderr,
                         "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
@@ -175,8 +204,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     fprintf(stderr, "crispasr: model '%s' not found locally.\n", effective_model_arg.c_str());
     fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
     if (!match.license.empty()) {
-        const bool is_nc =
-            match.license.find("NC") != std::string::npos || match.license.find("NonCommercial") != std::string::npos;
+        const bool is_nc = crispasr_license_requires_acceptance(match.license);
         if (is_nc)
             fprintf(stderr, "  LICENSE: %s — NON-COMMERCIAL USE ONLY. Do not use for commercial purposes.\n",
                     match.license.c_str());
@@ -184,8 +212,18 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
             fprintf(stderr, "  License: %s\n", match.license.c_str());
     }
 
+    // Restricted licences need explicit acceptance; --auto-download alone is
+    // NOT sufficient (mirrors CrispEmbed).
+    const bool restricted = !match.license.empty() && crispasr_license_requires_acceptance(match.license);
+    const bool accepted = restricted && crispasr_license_accepted(match.license, accepted_license);
+    if (restricted && !accepted && !isatty(fileno(stdin))) {
+        fprintf(stderr, "  Refusing: pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE).\n",
+                crispasr_license_tag(match.license).c_str());
+        return effective_model_arg;
+    }
+
     bool do_download = false;
-    if (auto_download) {
+    if (auto_download && (!restricted || accepted)) {
         do_download = true;
         fprintf(stderr, "  Auto-downloading (--auto-download is set)...\n");
     } else if (isatty(fileno(stdin))) {

@@ -148,10 +148,11 @@ add_library(crispasr-lib
             crispasr_aligner.cpp
             # Built-in G2P phonemizers (EN/DE/FR/ES) live in the kokoro
             # target (phonemizer.cpp) — only kokoro calls them.
-            # HF download + filesystem cache (shared with CLI). Consumed
-            # by the library's VAD / LID / diarize auto-download paths
-            # and by the CLI's `-m auto` resolver.
-            crispasr_cache.cpp
+            # HF download + filesystem cache (`crispasr_cache.cpp`) lives in
+            # crispasr-core, NOT here — kokoro's phonemizer.cpp calls
+            # crispasr_cache::ensure_cached_file (#316 CMUdict auto-download) and
+            # only links crispasr-core, so a static build (BUILD_SHARED_LIBS=OFF)
+            # left crispasr-diff's link unresolved when it lived here (#316 AUR).
             # Known-model registry lookup (backend → canonical GGUF URL).
             # CLI keeps the TTY prompting shim; the library does the
             # non-interactive resolve.
@@ -164,6 +165,10 @@ add_library(crispasr-lib
             # + indextts_voc runtimes also compiled in here.
             crispasr_speaker_embedder.cpp
             crispasr_speaker_cluster.cpp
+            # Tiron (#295): promote window-local <|speakerN|> indices to
+            # meeting-level ids by clustering group voiceprints (reuses the
+            # embedder + agglomerative clusterer above).
+            tiron_link.cpp
             # Text-LLM chat C ABI (docs/prompts/chat-abi.md). Calls into
             # the private crispasr-llama-core static lib; the public
             # surface lives in include/crispasr_chat.h and exposes only
@@ -218,10 +223,13 @@ if(APPLE)
         PROPERTIES LANGUAGE OBJCXX)
 endif()
 
+# Downstream bundlers can rebrand the shipped library file name (the C API
+# symbols are unchanged). Defaults to the historical "crispasr".
+set(CRISPASR_LIB_OUTPUT_NAME "crispasr" CACHE STRING "Base file name for the built library")
 set_target_properties(crispasr-lib PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${SOVERSION}
-    OUTPUT_NAME crispasr
+    OUTPUT_NAME ${CRISPASR_LIB_OUTPUT_NAME}
 )
 
 target_include_directories(crispasr-lib PUBLIC . ../include)
@@ -229,6 +237,37 @@ target_include_directories(crispasr-lib PUBLIC . ../include)
 # C2PA (Content Credentials) signing in the core C API — so wasm / bindings /
 # server get provenance too, not just the CLI. No-op when C2PA isn't available.
 crispasr_enable_c2pa(crispasr-lib)
+
+# Native pure-C++ C2PA signer (uECC ES256 + hand-built CBOR/JUMBF/COSE). Small,
+# permissively licensed (BSD-2 micro-ecc), zero external deps — always compiled
+# in so WAV provenance works on EVERY platform (desktop/mobile/wasm) without the
+# c2pa-rs Rust lib. Built as its own C++17 static lib so the C++11 crispasr-lib
+# language contract is untouched. Set CRISPASR_NO_C2PA_NATIVE=ON to opt out.
+option(CRISPASR_NO_C2PA_NATIVE "Disable the built-in pure-C++ C2PA WAV signer" OFF)
+if (CRISPASR_NO_C2PA_NATIVE)
+    target_compile_definitions(crispasr-lib PUBLIC CRISPASR_NO_C2PA_NATIVE)
+else()
+    # Sources vendored from the standalone c2pa-audio repo (git submodule).
+    set(_c2pa_audio_dir ${CMAKE_SOURCE_DIR}/third_party/c2pa-audio)
+    add_library(crispasr_c2pa_native STATIC
+        ${_c2pa_audio_dir}/src/c2pa_native.cpp
+        ${_c2pa_audio_dir}/third_party/uecc/uECC.c)
+    # src/ is PUBLIC — the shim headers (src/core/crispasr_c2pa_native.h etc.)
+    # and crispasr_c2pa.h include the submodule's c2pa_native.h / sha256.h, so
+    # every consumer that links crispasr_c2pa_native needs it on the path. uecc
+    # is PRIVATE (only the .cpp needs it).
+    target_include_directories(crispasr_c2pa_native PUBLIC ${_c2pa_audio_dir}/src)
+    target_include_directories(crispasr_c2pa_native PRIVATE ${_c2pa_audio_dir}/third_party/uecc)
+    # Vendored micro-ecc — silence its warnings so CRISPASR_FATAL_WARNINGS builds
+    # don't trip on third-party code we don't modify.
+    if (NOT MSVC)
+        set_source_files_properties(${_c2pa_audio_dir}/third_party/uecc/uECC.c
+            PROPERTIES COMPILE_OPTIONS "-w")
+    endif()
+    target_compile_features(crispasr_c2pa_native PRIVATE cxx_std_17)
+    set_target_properties(crispasr_c2pa_native PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(crispasr-lib PUBLIC crispasr_c2pa_native)
+endif()
 
 set(CRISPASR_LIB_CXX_STANDARD cxx_std_11)
 if (GGML_CUDA AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
@@ -293,6 +332,33 @@ if (CRISPASR_OPUS)
         endif()
         set(BUILD_TESTING       OFF CACHE BOOL "" FORCE)
         set(OPUS_BUILD_TESTING  OFF CACHE BOOL "" FORCE)
+        # Force the fetched codecs STATIC, as this option's name and docs
+        # promise ("build opus/ogg/opusfile statically"). ogg/opus come in via
+        # FetchContent_MakeAvailable and honour the INHERITED BUILD_SHARED_LIBS,
+        # so a parent configured with -DBUILD_SHARED_LIBS=ON (every official
+        # shared-lib release job) silently built them as DYLIBS instead. That
+        # gave libcrispasr @rpath/libogg.0.dylib + @rpath/libopus.0.dylib
+        # dependencies which the release tarball never packaged, so the shipped
+        # macOS bundle would not dlopen standalone (reported against v0.8.17).
+        # It also made THIRD_PARTY_NOTICES.txt's "statically compiled into
+        # libcrispasr ... all official release binaries" untrue.
+        # opusfile is already an explicit STATIC add_library below; this makes
+        # its two dependencies match.
+        set(_crispasr_save_shared "${BUILD_SHARED_LIBS}")
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        # Forcing them STATIC (above) is only half the story: a static library
+        # defaults to NON-PIC, and crispasr-lib is frequently a shared object.
+        # Linking non-PIC objects into a .so is a hard ld error on Linux/ELF —
+        #   relocation R_X86_64_PC32 against `silk_LBRR_flags_iCDF_ptr'
+        #   can not be used when making a shared object; recompile with -fPIC
+        # — which broke the linux-opus-fetch CI job the moment BUILD_SHARED_LIBS
+        # was forced OFF here. It does NOT reproduce on macOS, where everything
+        # is position-independent anyway, so the STATIC fix looked clean locally.
+        # opusfile below already sets POSITION_INDEPENDENT_CODE explicitly; ogg
+        # and opus arrive via FetchContent_MakeAvailable and need the directory
+        # default set before that call.
+        set(_crispasr_save_pic "${CMAKE_POSITION_INDEPENDENT_CODE}")
+        set(CMAKE_POSITION_INDEPENDENT_CODE ON)
         # Emscripten: Opus cmake auto-detects x86 and enables AVX2/FMA sources
         # that fail under wasm32 clang. Disable all intrinsics.
         if (EMSCRIPTEN)
@@ -323,6 +389,12 @@ if (CRISPASR_OPUS)
         message(STATUS "CrispASR: .opus via FetchContent static opus/ogg/opusfile")
         # Restore BUILD_TESTING so include(CTest) in the root CMakeLists
         # defaults correctly (it checks the cache variable).
+        # Restore the parent's BUILD_SHARED_LIBS before anything else is
+        # declared — leaving it OFF would silently make every later target
+        # static too.
+        set(BUILD_SHARED_LIBS "${_crispasr_save_shared}" CACHE BOOL "" FORCE)
+        set(CMAKE_POSITION_INDEPENDENT_CODE "${_crispasr_save_pic}")
+
         if (_crispasr_save_build_testing STREQUAL "__UNSET__")
             unset(BUILD_TESTING CACHE)
         else()
@@ -425,9 +497,40 @@ if (CRISPASR_AMR)
         # also matched dtx_decoder_amr_wb.cpp (suffix), dropping the DTX/comfort-
         # noise decoder and breaking the link with undefined _dtx_dec_amr_wb.
         list(FILTER _amrwb_srcs EXCLUDE REGEX "pvgsm[^/]*\\.cpp$|/decoder_amr_wb\\.cpp$")
+        # #314: opencore-amr is 2000s-era code that still declares locals
+        # `register`. C++17 REMOVED that storage class, so a toolchain whose
+        # default is C++17 (clang >= 16 — the reporter hit it with clang 21 on
+        # Termux/aarch64) makes every one of them a hard error:
+        #   az_lsp.cpp:492:5: error: ISO C++17 does not allow 'register'
+        #   storage class specifier [-Wregister]
+        # while an older default only warns (-Wdeprecated-register). So the
+        # break is toolchain-dependent, not architecture-dependent, and it is
+        # latent on every platform until the compiler default moves.
+        #
+        # Silence it for the VENDORED CODEC ONLY. A global CXXFLAGS
+        # -Wno-register (the issue's workaround) also hides the same mistake in
+        # our own code, and we want that diagnostic. Probing the POSITIVE flag
+        # is deliberate: GCC accepts an unknown `-Wno-*` silently and only
+        # complains once some other diagnostic fires, so testing `-Wno-register`
+        # would report success on compilers that do not know it. GCC has
+        # -Wregister; -Wdeprecated-register is clang-only; MSVC has neither.
+        # CXX-only via a generator expression — these targets also compile .c
+        # sources, where clang rejects the flag as "valid for C++ but not C".
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-Wregister"            CRISPASR_HAVE_WREGISTER)
+        check_cxx_compiler_flag("-Wdeprecated-register" CRISPASR_HAVE_WDEPRECATED_REGISTER)
+        set(_amr_legacy_flags "")
+        if (CRISPASR_HAVE_WREGISTER)
+            list(APPEND _amr_legacy_flags "$<$<COMPILE_LANGUAGE:CXX>:-Wno-register>")
+        endif()
+        if (CRISPASR_HAVE_WDEPRECATED_REGISTER)
+            list(APPEND _amr_legacy_flags "$<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-register>")
+        endif()
+
         if (_amrnb_srcs AND _amrwb_srcs AND EXISTS "${_amr_src}/amrnb/wrapper.cpp")
             add_library(crispasr_amrnb STATIC
                 "${_amr_src}/amrnb/wrapper.cpp" ${_amrnb_srcs})
+            target_compile_options(crispasr_amrnb PRIVATE ${_amr_legacy_flags})
             target_compile_definitions(crispasr_amrnb PRIVATE DISABLE_AMRNB_ENCODER)
             target_include_directories(crispasr_amrnb SYSTEM PUBLIC
                 "${_amr_src}" "${_amr_src}/amrnb" "${_amr_src}/oscl"
@@ -441,6 +544,7 @@ if (CRISPASR_AMR)
 
             add_library(crispasr_amrwb STATIC
                 "${_amr_src}/amrwb/wrapper.cpp" ${_amrwb_srcs})
+            target_compile_options(crispasr_amrwb PRIVATE ${_amr_legacy_flags})
             target_include_directories(crispasr_amrwb SYSTEM PUBLIC
                 "${_amr_src}" "${_amr_src}/amrwb" "${_amr_src}/oscl"
                 "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_wb/dec/src"
@@ -517,11 +621,11 @@ target_link_libraries(crispasr-lib PUBLIC glint)
 # tests don't have to remember to add it. Mirrors how Threads::Threads
 # already flows through.
 if (WIN32)
-    # winhttp: HF auto-download in crispasr_cache.cpp
     # mfplat/mfreadwrite/mfuuid: Media Foundation AAC decoder in crispasr_audio.cpp
     # ole32: CoInitializeEx for MF
+    # (winhttp for crispasr_cache.cpp now flows from crispasr-core — it moved there.)
     # MSVC auto-links via #pragma comment(lib,...) but MinGW/Clang/lld ignores those.
-    target_link_libraries(crispasr-lib PUBLIC winhttp mfplat mfreadwrite mfuuid ole32)
+    target_link_libraries(crispasr-lib PUBLIC mfplat mfreadwrite mfuuid ole32)
 endif()
 
 if (ANDROID AND CRISPASR_MEDIA_NDK)
@@ -747,8 +851,20 @@ add_library(crispasr-core STATIC
             core/gguf_loader.cpp
             core/rvq.h
             core/rvq.cpp
+            # F5-TTS Chinese g2p (#294): jieba-min + pypinyin TONE3 + sandhi.
+            core/pinyin_g2p.h
+            core/pinyin_g2p.cpp
             core/kaldi_fbank.h
             core/kaldi_fbank.cpp
+            # Speaker-count estimation + spectral clustering (#324). Lives in
+            # crispasr-core because both the diarizer and its unit tests use it
+            # and it depends on nothing but the standard library.
+            core/spectral_diarize.h
+            core/spectral_diarize.cpp
+            core/diarize_smooth.h
+            core/diarize_smooth.cpp
+            core/foxnose_pipeline.h
+            core/foxnose_pipeline.cpp
             core/audio_resample.h
             core/audio_resample.cpp
             # Importance-matrix (imatrix) activation-stats collector. Lives in
@@ -758,8 +874,22 @@ add_library(crispasr-core STATIC
             # No-op unless CRISPASR_IMATRIX_OUT is set (see docs/quantize.md).
             crispasr_imatrix.h
             crispasr_imatrix.cpp
+            # HF download + filesystem cache. Lives HERE (not crispasr-lib) for
+            # the same reason as imatrix: backend static libs call it — kokoro's
+            # phonemizer.cpp uses crispasr_cache::ensure_cached_file (#316 CMUdict
+            # auto-download) and links only crispasr-core, so a static build must
+            # find the symbol in the leaf lib, not the higher crispasr-lib (#316).
+            crispasr_cache.h
+            crispasr_cache.cpp
             )
 target_include_directories(crispasr-core PUBLIC . ../include)
+if (WIN32)
+    # crispasr_cache.cpp's HF auto-download uses WinHTTP. MSVC auto-links via
+    # #pragma comment(lib,"winhttp.lib"); MinGW/Clang/lld ignore that, so link it
+    # explicitly here now that crispasr_cache lives in crispasr-core. PUBLIC so any
+    # target that links crispasr-core (backend static libs, tests) inherits it.
+    target_link_libraries(crispasr-core PUBLIC winhttp)
+endif()
 # PLAN #51a: gguf_loader uses ggml_backend_buffer_init from
 # ggml-backend-impl.h to register a custom mmap-owning CPU buffer. The
 # header lives in ggml/src/ rather than ggml/include/, so we expose it
@@ -941,11 +1071,68 @@ if(APPLE)
 endif()
 
 # ---------------------------------------------------------------------------
+# GigaAM-v3 — ai-sage/GigaAM-v3 (rotary Conformer encoder + CTC / RNN-T head)
+# ---------------------------------------------------------------------------
+add_library(gigaam STATIC
+            gigaam.h
+            gigaam.cpp
+            )
+target_include_directories(gigaam PUBLIC . ../include)
+target_compile_features   (gigaam PUBLIC cxx_std_17)
+set_target_properties(gigaam PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (gigaam PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(gigaam PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(gigaam PRIVATE GGML_USE_METAL)
+    target_link_libraries(gigaam PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(gigaam PRIVATE GGML_USE_CUDA)
+    target_link_libraries(gigaam PUBLIC ggml-cuda)
+endif()
+# Accelerate cblas_sgemv for the LSTM predictor + joint head (same rationale
+# as nemotron: the transducer steps are tiny per-token GEMVs).
+if(APPLE)
+    if(NOT ACCELERATE_LIB)
+        find_library(ACCELERATE_LIB Accelerate REQUIRED)
+    endif()
+    target_link_libraries(gigaam PUBLIC ${ACCELERATE_LIB})
+    target_compile_definitions(gigaam PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
+
+# ---------------------------------------------------------------------------
+# WeSpeaker ResNet34-LM — speaker embedding (#324 FoxNose diarization)
+# ---------------------------------------------------------------------------
+add_library(wespeaker STATIC
+            wespeaker.h
+            wespeaker.cpp
+            )
+target_include_directories(wespeaker PUBLIC . ../include)
+target_compile_features   (wespeaker PUBLIC cxx_std_17)
+set_target_properties(wespeaker PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (wespeaker PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(wespeaker PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(wespeaker PRIVATE GGML_USE_METAL)
+    target_link_libraries(wespeaker PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(wespeaker PRIVATE GGML_USE_CUDA)
+    target_link_libraries(wespeaker PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # Parakeet TDT — nvidia/parakeet-tdt-0.6b-v3 (FastConformer encoder + TDT decoder)
 # ---------------------------------------------------------------------------
 add_library(parakeet STATIC
             parakeet.h
             parakeet.cpp
+            parakeet_orchestrate.h
+            parakeet_orchestrate.cpp
             )
 target_include_directories(parakeet PUBLIC . ../include)
 target_compile_features   (parakeet PUBLIC cxx_std_17)
@@ -1061,6 +1248,20 @@ endif()
 if(GGML_CUDA)
     target_compile_definitions(sensevoice PRIVATE GGML_USE_CUDA)
     target_link_libraries(sensevoice PUBLIC ggml-cuda)
+endif()
+
+# Sidon speech restoration (w2v-BERT predictor + continuous 48 kHz DAC)
+add_library(sidon STATIC sidon.h sidon.cpp)
+target_include_directories(sidon PUBLIC . ../include)
+target_compile_features(sidon PUBLIC cxx_std_17)
+set_target_properties(sidon PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(sidon PUBLIC crispasr-core ggml ggml-base ggml-cpu Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(sidon PRIVATE -O3)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(sidon PRIVATE GGML_USE_CUDA)
+    target_link_libraries(sidon PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1425,7 +1626,28 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# miotts — Aratako/MioTTS (Qwen3 LLM + MioCodec FSQ → 24kHz waveform)
+# ---------------------------------------------------------------------------
+add_library(miotts STATIC miotts.h miotts.cpp)
+set_target_properties(miotts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(miotts PUBLIC .)
+target_compile_features   (miotts PUBLIC cxx_std_17)
+target_link_libraries     (miotts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(miotts PRIVATE -O3)
+endif()
+
+# miocodec — Aratako/MioCodec-25Hz-44.1kHz-v2 (MIT, 133M params)
+# Standalone audio codec: FSQ → Transformer + AdaLN-Zero → iSTFT → 44.1kHz
+add_library(miocodec STATIC miocodec.h miocodec.cpp)
+set_target_properties(miocodec PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(miocodec PUBLIC .)
+target_compile_features   (miocodec PUBLIC cxx_std_17)
+target_link_libraries     (miocodec PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+
+# ---------------------------------------------------------------------------
 # omnivoice — OmniVoice (full realtime Qwen3 + RVQ codec pipeline)
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 add_library(omnivoice STATIC
     omnivoice.h
@@ -1455,6 +1677,18 @@ target_compile_features   (orpheus PUBLIC cxx_std_17)
 target_link_libraries     (orpheus PUBLIC crispasr-core snac ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(orpheus PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# piano_transcription — ByteDance/Kong piano transcription (Apache-2.0, ~86M F16)
+# ---------------------------------------------------------------------------
+add_library(piano-transcription STATIC piano_transcription.h piano_transcription.cpp)
+set_target_properties(piano-transcription PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(piano-transcription PUBLIC .)
+target_compile_features   (piano-transcription PUBLIC cxx_std_17)
+target_link_libraries     (piano-transcription PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(piano-transcription PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1491,7 +1725,9 @@ add_library(tada-tts STATIC tada_tts.h tada_tts.cpp)
 set_target_properties(tada-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tada-tts PUBLIC .)
 target_compile_features   (tada-tts PUBLIC cxx_std_17)
-target_link_libraries     (tada-tts PUBLIC tada-codec crispasr-core ggml ggml-base ggml-cpu)
+# tada-encoder (declared below) provides the in-memory make-ref path (#201:
+# tada_make_ref_from_pcm). PUBLIC so crispasr-lib picks it up transitively.
+target_link_libraries     (tada-tts PUBLIC tada-codec tada-encoder crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(tada-tts PRIVATE -O3)
 endif()
@@ -1625,7 +1861,7 @@ target_link_libraries     (kugelaudio PUBLIC crispasr-core ggml ggml-base ggml-c
 # ---------------------------------------------------------------------------
 # voxcpm2_tts — openbmb/VoxCPM2 (diffusion AR TTS, 30 languages, 48kHz)
 # ---------------------------------------------------------------------------
-add_library(voxcpm2_tts STATIC voxcpm2_tts.h voxcpm2_tts.cpp)
+add_library(voxcpm2_tts STATIC voxcpm2_tts.h voxcpm2_vae.h voxcpm2_tts.cpp)
 set_target_properties(voxcpm2_tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(voxcpm2_tts PUBLIC .)
 target_compile_features   (voxcpm2_tts PUBLIC cxx_std_17)
@@ -1663,6 +1899,28 @@ endif()
 # phonemizer.cpp lives here — only kokoro calls phonemize_builtin_*.
 add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.cpp phonemizer.h)
 set_target_properties(kokoro PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# #316: enable the G2P dictionary auto-download in phonemizer.cpp.
+#
+# CRISPASR_HAS_CACHE was referenced there but DEFINED NOWHERE, so every
+# auto-download in that file — CMUdict included — was dead code. A user without
+# a pre-seeded ~/.cache/crispasr/cmudict.dict silently got no English dictionary
+# at all and fell through to the letter-to-sound rules ("this" -> θˈɪs), which
+# is a large part of what #316 sounded like.
+#
+# The gate is CRISPASR_BUILD, which guards both the #include and the
+# CRISPASR_HAS_CACHE define — and it was only ever set on crispasr-lib, and only
+# under BUILD_SHARED_LIBS, so it was never true where phonemizer.cpp is
+# compiled.
+#
+# crispasr_cache.cpp now lives in crispasr-core (the leaf lib kokoro already
+# links), NOT crispasr-lib. Originally it was in crispasr-lib and the reference
+# was left for the final executable to resolve — but a static build
+# (BUILD_SHARED_LIBS=OFF) links crispasr-lib BEFORE kokoro, so the linker
+# discarded crispasr_cache.o before phonemizer.o referenced it and crispasr-diff
+# failed to link (#316 AUR report). Moving the symbol to crispasr-core — which
+# every backend static lib depends on — resolves it in all link configs with no
+# cycle (mirrors crispasr_imatrix).
+target_compile_definitions(kokoro PRIVATE CRISPASR_BUILD)
 target_include_directories(kokoro PUBLIC .)
 target_compile_features   (kokoro PUBLIC cxx_std_17)
 target_link_libraries     (kokoro PUBLIC crispasr-core ggml ggml-base ggml-cpu)
@@ -2033,6 +2291,30 @@ target_include_directories(crispasr-vad-encdec PUBLIC .)
 target_compile_features   (crispasr-vad-encdec PUBLIC cxx_std_17)
 target_link_libraries     (crispasr-vad-encdec PUBLIC ggml ggml-base ggml-cpu)
 
+# webrtc-vad — WebRTC GMM-based VAD (no model file, pure algorithmic)
+set(_webrtc_vad_dir ${CMAKE_SOURCE_DIR}/third_party/webrtc)
+file(GLOB_RECURSE _webrtc_vad_c_sources ${_webrtc_vad_dir}/*.c)
+add_library(webrtc-vad STATIC
+    webrtc_vad.h webrtc_vad.cpp
+    ${_webrtc_vad_c_sources})
+set_target_properties(webrtc-vad PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(webrtc-vad PUBLIC .)
+target_include_directories(webrtc-vad PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(webrtc-vad PUBLIC cxx_std_17)
+# WEBRTC_POSIX makes the vendored spl_init.c take its `#include <pthread.h>`
+# branch (spl_init.c:95); on Windows/MSVC there is no pthread.h, so it must fall
+# through to the native `#elif defined(_WIN32)` CRITICAL_SECTION branch
+# (spl_init.c:103) instead. Only define WEBRTC_POSIX off-Windows. (Diagnosed in
+# PR #279 by KevinAHM; verified against the vendored source. Paired with the
+# [[noreturn]] fix already on main, this closes the Windows CI/Release leg.)
+if(NOT WIN32)
+    target_compile_definitions(webrtc-vad PRIVATE WEBRTC_POSIX)
+endif()
+if(NOT MSVC)
+    set_source_files_properties(${_webrtc_vad_c_sources}
+        PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+
 # ---------------------------------------------------------------------------
 # firered-lid — FireRedLID (120-language identification)
 # ---------------------------------------------------------------------------
@@ -2237,6 +2519,166 @@ if(NOT MSVC)
     target_compile_options(ctc-align PRIVATE -O3)
 endif()
 # ---------------------------------------------------------------------------
+# htdemucs — HTDemucs source separation (Meta Demucs v4)
+# ---------------------------------------------------------------------------
+add_library(htdemucs STATIC htdemucs.h htdemucs.cpp)
+set_target_properties(htdemucs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(htdemucs PUBLIC .)
+target_compile_features   (htdemucs PUBLIC cxx_std_17)
+target_link_libraries     (htdemucs PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+# The CrossTransformer is ~86% of htdemucs runtime (measured with
+# CRISPASR_HTDEMUCS_PROFILE=1). Link Accelerate so its projections and attention
+# run through cblas_sgemm instead of scalar loops.
+if(APPLE)
+    if(NOT ACCELERATE_LIB)
+        find_library(ACCELERATE_LIB Accelerate REQUIRED)
+    endif()
+    target_link_libraries(htdemucs PUBLIC ${ACCELERATE_LIB})
+    target_compile_definitions(htdemucs PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
+if(NOT MSVC)
+    target_compile_options(htdemucs PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# beat-this — Beat This! beat/downbeat tracking (§251b)
+# ---------------------------------------------------------------------------
+add_library(beat-this STATIC beat_this.h beat_this.cpp)
+set_target_properties(beat-this PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(beat-this PUBLIC .)
+target_compile_features   (beat-this PUBLIC cxx_std_17)
+target_link_libraries     (beat-this PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(beat-this PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# rvc-svc — RVC voice conversion (§CB1). Full infer(): enc_p + flow + dec.
+# Weights vary in licence; the GGUF carries its own tag and the registry gates.
+add_library(rvc-svc STATIC rvc_svc.h rvc_svc.cpp)
+set_target_properties(rvc-svc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rvc-svc PUBLIC .)
+target_compile_features   (rvc-svc PUBLIC cxx_std_17)
+target_link_libraries     (rvc-svc PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(rvc-svc PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# beatrice-pitch — Beatrice v2 PitchEstimator (§CB2). MIT, source and weights.
+# First of three components; deterministic (the RNG is in the vocoder).
+add_library(beatrice-pitch STATIC beatrice_pitch.h beatrice_pitch.cpp beatrice_phone.h beatrice_phone.cpp)
+set_target_properties(beatrice-pitch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(beatrice-pitch PUBLIC .)
+target_compile_features   (beatrice-pitch PUBLIC cxx_std_17)
+target_link_libraries     (beatrice-pitch PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(beatrice-pitch PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# crepe — CREPE monophonic F0 estimation (music transcription)
+# ---------------------------------------------------------------------------
+# btc_chords — BTC chord recognition (ISMIR 2019). Weights are CC-BY-NC-SA;
+# the registry gate refuses to download them without --accept-license.
+add_library(btc-chords STATIC btc_chords.h btc_chords.cpp)
+set_target_properties(btc-chords PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(btc-chords PUBLIC .)
+target_compile_features   (btc-chords PUBLIC cxx_std_17)
+target_link_libraries     (btc-chords PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(btc-chords PRIVATE -O3)
+endif()
+
+# TabCNN guitar tablature emission scorer (--tab). Weights are CC BY 4.0
+# (EGSet12, doi:10.5281/zenodo.11406378) and require attribution.
+add_library(tabcnn STATIC tabcnn.h tabcnn.cpp)
+set_target_properties(tabcnn PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(tabcnn PUBLIC .)
+target_compile_features   (tabcnn PUBLIC cxx_std_17)
+target_link_libraries     (tabcnn PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(tabcnn PRIVATE -O3)
+endif()
+
+add_library(crepe STATIC crepe.h crepe.cpp)
+set_target_properties(crepe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(crepe PUBLIC .)
+target_compile_features   (crepe PUBLIC cxx_std_17)
+target_link_libraries     (crepe PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(crepe PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# mel-band-roformer — Mel-Band RoFormer source separation (§248)
+# ---------------------------------------------------------------------------
+add_library(mel-band-roformer STATIC mel_band_roformer.h mel_band_roformer.cpp)
+set_target_properties(mel-band-roformer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mel-band-roformer PUBLIC .)
+target_compile_features   (mel-band-roformer PUBLIC cxx_std_17)
+target_link_libraries     (mel-band-roformer PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(mel-band-roformer PRIVATE -O3)
+endif()
+# #296: parallelise the band/time Transformer loops (run_time/run_freq) when
+# OpenMP is available; the pragmas are #ifdef _OPENMP-guarded so non-OMP builds
+# keep the serial path.
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mel-band-roformer PUBLIC OpenMP::OpenMP_CXX)
+endif()
+# #296 (the real fix): route linear() through cblas_sgemm — the forward is
+# ~264 GFLOP of matmul, fast on macOS/Accelerate but a ~24-min scalar loop
+# elsewhere. Link a BLAS the same way cohere does (Accelerate on Apple,
+# OpenBLAS/MKL via crispasr_prefer_cblas elsewhere); HAVE_BLAS gates the fast path.
+if(APPLE)
+    if(NOT ACCELERATE_LIB)
+        find_library(ACCELERATE_LIB Accelerate REQUIRED)
+    endif()
+    target_link_libraries(mel-band-roformer PUBLIC ${ACCELERATE_LIB})
+    target_compile_definitions(mel-band-roformer PRIVATE HAVE_BLAS ACCELERATE_NEW_LAPACK)
+elseif(CRISPASR_MEL_BLAS)
+    # Gated on CRISPASR_MEL_BLAS (default ON) — the same switch the mel filterbank
+    # uses. OFF (e.g. the Go bindings build, which links a hand-maintained cgo lib
+    # list with no external BLAS) compiles the scalar linear()/attention() fallback
+    # so no unresolved cblas_sgemm is referenced. Prefer OpenBLAS EXPLICITLY: crispasr_prefer_cblas() / find_package(CBLAS)
+    # happily returns the reference Netlib libcblas.so, whose sgemm is a naive
+    # scalar loop — measured as slow as no BLAS at all (#296 validation). OpenBLAS
+    # exports the cblas symbols too and is 10-50x faster, so look for it first.
+    find_library(MBR_OPENBLAS NAMES openblas openblasp openblaso)
+    find_path(CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas)
+    if(MBR_OPENBLAS AND CBLAS_INCLUDE_DIR)
+        target_link_libraries(mel-band-roformer PUBLIC ${MBR_OPENBLAS})
+        target_include_directories(mel-band-roformer PRIVATE ${CBLAS_INCLUDE_DIR})
+        # CRISPASR_MBR_OPENBLAS: OpenBLAS specifically is linked, so
+        # openblas_set_num_threads is guaranteed present (portable, no weak symbol).
+        target_compile_definitions(mel-band-roformer PRIVATE HAVE_BLAS CRISPASR_MBR_OPENBLAS)
+        message(STATUS "mel-band-roformer: linking OpenBLAS ${MBR_OPENBLAS}")
+    else()
+        # Fall back to whatever cblas exists (reference is slow but correct).
+        crispasr_prefer_cblas(QUIET)
+        if(BLAS_FOUND AND CBLAS_INCLUDE_DIR)
+            target_link_libraries(mel-band-roformer PUBLIC ${BLAS_LIBRARIES})
+            target_include_directories(mel-band-roformer PRIVATE ${CBLAS_INCLUDE_DIR})
+            target_compile_definitions(mel-band-roformer PRIVATE HAVE_BLAS)
+            message(STATUS "mel-band-roformer: OpenBLAS not found; using ${BLAS_LIBRARIES} (may be slow reference cblas)")
+        else()
+            message(STATUS "mel-band-roformer: no BLAS found — linear() uses the scalar fallback (slow separation)")
+        endif()
+    endif()
+else()
+    message(STATUS "mel-band-roformer: CRISPASR_MEL_BLAS=OFF — scalar fallback (slow separation)")
+endif()
+
+# Standalone front-end diff probe (§248 Phase 1). Opt-in so it doesn't add to
+# the default build: cmake -DCRISPASR_BUILD_MBR_PROBE=ON.
+option(CRISPASR_BUILD_MBR_PROBE "Build the mel-band-roformer diff probe" OFF)
+if(CRISPASR_BUILD_MBR_PROBE)
+    add_executable(mbr-diff-probe ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mbr_diff_probe.cpp)
+    target_link_libraries(mbr-diff-probe PRIVATE mel-band-roformer)
+endif()
+
+# ---------------------------------------------------------------------------
 # Multi-backend linkage (consumed by CLI + Dart + Python + Rust)
 #
 # Non-Whisper CrispASR backends become reachable through the `crispasr_*`
@@ -2251,6 +2693,12 @@ endif()
 # `target_link_libraries(crispasr-lib PUBLIC <target>)` below, (3) add the
 # `crispasr_<backend>_*` wrappers to crispasr_c_api.cpp.
 # ---------------------------------------------------------------------------
+if (TARGET gigaam)
+    target_link_libraries(crispasr-lib PUBLIC gigaam)
+endif()
+if (TARGET wespeaker)
+    target_link_libraries(crispasr-lib PUBLIC wespeaker)
+endif()
 if (TARGET nemotron)
     target_link_libraries(crispasr-lib PUBLIC nemotron)
 endif()
@@ -2305,8 +2753,20 @@ endif()
 if (TARGET glm-asr)
     target_link_libraries(crispasr-lib PUBLIC glm-asr)
 endif()
+if (TARGET htdemucs)
+    target_link_libraries(crispasr-lib PUBLIC htdemucs)
+endif()
+# miotts: crispasr_c_api.cpp calls miotts_init_from_file / _free /
+# _context_default_params, but the library was never linked, so libcrispasr
+# failed to link with undefined _miotts_* symbols.
+if (TARGET miotts)
+    target_link_libraries(crispasr-lib PUBLIC miotts)
+endif()
 if (TARGET mini-omni2)
     target_link_libraries(crispasr-lib PUBLIC mini-omni2)
+endif()
+if (TARGET sidon)
+    target_link_libraries(crispasr-lib PUBLIC sidon)
 endif()
 if (TARGET kyutai-stt)
     target_link_libraries(crispasr-lib PUBLIC kyutai-stt)
@@ -2323,6 +2783,9 @@ endif()
 if (TARGET crispasr-vad-encdec)
     target_link_libraries(crispasr-lib PUBLIC crispasr-vad-encdec)
 endif()
+if (TARGET webrtc-vad)
+    target_link_libraries(crispasr-lib PUBLIC webrtc-vad)
+endif()
 if (TARGET firered-lid)
     target_link_libraries(crispasr-lib PUBLIC firered-lid)
 endif()
@@ -2336,6 +2799,9 @@ if (TARGET omniasr)
 endif()
 if (TARGET vibevoice)
     target_link_libraries(crispasr-lib PUBLIC vibevoice)
+endif()
+if (TARGET piano-transcription)
+    target_link_libraries(crispasr-lib PUBLIC piano-transcription)
 endif()
 if (TARGET kugelaudio)
     target_link_libraries(crispasr-lib PUBLIC kugelaudio)
@@ -2551,6 +3017,11 @@ endif()
 if (TARGET pyannote-seg)
     target_link_libraries(crispasr-lib PUBLIC pyannote-seg)
 endif()
+# WeSpeaker is likewise not a backend — crispasr_diarize.cpp consumes it for
+# the "foxnose" method (#324).
+if (TARGET wespeaker)
+    target_link_libraries(crispasr-lib PUBLIC wespeaker)
+endif()
 # Silero LID engine used by crispasr_lid.cpp's native Silero path.
 if (TARGET silero-lid)
     target_link_libraries(crispasr-lib PUBLIC silero-lid)
@@ -2564,6 +3035,36 @@ endif()
 # crispasr-lib (the main library) and crispasr-lid both go through this.
 if (TARGET text-lid-dispatch AND NOT TARGET crisp_lid)
     target_link_libraries(crispasr-lib PUBLIC text-lid-dispatch)
+endif()
+
+# §248 source-separation backends — driven by the --separate CLI dispatcher
+# (examples/cli/crispasr_separate_cli.cpp), arch auto-detected from the GGUF.
+if (TARGET mel-band-roformer)
+    target_link_libraries(crispasr-lib PUBLIC mel-band-roformer)
+endif()
+if (TARGET htdemucs)
+    target_link_libraries(crispasr-lib PUBLIC htdemucs)
+endif()
+
+# Pitch (F0) estimation — driven by the --pitch CLI dispatcher
+# (examples/cli/crispasr_pitch_cli.cpp), arch auto-detected from the GGUF.
+if (TARGET crepe)
+    target_link_libraries(crispasr-lib PUBLIC crepe)
+endif()
+if (TARGET btc-chords)
+    target_link_libraries(crispasr-lib PUBLIC btc-chords)
+endif()
+if (TARGET tabcnn)
+    target_link_libraries(crispasr-lib PUBLIC tabcnn)
+endif()
+if (TARGET beatrice-pitch)
+    target_link_libraries(crispasr-lib PUBLIC beatrice-pitch)
+endif()
+if (TARGET rvc-svc)
+    target_link_libraries(crispasr-lib PUBLIC rvc-svc)
+endif()
+if (TARGET beat-this)
+    target_link_libraries(crispasr-lib PUBLIC beat-this)
 endif()
 
 # Text-LLM chat backend — PRIVATE link: llama.h identifiers are

@@ -31,6 +31,13 @@
 
 #include "crispasr_c2pa_default_cert.h" // bundled self-signed default cert (baked in)
 
+// Native pure-C++ C2PA signer for WAV (no c2pa-rs). Always available; it is the
+// primary path for WAV on every platform. Define CRISPASR_NO_C2PA_NATIVE to opt
+// out (e.g. a build that only wants MP3/M4A via c2pa-rs).
+#ifndef CRISPASR_NO_C2PA_NATIVE
+#include "crispasr_c2pa_native.h"
+#endif
+
 #ifdef CRISPASR_HAVE_C2PA
 #include <c2pa.h>
 #endif
@@ -74,6 +81,19 @@ inline const char* crispasr_c2pa_format_for_ext(const std::string& ext) {
         return "audio/flac";
     return ""; // aac (adts), opus/ogg — not embeddable by c2pa
 }
+
+// read_file is always available (needs only <fstream>) so the native WAV path
+// can load a user cert/key without c2pa-rs compiled in.
+namespace crispasr_c2pa_detail {
+inline std::string read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return {};
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+} // namespace crispasr_c2pa_detail
 
 #ifdef CRISPASR_HAVE_C2PA
 
@@ -126,15 +146,6 @@ inline intptr_t mem_flush(StreamContext*) {
     return 0;
 }
 
-inline std::string read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return {};
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
 } // namespace crispasr_c2pa_detail
 
 #endif // CRISPASR_HAVE_C2PA
@@ -149,6 +160,31 @@ inline bool crispasr_c2pa_sign_pem(std::string& data, const char* format, const 
                                    const std::string& key_pem) {
     if (!format || !*format || cert_pem.empty() || key_pem.empty())
         return false;
+
+#ifndef CRISPASR_NO_C2PA_NATIVE
+    // Native path — pure C++ (uECC ES256 + hand-built CBOR/JUMBF/COSE) from the
+    // vendored c2pa-audio lib, no c2pa-rs; works on every platform including the
+    // wasm/mobile sandbox. WAV (RIFF chunk), MP3 (ID3v2 GEOB), M4A/MP4 (ISO BMFF,
+    // c2pa.hash.bmff.v3), and FLAC (ID3v2 GEOB prepend) are ALL native — c2pa-rs
+    // is no longer needed for any audio container CrispASR emits.
+    {
+        crispasr::c2pa_native::Bytes in(data.begin(), data.end());
+        crispasr::c2pa_native::Bytes out;
+        if (std::strcmp(format, "audio/wav") == 0)
+            out = crispasr::c2pa_native::sign_wav(in, cert_pem, key_pem);
+        else if (std::strcmp(format, "audio/mpeg") == 0)
+            out = crispasr::c2pa_native::sign_mp3(in, cert_pem, key_pem);
+        else if (std::strcmp(format, "audio/mp4") == 0)
+            out = crispasr::c2pa_native::sign_m4a(in, cert_pem, key_pem);
+        else if (std::strcmp(format, "audio/flac") == 0)
+            out = crispasr::c2pa_native::sign_flac(in, cert_pem, key_pem);
+        if (!out.empty()) {
+            data.assign(reinterpret_cast<const char*>(out.data()), out.size());
+            return true;
+        }
+        // fall through to c2pa-rs (if compiled in) on native failure / other formats
+    }
+#endif
 
 #ifdef CRISPASR_HAVE_C2PA
     using namespace crispasr_c2pa_detail;
@@ -222,7 +258,9 @@ inline bool crispasr_c2pa_sign_buffer(std::string& data, const char* format, con
                                       const std::string& key_path) {
     if (!format || !*format || cert_path.empty() || key_path.empty())
         return false;
-#ifdef CRISPASR_HAVE_C2PA
+    // Reading the PEM files needs only <fstream> (always available); the native
+    // WAV path then works even without c2pa-rs. read_file is defined regardless
+    // of CRISPASR_HAVE_C2PA (see crispasr_c2pa_detail below).
     std::string cert = crispasr_c2pa_detail::read_file(cert_path);
     std::string key = crispasr_c2pa_detail::read_file(key_path);
     if (cert.empty() || key.empty()) {
@@ -230,10 +268,6 @@ inline bool crispasr_c2pa_sign_buffer(std::string& data, const char* format, con
         return false;
     }
     return crispasr_c2pa_sign_pem(data, format, cert, key);
-#else
-    (void)data;
-    return false;
-#endif
 }
 
 // Back-compat WAV wrapper (existing call sites).
@@ -257,14 +291,20 @@ inline bool crispasr_c2pa_sign_auto(std::string& data, const char* format, const
     return crispasr_c2pa_sign_pem(data, format, crispasr_c2pa_default_cert_pem(), crispasr_c2pa_default_key_pem());
 }
 
-// Print a one-time startup warning if C2PA is not compiled in.
+// Print a one-time startup note about C2PA capabilities.
 inline void crispasr_c2pa_startup_check() {
-#ifndef CRISPASR_HAVE_C2PA
+#if !defined(CRISPASR_HAVE_C2PA) && defined(CRISPASR_NO_C2PA_NATIVE)
     static bool warned = false;
     if (!warned) {
-        fprintf(stderr, "crispasr: C2PA signing disabled (c2pa-c library not found; run "
-                        "scripts/fetch-c2pa.sh and rebuild)\n");
+        fprintf(stderr, "crispasr: C2PA signing disabled (no native signer and c2pa-c not found; "
+                        "run scripts/fetch-c2pa.sh and rebuild, or enable the native signer)\n");
         warned = true;
     }
+#elif !defined(CRISPASR_HAVE_C2PA)
+    // The native signer covers WAV, MP3 (ID3v2.4 GEOB), M4A/MP4 (ISO BMFF
+    // uuid) and FLAC — see crispasr_c2pa_sign_pem() above. c2pa-rs is only a
+    // fallback for formats outside that set. No warning: signing works out of
+    // the box for every container CrispASR emits a manifest into, and the
+    // watertight marking floor relies on that being true.
 #endif
 }

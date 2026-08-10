@@ -30,7 +30,8 @@
 #include "core/g2p_fr.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
-#include "phonemizer.h"            // strip_espeak_lang_markers (#169)
+#include "core/crispasr_env.h"
+#include "phonemizer.h" // strip_espeak_lang_markers (#169)
 // crispasr_cache is part of crispasr-lib, not piper-tts; guard behind CRISPASR_BUILD.
 #ifdef CRISPASR_BUILD
 #include "crispasr_cache.h"
@@ -55,7 +56,7 @@
 static bool piper_use_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (getenv("PIPER_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_PIPER_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 #endif
@@ -67,7 +68,7 @@ static bool piper_use_scalar() {
 static bool piper_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("PIPER_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_PIPER_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -620,6 +621,7 @@ struct piper_tts_context {
     float length_scale;
     float noise_w;
     int speaker_id;
+    uint32_t seed; // 0 = non-deterministic (std::random_device)
     std::string espeak_voice;
 
     int verbosity;
@@ -1538,8 +1540,10 @@ static void sdp_forward(piper_tts_context* ctx,
     // 3. Generate noise z ~ N(0, noise_w²)
     std::vector<float> z(2 * T, 0.0f);
     if (noise_w > 0) {
-        std::random_device rd;
-        std::mt19937 gen(rd());
+        // Seeded when ctx->seed is set, so synthesis is reproducible; otherwise
+        // std::random_device as before. +1/+2 keep the two stochastic stages on
+        // separate streams (same convention as melotts).
+        std::mt19937 gen(ctx->seed ? ctx->seed + 1 : (uint32_t)std::random_device()());
         std::normal_distribution<float> dist(0.0f, noise_w);
         for (int i = 0; i < 2 * T; i++) {
             z[i] = dist(gen);
@@ -2241,6 +2245,7 @@ struct piper_tts_params piper_tts_default_params(void) {
     p.length_scale = -1.0f;
     p.noise_w = -1.0f;
     p.speaker_id = 0;
+    p.seed = 0;
     return p;
 }
 
@@ -2295,6 +2300,7 @@ struct piper_tts_context* piper_tts_init_from_file(const char* path_model, struc
     ctx->length_scale = params.length_scale >= 0 ? params.length_scale : ctx->hp.length_scale;
     ctx->noise_w = params.noise_w >= 0 ? params.noise_w : ctx->hp.noise_w;
     ctx->speaker_id = params.speaker_id;
+    ctx->seed = params.seed;
     ctx->espeak_voice = ctx->hp.espeak_voice;
 
     // Pre-cache all weights as F32 to avoid repeated backend_tensor_get +
@@ -2458,8 +2464,7 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
     int T_latent = total_dur;
     std::vector<float> z(C * T_latent);
     {
-        std::random_device rd;
-        std::mt19937 gen(rd());
+        std::mt19937 gen(ctx->seed ? ctx->seed + 2 : (uint32_t)std::random_device()());
         std::normal_distribution<float> dist(0.0f, 1.0f);
         for (int i = 0; i < C * T_latent; i++) {
             float noise = dist(gen) * ctx->noise_scale;

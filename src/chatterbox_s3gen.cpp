@@ -20,8 +20,10 @@
 #include "chatterbox_s3gen.h"
 #include "chatterbox_s3tok.h"
 #include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (shared FASTCONV)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -48,7 +50,7 @@
 static bool cb_s3gen_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CB_S3GEN_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CB_S3GEN_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -355,6 +357,18 @@ struct chatterbox_s3gen_context {
     bool dequant_cfm_f16 = false;
     ggml_context* ctx_f16 = nullptr;
     ggml_backend_buffer_t buf_f16 = nullptr;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked F32 copies of the F16 conv
+    // kernels, so the fork's per-graph F16→F32 cast (in ggml_conv_1d) becomes a
+    // no-op. Two caches because s3gen weights are split across backends (split
+    // load routes s3.fd.*→CPU, rest→GPU; the Metal CFM fix moves quantized
+    // s3.fd.* back to GPU) — each F16 conv kernel is baked on ITS OWN backend so
+    // the pointer-swap in c->tensors preserves placement exactly. Cast-kill only
+    // (no k=1→matmul), which is bitwise-identical to the legacy cast. Gated
+    // CRISPASR_S3GEN_FASTCONV (default OFF pending a full seeded A/B on a quiet box).
+    core_dac::fastconv_cache fc_gpu;
+    core_dac::fastconv_cache fc_cpu;
+
     mt19937_state noise_rng{};
     uint32_t noise_seed = 0;
 
@@ -395,6 +409,8 @@ struct chatterbox_s3gen_context {
             ggml_backend_buffer_free(buf_f16);
         if (ctx_f16)
             ggml_free(ctx_f16);
+        fc_gpu.free();
+        fc_cpu.free();
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
@@ -782,6 +798,61 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
                         "(%.0f→%.0f MiB; correct mul_mm_f16_f32_hp path, full GPU speed; "
                         "CRISPASR_S3GEN_UNET_CPU=1 for the CPU route)\n",
                         n_conv, bytes_q / 1048576.0, bytes_f16 / 1048576.0);
+            }
+        }
+    }
+
+    // FASTCONV: bake F32 copies of the F16 conv kernels and redirect graph
+    // lookups to them (same pointer-swap idiom as the ctx_f16 fix above), so
+    // ggml_conv_1d skips its per-graph F16→F32 kernel cast. Bitwise-identical to
+    // the legacy cast (the bake IS that conversion, done once at load). Each
+    // kernel is baked on its OWN backend to preserve split-load placement.
+    // Gated CRISPASR_S3GEN_FASTCONV; default OFF until a full seeded A/B lands.
+    {
+        // Default ON: the A/B proved cast-kill is audio byte-identical to the
+        // legacy in-graph cast (ON vs OFF @seed42 = 0/32768 across all samples,
+        // which for this flow-matching+AR pipeline also subsumes the determinism
+        // gate — a non-deterministic run would have diverged). Set =0 to revert.
+        const char* e = std::getenv("CRISPASR_S3GEN_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        if (on) {
+            const bool have_gpu = (c->backend_cpu && c->backend_cpu != c->backend);
+            ggml_backend_buffer_type_t cpu_buft =
+                have_gpu ? ggml_backend_get_default_buffer_type(c->backend_cpu) : nullptr;
+            std::vector<ggml_tensor*> gpu_k, cpu_k;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                if (!w || w->type != GGML_TYPE_F16 || ggml_n_dims(w) != 3)
+                    continue; // conv kernels are the only 3D weights (matmuls are 2D)
+                // Exclude ConvTranspose1d upsample weights (.ups.): they go through
+                // core_convt's decomposed permute path, not ggml_conv_1d, and the
+                // permute below reads the F16 original from c->tensors — swapping
+                // them to F32 would feed garbage to permute_convt1d_weight.
+                if (kv.first.find(".ups.") != std::string::npos)
+                    continue;
+                // Route each kernel to a cache on ITS OWN backend so the swap
+                // preserves split-load placement. CPU-only mode → all on c->backend.
+                const bool on_cpu =
+                    have_gpu && w->buffer && cpu_buft && ggml_backend_buffer_get_type(w->buffer) == cpu_buft;
+                (on_cpu ? cpu_k : gpu_k).push_back(w);
+            }
+            c->fc_gpu.bake(c->backend, gpu_k, true);
+            if (have_gpu)
+                c->fc_cpu.bake(c->backend_cpu, cpu_k, true);
+            size_t swapped = 0;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                ggml_tensor* f = c->fc_gpu.get(w);
+                if (f == w)
+                    f = c->fc_cpu.get(w);
+                if (f != w) {
+                    kv.second = f;
+                    swapped++;
+                }
+            }
+            if (verbosity >= 1 || std::getenv("CRISPASR_S3GEN_FASTCONV_DEBUG")) {
+                fprintf(stderr, "s3gen: FASTCONV ON — baked %zu GPU + %zu CPU F16 conv kernels → F32 (%zu swapped)\n",
+                        c->fc_gpu.f32.size(), c->fc_cpu.f32.size(), swapped);
             }
         }
     }
@@ -2613,7 +2684,28 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
     // The batch=2 graph fuses both into one Metal dispatch so attention GEMMs (≈90% of
     // compute) run as batched matmuls rather than two sequential single-batch calls.
     // Opt out with CRISPASR_S3GEN_UNET_CFG_SINGLE=1 to force the old sequential path.
-    const bool use_cfg_b2 = (cfg_rate > 0.0f && !meanflow) && !std::getenv("CRISPASR_S3GEN_UNET_CFG_SINGLE");
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond UNet pass only every K CFM Euler steps and reuse the cached uncond
+    // velocity in between; the cond pass stays fresh every step; the first and last
+    // step always recompute. K>1 forces the SEQUENTIAL single-UNet path (the batched
+    // B2 graph fuses cond+uncond in one dispatch, so there is nothing to skip), then
+    // skips the uncond pass. Only active when K>1 && cfg_rate>0 && !meanflow, so at the
+    // default the batched B2 path below is byte-for-byte unchanged (K=1 = exact).
+    // Gated CRISPASR_S3GEN_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_S3GEN_CFG_INTERVAL");
+        const int k = e ? std::atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool cfg_interval_on = cfg_interval > 1 && cfg_rate > 0.0f && !meanflow;
+    std::vector<float> v_uncond_cache; // last computed uncond velocity; reused between recomputes
+    if (cfg_interval_on && c->verbosity >= 1)
+        fprintf(stderr, "s3gen: interval-CFG K=%d (uncond UNet pass recomputed every %d steps; first+last always)\n",
+                cfg_interval, cfg_interval);
+
+    // B2 fuses cond+uncond; interval needs the standalone uncond pass to skip → force single.
+    const bool use_cfg_b2 =
+        (cfg_rate > 0.0f && !meanflow) && !std::getenv("CRISPASR_S3GEN_UNET_CFG_SINGLE") && !cfg_interval_on;
 
     // Reusable input buffer for batch=2: (T, 320, 2) — cond in batch 0, uncond in batch 1.
     std::vector<float> b2_input(use_cfg_b2 ? T_mel * 320 * 2 : 0, 0.0f);
@@ -2702,7 +2794,7 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             } else {
                 // ── Legacy ggml_backend_sched path (default) ──────────────────
                 // Rebuild graph each step (sched mutates it on alloc; not reusable).
-                const bool bench_alloc = std::getenv("CHATTERBOX_BENCH") != nullptr;
+                const bool bench_alloc = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH") != nullptr;
                 int64_t t_alloc0 = bench_alloc ? ggml_time_us() : 0;
                 gf_b2 = build_graph_unet1d_b2(c, T_mel);
                 ggml_backend_sched_reset(c->sched);
@@ -2814,8 +2906,19 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             break;
 
         std::vector<float> v_uncond;
-        if (cfg_rate > 0.0f && !meanflow)
-            v_uncond = run_denoiser(std::vector<float>(T_mel * 320, 0.0f));
+        if (cfg_rate > 0.0f && !meanflow) {
+            // Interval-CFG: recompute the uncond pass on the first + last step and
+            // every K-th step; otherwise reuse the cached uncond velocity (the approximation).
+            const bool recompute_unc =
+                !cfg_interval_on || v_uncond_cache.empty() || (step % cfg_interval == 0) || (step == n_steps - 1);
+            if (recompute_unc) {
+                v_uncond = run_denoiser(std::vector<float>(T_mel * 320, 0.0f));
+                if (cfg_interval_on && !v_uncond.empty())
+                    v_uncond_cache = v_uncond;
+            } else {
+                v_uncond = v_uncond_cache; // reuse stale uncond velocity
+            }
+        }
 
         ggml_tensor* out_t = ggml_graph_get_tensor(gf, "denoiser_out");
         int out_T = (int)out_t->ne[0];

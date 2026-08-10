@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct crispasr_audio_slice {
@@ -134,14 +135,33 @@ inline std::vector<crispasr_audio_slice> crispasr_post_merge_vad_slices(const st
 // `vad_model_path` must be a concrete file path; auto-download /
 // cache resolution is the caller's responsibility (CLI handles it
 // via crispasr_cache; wrappers can ship the GGUF as an asset).
+//
+// An empty result is ambiguous — no speech vs. the model failing to load.
+// When `out_load_failed` is non-null it is set to `true` iff the model
+// could not be loaded (silero/marblenet/whisper-vad returned no context),
+// and `false` otherwise (including a successful run that found no speech).
+// This lets a caller (issue #311 --strict-pipeline) distinguish "VAD ran,
+// no speech" from "VAD model unloadable". webrtc (no model) and firered are
+// reported as loaded. Detection is best-effort — it never false-positives.
 std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* samples, int n_samples, int sample_rate,
                                                               const char* vad_model_path,
-                                                              const crispasr_vad_options& opts);
+                                                              const crispasr_vad_options& opts,
+                                                              bool* out_load_failed = nullptr);
 
 // Same shape as above but without VAD: returns fixed `chunk_seconds` windows
 // (one slice covering the whole buffer when it's shorter than a chunk).
 // Useful as a fallback when no VAD model is available.
 std::vector<crispasr_audio_slice> crispasr_fixed_chunk_slices(int n_samples, int sample_rate, int chunk_seconds);
+
+// Re-chunk existing slices to `chunk_seconds`, splitting any segment that
+// exceeds it at energy minima (issue #89 policy). Used when transcribing and
+// when importing a RAW-VAD-segment export (issue #227): the same speech
+// segments can be re-chunked to whatever length the importing run needs, so a
+// raw export is genuinely chunk-length-independent. Segments already within the
+// limit pass through unchanged; chunk_seconds <= 0 returns the input as-is.
+std::vector<crispasr_audio_slice> crispasr_rechunk_slices(const std::vector<crispasr_audio_slice>& in,
+                                                          const float* samples, int n_samples, int sample_rate,
+                                                          int chunk_seconds);
 
 // Like `crispasr_fixed_chunk_slices` but cuts each window at the
 // lowest-RMS 100 ms inside the last `search_window_seconds` of a
@@ -168,3 +188,36 @@ int64_t crispasr_vad_remap_timestamp(const std::vector<crispasr_vad_mapping>& ma
 // shutdown or when the VAD model is no longer needed. The cache is
 // automatically invalidated when the model path changes.
 void crispasr_vad_free_cache();
+
+// ---- VAD segment boundary export / import (issue #227) ----
+//
+// Serialize a slice list to a small JSON document so it can be persisted
+// and reused across ASR runs (e.g. transcribe the same audio with several
+// backends without re-running VAD each time). The format is:
+//
+//   { "crispasr_vad": { "version": 1, "sample_rate": 16000,
+//       "num_slices": N,
+//       "slices": [ { "start": <sample>, "end": <sample>,
+//                     "t0_cs": <centisec>, "t1_cs": <centisec> }, ... ] } }
+//
+// `start`/`end` are sample indices into the full PCM buffer at
+// `sample_rate`; `t0_cs`/`t1_cs` are absolute centisecond timestamps.
+std::string crispasr_serialize_vad_slices(const std::vector<crispasr_audio_slice>& slices, int sample_rate,
+                                          float chunk_seconds, bool is_raw_segments = false);
+
+// Parse a document produced by crispasr_serialize_vad_slices back into a
+// slice list. Tolerant of whitespace and field ordering. Returns false on
+// malformed input (in which case `out` is left empty). When `sample_rate_out`
+// is non-null it receives the serialized sample rate (0 if absent).
+bool crispasr_parse_vad_slices(const std::string& text, std::vector<crispasr_audio_slice>& out, int* sample_rate_out,
+                               float* chunk_seconds_out, bool* is_raw_segments_out = nullptr);
+
+// Issue #227: should a --vad-import be rejected/warned because its chunk length
+// differs from the run's? Shared by the CLI and the server so the two cannot
+// drift (the multi-surface-dispatch rule). Returns true when the run should
+// treat it as a mismatch. `imported_chunk` <= 0 means the file predates the
+// chunk_cs field ("unknown"), which is NEVER a mismatch. `requested_chunk` is
+// the run's REQUESTED chunk length (0 -> the 30 s default), not the effective
+// one -- the exporter runs before backend init and cannot know the effective
+// value.
+bool crispasr_vad_chunk_mismatch(float imported_chunk, float requested_chunk);

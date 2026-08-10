@@ -30,8 +30,12 @@ curl http://localhost:8080/backends
 
 The server loads the model once at startup and keeps it in memory.
 Subsequent `/inference` requests reuse the loaded model with no reload
-overhead. Requests are mutex-serialized. Use `--host 0.0.0.0` to
-accept remote connections.
+overhead. Requests are mutex-serialized by default (the HTTP layer accepts
+connections concurrently, but inference runs one-at-a-time through the single
+loaded model). To run transcriptions concurrently, or to scale out with
+replicas / bulk process fan-out, see
+**[Concurrency, parallelism & scaling](concurrency.md)** (`--server-workers N`).
+Use `--host 0.0.0.0` to accept remote connections.
 
 ## API keys
 
@@ -94,6 +98,8 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
 | `max_new_tokens` | Alias for `max_tokens` |
 | `frequency_penalty` | Opt-in repeated generated-token penalty for supported autoregressive ASR backends (`0.0` disabled) |
+| `offset_t_ms` | Start transcription this many ms into the audio (default: 0). Reported timestamps stay in original-audio time |
+| `duration_ms` | Transcribe only this many ms from `offset_t_ms` (default: 0 = to end) |
 | `translate` | `true`/`false` — translate to English (backends with `CAP_TRANSLATE`) |
 | `source_lang` | Source language for AST backends (canary, cohere) |
 | `target_lang` | Target language for AST backends |
@@ -103,6 +109,10 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `diarize_embedder` | Speaker-embedding model for cross-slice clustering (path or `auto`) |
 | `diarize_cluster_threshold` | Cosine merge threshold for embedding clustering (default: 0.5) |
 | `diarize_max_speakers` | Upper bound on speaker cluster count (default: 8) |
+| `vad_export` | `true`/`false` — include the computed VAD/chunk boundaries in the JSON response under `vad_segments` (default: `false`) |
+| `vad_import` | The `vad_segments` object from an earlier `vad_export` response. Reuses those boundaries and skips VAD entirely |
+| `vad_export_raw` | `true`/`false` — with `vad_export`, return raw VAD speech segments (chunk-independent, re-chunked per request) instead of chunk boundaries (default: `false`) |
+| `vad_import_strict` | `true`/`false` — with `vad_import`, reject (rather than warn) a chunk-boundary payload whose chunk length differs from this request (default: `false`) |
 | `vad` | `true`/`false` — enable VAD pre-processing |
 | `vad_threshold` | VAD speech probability threshold (default: 0.5) |
 | `vad_min_speech_duration_ms` | Minimum speech segment duration in ms (default: 250) |
@@ -118,6 +128,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `best_of` | Whisper best-of-N sampling candidates |
 | `beam_size` | Whisper beam search width |
 | `return_logits` | `true`/`false` — for supported dense CTC backends, include `ctc_logits` in JSON responses (`n_frames`, `n_vocab`, frame-major `data`, optional `vocab`) |
+| `sensitivity` | `conservative` / `balanced` / `aggressive` — the four threshold fields as one bundle. Applied before them, so an explicit `entropy_thold` etc. in the same request still wins. An unknown value is ignored with a stderr warning |
 | `entropy_thold` | Entropy threshold for decoder fallback |
 | `logprob_thold` | Log-probability threshold for decoder fallback |
 | `no_speech_thold` | No-speech probability threshold |
@@ -131,8 +142,66 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `max_len` | Maximum segment length in characters |
 | `chunk_seconds` | Maximum chunk duration for long audio (default: 30) |
 | `chunk_overlap` | Overlap context (seconds) around chunk boundaries |
+| `strict_pipeline` | `true`/`false` — #311: fail the request (HTTP 400) if an explicitly-requested aux stage (VAD, forced aligner, punctuation) could not load or produce its output, instead of degrading silently (default: `false`) |
+| `require_vad` | `true`/`false` — force the VAD-load-success requirement (needs `vad`/`vad_model`) |
+| `require_word_timestamps` | `true`/`false` — fail unless every non-empty segment carries word timestamps (native or aligned) |
+| `require_punctuation` | `true`/`false` — fail unless a punctuation model is loaded (start the server with `--punc-model`) |
 
 The `/inference` endpoint accepts the same CrispASR extension fields.
+
+### Strict pipeline — fail on a required stage's failure (#311)
+
+By default the server, like the CLI, **degrades gracefully**: a VAD, forced
+aligner, or punctuation model that fails to load is skipped and the request
+still returns `200`. Integrations that treat those stages as required task
+properties can opt into strict semantics with the fields above — a required
+stage that fails to load or produce its output then returns **HTTP 400** with
+an `{"error": {...}}` body instead of a degraded `200`. A stage that ran and
+legitimately produced nothing (VAD detected no speech) stays a success. This
+mirrors the CLI's `--strict-pipeline` family (see
+[`cli.md`](cli.md#strict-pipeline--require-aux-stages-to-succeed-strict-pipeline-311));
+the strict decision is shared code (`crispasr_strict.h`), so the two front-ends
+cannot drift.
+
+```bash
+# rc-style contract over HTTP: 200 ⟺ every required stage succeeded.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8080/v1/audio/transcriptions \
+  -F file=@meeting.wav -F model=whisper \
+  -F vad=true -F strict_pipeline=true    # 400 if VAD couldn't load; 200 otherwise
+```
+
+`require_punctuation` needs the server to have been started with `--punc-model`
+(punctuation is a resident startup post-processor, not per-request) — otherwise
+the request fails fast with a clear error.
+
+### Reusing VAD boundaries across backends (#227)
+
+VAD (or the fixed-chunk fallback) runs on every request. To transcribe the same
+audio with several backends without paying it each time, ask for the boundaries
+once and hand them back afterwards:
+
+```bash
+# 1. Transcribe + get the boundaries back.
+curl -s -F file=@talk.wav -F vad=true -F vad_export=true \
+     -F response_format=verbose_json \
+     http://127.0.0.1:8080/v1/audio/transcriptions > first.json
+
+# 2. Extract the vad_segments object.
+jq '.vad_segments' first.json > vad.json
+
+# 3. Reuse it on later requests — no VAD model is run.
+curl -s -F file=@talk.wav -F "vad_import=<vad.json" \
+     -F response_format=verbose_json \
+     http://127.0.0.1:8080/v1/audio/transcriptions
+```
+
+`vad_segments` is the same wire format the CLI's `--vad-export` writes, so
+boundaries are interchangeable between the two. Boundaries are clamped to the
+audio of the request they're used on and out-of-range slices are dropped, so a
+stale set can't read out of bounds; a malformed one returns
+`invalid_request_error`. They are interpreted against the audio actually being
+processed — i.e. after any `offset_t_ms`/`duration_ms` window is applied.
 
 > **Parakeet segmentation (issue #257).** Backends that chunk internally
 > (parakeet/canary — full-attention FastConformer) now receive the whole clip
@@ -267,11 +336,13 @@ curl http://localhost:8080/v1/audio/speech \
 |---|---|---|
 | `input` | (required) | Text to synthesize. Capped at `--tts-max-input-chars` (default 4096); set to 0 to disable the cap. Long input is automatically split on sentence boundaries before synthesis (see [long-form chunking](#long-form-chunking-for-v1audiospeech) below). |
 | `model` | (ignored) | Read but not validated — we serve whatever was loaded via `-m` or `POST /load`. Surfaced in the synth log line. |
-| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` is not yet accepted for tada (convert to a `tada-ref.gguf` first). |
+| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` reference is cloned on the fly (needs `ref_text` + the encoder/aligner GGUFs) when the server runs with `CRISPASR_TADA_WAV_CLONE=1` — otherwise convert it to a `tada-ref.gguf` first. |
 | `instructions` | empty | Voice-direction prose for backends that support it (qwen3-tts VoiceDesign). Silently ignored on other backends so OpenAI clients targeting `gpt-4o-mini-tts` don't see 4xx errors. |
 | `seed` | `0` | RNG seed for sampling. `0` = non-deterministic. Same-seed + same-text produces bit-identical audio on all sampling-capable TTS backends (qwen3-tts, chatterbox, vibevoice, orpheus). |
 | `temperature` | server's `--temperature` | Sampling temperature for AR TTS backends. `0` = greedy; backends apply their own default (e.g. 0.8 for qwen3-tts) when the global default of 0.0 is unchanged. |
 | `max_new_tokens` | server's `--max-new-tokens` | AR token generation cap. `<= 0` clears the override and uses the backend default. |
+| `max_speech_tokens` | backend default | MOSS-TTS / moss-tts-local hard cap on generated audio frames (~12.5 frames/sec). The decode loop is forced to end once this many frames are produced, so it bounds the worst-case synthesis length even when the model never emits its end token. Per request. |
+| `min_speech_tokens` | backend default | MOSS-TTS / moss-tts-local minimum number of generated audio frames (~12.5 frames/sec). The decode loop is forbidden from ending until this many frames are produced. **Setting `min_speech_tokens == max_speech_tokens` yields exact-duration synthesis** — the model generates precisely that window of audio (within one frame ≈ 80 ms) with no post-hoc tempo change, which is what game-dubbing / lip-sync work needs. Per request. |
 | `frequency_penalty` | `0.0` | Opt-in repeated generated-token penalty for AR TTS backends. `0.0` disabled. |
 | `top_p` | backend default | Nucleus-sampling cutoff for AR TTS backends (tada, chatterbox). Applied per request; omit to keep the backend default. |
 | `top_k` | backend default | Top-k sampling cutoff (`0` = disabled). Honoured by tada. Per request. |
@@ -283,8 +354,13 @@ curl http://localhost:8080/v1/audio/speech \
 | `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
-| `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
-| `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
+| `consent_attestation` | empty | Required when `voice` is a **clone**: a `.wav` reference, or a `.gguf` pack stamped `crispasr.voice.cloned_from_recording` by the baker that derived it from a real recording. The name is resolved against `--voice-dir` first, so a bare `"victim"` is treated exactly like `"victim.wav"`. A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit, with the reason the voice was classified a clone. Preset packs (kokoro, vibevoice, `tada-ref-<lang>`, …) carry no stamp and need no attestation — see [`eu-ai-act.md` §6.2](eu-ai-act.md#62-art-504--deepfake-disclosure). Note that "no attestation" is not "nothing to disclose": a preset whose voice is a real person still owes the audible label, via `speaker_identity` below. |
+| `ref_text` | empty | Transcript of the `.wav` clone reference, used by TADA on-the-fly cloning (#201). A companion `<name>.txt` in `--voice-dir` is used when omitted. Ignored by backends that clone from audio alone. |
+| `language` | server's `-l` | The language to **speak** (alias: `target_lang`). ISO-639-1 (`de`) or an English name (`German`). cosyvoice3 compares it to the reference voice's language and switches to cross-lingual synthesis when they differ; qwen3-tts sets the talker's explicit `codec_language_id`; moss-tts fills its `- Language:` prompt field; kokoro/zonos/piper pick the eSpeak voice. Language-agnostic backends (voxcpm2, f5-tts, vibevoice) ignore it and read the script of `input` instead. |
+| `source_lang` | empty | The language the **cloning reference** is spoken in (alias: `ref_lang`) — not the output language. Only cosyvoice3 acts on it, to decide whether the requested `language` needs cross-lingual synthesis. Optional: the backend otherwise infers it from the voice-bank entry or from `ref_text`. That inference declines rather than guesses on a short transcript, and when it declines the requested `language` has no effect and the clone keeps the reference's accent — set this to make it explicit (#329). |
+| `speaker_identity` | empty (`unknown`) | Whose voice a **preset** voice is: `real_person`, `synthetic` or `unknown`. `real_person` adds the audible AI disclosure to non-cloned output — a preset shipped inside a model can be an identifiable individual, which makes the output a deep fake under Art. 3(60) even though nothing was cloned. It does **not** require `consent_attestation`: whether that donor agreed to the model being trained is settled upstream and you cannot attest to it. Outranks the pack's own `crispasr.voice.speaker_identity` stamp and the backend default. An unrecognised value is a `400` with `code=invalid_speaker_identity` rather than a silent downgrade. See [`eu-ai-act.md` §6.2a](eu-ai-act.md#62a-whose-voice-is-a-preset-voice-speaker_identity). |
+| `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users — which is why the opt-out is only honoured when attested (see `marking_attestation`). |
+| `marking_attestation` | empty | Required (since v0.8.22) to **honour** `"spoken_disclaimer": false` on a voice clone — a free-text affirmation that you accept the AI-content disclosure duty, e.g. `"I will disclose this is AI-generated"`. Logged for audit. A server launched with `--accept-marking-responsibility` has already accepted that duty for every response it serves and satisfies this per-request field. **Without it the opt-out is denied, not the request** (since v0.8.24): the response is still `200`, but it carries the spoken disclaimer and the headers below say so. Earlier v0.8.22/v0.8.23 servers returned `400 marking_attestation_required` instead. |
 
 > **Watermarking.** Every response is watermarked by default. There is **no
 > per-request watermark toggle** — the mark is disabled only at the process
@@ -292,6 +368,15 @@ curl http://localhost:8080/v1/audio/speech \
 > which turns it off for **all** responses and logs a one-time warning that the
 > AI-content marking responsibility then rests with the operator. See
 > [`tts.md`](tts.md#disabling-the-watermark-operator-opt-out).
+>
+> **The floor that opt-out cannot cross.** A response may lose the watermark
+> only if a C2PA manifest still marks it. `response_format` decides that, so the
+> floor is applied per response: `wav` and `mp3` carry a manifest, and
+> `pcm` / `f32` / `aac` / `opus` and the streaming path do not — for those the
+> watermark is forced on even under `--no-watermark`. Before v0.8.26 the server
+> had no floor at all and signed only `wav`, so `--no-watermark` plus
+> `"response_format": "mp3"` returned entirely unmarked synthetic audio while
+> the CLI in the same configuration forced the mark back on.
 
 **Returns:**
 
@@ -317,6 +402,32 @@ The listing reflects the filesystem; whether a particular backend
 actually accepts a given voice depends on the backend's own resolution
 (e.g. CustomVoice models only accept names baked into the GGUF
 metadata — the `<voice-dir>` files are irrelevant to those).
+
+**Voice upload — requires a consent attestation:**
+
+```bash
+curl -X POST http://localhost:8080/v1/voices \
+  -F voice=@speaker.wav \
+  -F name=vivian \
+  -F consent_attestation="I have the speaker's consent" \
+  -F transcript="the reference transcript"   # optional, Qwen3-TTS ICL prefill
+# 201 {"name": "vivian", "format": "wav", "size_bytes": 220544}
+```
+
+`consent_attestation` is **mandatory** — a missing or empty field is a `400`
+with `code=consent_required`. Storing a recording as a reusable voiceprint *is*
+the cloning step, the same act the CLI gates behind `--i-have-rights` and every
+voice baker gates at bake time; taking the attestation only later, at
+`/v1/audio/speech`, would mean a third party's voice could be enrolled by anyone
+who could reach the endpoint. The upload emits an
+`[CONSENT] scope=voice-upload …` audit line. See
+[`eu-ai-act.md`](eu-ai-act.md) §6.2.
+
+> **Breaking change.** This field is new; clients that provisioned voices
+> without it get a `400` until they add it.
+
+Requires `--voice-dir`; names must match `[a-zA-Z0-9_-]+`; an existing name
+needs `?force=true`. `DELETE /v1/voices/{name}` removes one.
 
 ### Voice file conventions
 
@@ -404,7 +515,8 @@ resp.stream_to_file("out.wav")
 ## Speech-to-speech endpoint
 
 `POST /v1/audio/speech-to-speech` runs end-to-end audio-in → audio-out
-on S2S-capable backends (`lfm2-audio`, `mini-omni2`). Non-S2S backends
+on S2S-capable backends (`lfm2-audio`, `mini-omni2`, `sidon`,
+`voxcpm2-vae`). Non-S2S backends
 return 400.
 
 ```bash
@@ -436,8 +548,8 @@ audio is watermarked by default, same as TTS (process-level opt-out via
 |---|---|
 | Streaming response (chunked / SSE) | Pending — see PLAN §70 (couples with chunked-VAE for the full latency win). |
 | `mp3` / `aac` / `opus` encoding | **Done** — encoded in-tree by glint, no build deps (`response_format=mp3\|aac\|opus`; `opus` = Ogg Opus). `flac` output still pending. |
-| `POST /v1/voices` (multipart upload for runtime provisioning) | Pending — security review (size limits, content-type validation, disk quota). |
-| `DELETE /v1/voices/{name}` | Pending alongside upload. |
+| `POST /v1/voices` (multipart upload for runtime provisioning) | **Done** — gated on `consent_attestation` (see above). Disk quota and content-type validation still pending. |
+| `DELETE /v1/voices/{name}` | **Done**. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |
 
 ## Translation endpoint
@@ -646,6 +758,7 @@ You can override the loaded model and startup flags through `.env`:
 | `CRISPASR_CACHE_DIR` | Where auto-downloaded models live (defaults to `/cache`) |
 | `CRISPASR_API_KEYS` | Comma-separated API keys (see [API keys](#api-keys)) |
 | `CRISPASR_EXTRA_ARGS` | Forwarded verbatim to the server CLI (e.g. `--no-punctuation`) |
+| `CRISPASR_SERVER_WORKERS` | `N>1` loads N independent ASR backend instances so **pure-ASR** requests (explicit `language`, no aligner, no punctuation/truecaser) run concurrently instead of serializing on the single model. Costs N× model memory. Only a throughput win where a single request under-utilises the box (spare cores, a GPU not saturated by one stream, smaller models); a *net loss* on a saturated memory-bandwidth-bound CPU model, where the instances contend. Requests using shared LID/aligner/post-processing stay serialized. `/load` is disabled while a pool is active (restart to change models). Default `1` = single instance. Equivalent to the `--server-workers N` CLI flag (this env var overrides the flag when both are set). Full guidance: **[docs/concurrency.md](concurrency.md)**. |
 
 The service is configured to avoid serving as root by default:
 - `user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"`

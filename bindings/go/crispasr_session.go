@@ -28,9 +28,11 @@ void             crispasr_session_close(CrispasrSession* s);
 int              crispasr_session_set_codec_path(CrispasrSession* s, const char* path);
 int              crispasr_session_set_source_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_target_language(CrispasrSession* s, const char* lang);
+int              crispasr_session_set_tts_reference_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
 int              crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
+int              crispasr_session_set_sensitivity(CrispasrSession* s, const char* preset);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
 int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
@@ -71,9 +73,13 @@ int              crispasr_session_set_speaker_id(CrispasrSession* s, int id);
 int              crispasr_session_n_speakers(CrispasrSession* s);
 const char*      crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int              crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
+int              crispasr_session_set_tts_phonemes(CrispasrSession* s, const char* phonemes);
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
+float*           crispasr_session_synthesize_raw(CrispasrSession* s, const char* text, int* out_n_samples);
+int              crispasr_session_accept_marking_responsibility(CrispasrSession* s, const char* attestation);
+int              crispasr_session_set_speaker_identity(CrispasrSession* s, const char* identity);
 float*           crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                     char** out_text, int* out_n_samples);
 void             crispasr_session_translate_text_free(char* text);
@@ -107,6 +113,7 @@ long long    crispasr_session_result_word_t0(crispasr_session_result* r, int i_s
 long long    crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg);
+const char*  crispasr_session_result_segment_speaker(crispasr_session_result* r, int i);
 // Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
 // backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
 // canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
@@ -157,6 +164,15 @@ struct crispasr_diarize_opts_abi {
     int         n_threads;
     long long   slice_t0_cs;
     const char* pyannote_model_path;
+    // #324 foxnose (method 4). This layout is hand-maintained and MUST match
+    // struct crispasr_diarize_opts_abi in src/crispasr_c_api.cpp exactly —
+    // Go allocates the struct, so a missing field here means the C side reads
+    // past the end of it.
+    const char* foxnose_embedder_path;
+    int         min_speakers;
+    int         max_speakers;
+    int         num_speakers;
+    int         _pad2;
 };
 int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int n_samples,
                                   int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
@@ -287,14 +303,15 @@ void  crispasr_titanet_free(void* ctx);
 int   crispasr_titanet_embed(void* ctx, const float* pcm_16k, int n_samples, float* out);
 float crispasr_titanet_cosine_sim(const float* a, const float* b, int dim);
 
-// --- Speaker database ---
-void* crispasr_speaker_db_load(const char* dir_path);
+// --- Speaker database (closed-roster, consent-gated — issue #266) ---
+void* crispasr_speaker_db_open(const char* dir_path, const char* expected_names_csv,
+                               int consent_attested);
 void  crispasr_speaker_db_free(void* db);
 int   crispasr_speaker_db_count(const void* db);
 float crispasr_speaker_db_match(const void* db, const float* embedding, int dim,
                                 float threshold, char* out_name, int out_cap);
-int   crispasr_speaker_db_enroll(const char* dir_path, const char* name,
-                                 const float* embedding, int dim);
+int   crispasr_speaker_db_enroll2(const char* dir_path, const char* name,
+                                  const float* embedding, int dim, int consent_attested);
 
 // --- Kokoro lang helpers ---
 int  crispasr_kokoro_lang_is_german_abi(const char* lang);
@@ -304,10 +321,15 @@ int  crispasr_kokoro_lang_has_native_voice_abi(const char* lang);
 int crispasr_registry_lookup_by_filename_abi(const char* filename, char* out_filename, int filename_cap,
                                              char* out_url, int url_cap, char* out_size, int size_cap);
 int crispasr_registry_list_backends_abi(char* out_csv, int out_cap);
+int crispasr_registry_default_bundle_info_abi(const char* backend, char* out_backend, int backend_cap,
+                                              char* out_license, int license_cap, int* out_requires_acceptance);
+int crispasr_registry_default_bundle_artifact_abi(const char* backend, int index, int* out_kind,
+                                                  char* out_filename, int filename_cap, char* out_url,
+                                                  int url_cap, char* out_size, int size_cap);
 
 // --- Session extras ---
 int crispasr_session_available_backends(char* out_csv, int out_cap);
-int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap);
+int crispasr_session_detected_language(CrispasrSession* s, char* out_buf, int out_cap);
 // CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
 // maps an id to its raw piece (word-boundary marker intact) or "" when out of
 // range / unsupported. Pairs with the result logits accessor for detokenization.
@@ -399,6 +421,26 @@ func (s *CrispasrSession) SetTargetLanguage(lang string) error {
 	return nil
 }
 
+// SetTTSReferenceLanguage declares the language a voice-cloning REFERENCE clip
+// is spoken in (issue #329). Cross-lingual TTS backends (cosyvoice3) compare it
+// to the requested output language — SetTargetLanguage, falling back to
+// SetSourceLanguage — and drop the reference transcript when they differ, so the
+// clone speaks the target language instead of carrying the reference's accent.
+//
+// Optional: the backend otherwise infers it from the voice bank or the reference
+// transcript, and that inference declines rather than guesses on a short
+// transcript. When it declines, the requested target language has no effect —
+// set this to make it explicit. Empty string clears.
+func (s *CrispasrSession) SetTTSReferenceLanguage(lang string) error {
+	cl := C.CString(lang)
+	defer C.free(unsafe.Pointer(cl))
+	rc := C.crispasr_session_set_tts_reference_language(s.handle, cl)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_tts_reference_language failed")
+	}
+	return nil
+}
+
 // SetPunctuation toggles punctuation + capitalisation in the output
 // (canary/cohere natively; LLM backends via post-process strip). Default true.
 func (s *CrispasrSession) SetPunctuation(enable bool) error {
@@ -437,6 +479,28 @@ func (s *CrispasrSession) SetHotwords(hotwords string, boost float32) error {
 	rc := C.crispasr_session_set_hotwords(s.handle, ch, C.float(boost))
 	if rc != 0 {
 		return errors.New("crispasr_session_set_hotwords failed")
+	}
+	return nil
+}
+
+// SetSensitivity applies a named bundle of the four decoder fallback
+// thresholds: "conservative", "balanced" (the shipped defaults, a no-op) or
+// "aggressive". "strict"/"default"/"loose" are aliases. Mirrors the CLI's
+// --sensitivity.
+//
+// The four thresholds interact — a decode is only retried when the logprob and
+// no-speech bars are both crossed — so they move as a set. A later
+// SetFallbackThresholds overrides this. An unrecognised name is rejected
+// rather than silently treated as "balanced".
+func (s *CrispasrSession) SetSensitivity(preset string) error {
+	cp := C.CString(preset)
+	defer C.free(unsafe.Pointer(cp))
+	rc := C.crispasr_session_set_sensitivity(s.handle, cp)
+	if rc == -2 {
+		return errors.New("unknown sensitivity preset (expected: conservative, balanced, aggressive)")
+	}
+	if rc != 0 {
+		return errors.New("crispasr_session_set_sensitivity failed")
 	}
 	return nil
 }
@@ -955,6 +1019,25 @@ func (s *CrispasrSession) SetInstruct(instruct string) error {
 	}
 }
 
+// SetTTSPhonemes synthesizes the given phonemes verbatim instead of
+// phonemizing the text — the seam between text processing and the acoustic
+// model. Use it to reproduce another implementation's pronunciation exactly, or
+// to tell a G2P bug from a model bug (#316). Empty clears.
+// Honoured by kokoro and piper; other backends return a soft no-op error.
+func (s *CrispasrSession) SetTTSPhonemes(phonemes string) error {
+	cps := C.CString(phonemes)
+	defer C.free(unsafe.Pointer(cps))
+	rc := C.crispasr_session_set_tts_phonemes(s.handle, cps)
+	switch rc {
+	case 0:
+		return nil
+	case -2:
+		return errors.New("backend has no phonemes-in entry point; SetTTSPhonemes applies to kokoro and piper")
+	default:
+		return fmt.Errorf("SetTTSPhonemes failed (rc=%d)", int(rc))
+	}
+}
+
 // IsCustomVoice reports whether the loaded model is a qwen3-tts
 // CustomVoice variant (use SetSpeakerName for it).
 func (s *CrispasrSession) IsCustomVoice() bool {
@@ -998,6 +1081,69 @@ func (s *CrispasrSession) Synthesize(text string) ([]float32, error) {
 	return samples, nil
 }
 
+// SetSpeakerIdentity declares whose voice a PRESET voice is: "real_person",
+// "synthetic" or "unknown".
+//
+// Cloning is not the only way to produce a deep fake. A preset voice shipped
+// inside a model can be an identifiable individual — a named donor, a corpus
+// speaker — and EU AI Act Art. 3(60) attaches to the audio resembling that
+// person, not to which pipeline made it. Setting real_person makes the
+// Art. 50(4) reminder fire for a non-cloned voice.
+//
+// It does NOT require a consent attestation: whether that donor agreed to the
+// model being trained is a licensing matter settled upstream that you cannot
+// attest to.
+//
+// Returns an error on an unrecognised value rather than silently downgrading
+// it to "unknown".
+func (s *CrispasrSession) SetSpeakerIdentity(identity string) error {
+	if s == nil || s.handle == nil {
+		return errors.New("session is closed")
+	}
+	cid := C.CString(identity)
+	defer C.free(unsafe.Pointer(cid))
+	switch rc := C.crispasr_session_set_speaker_identity(s.handle, cid); rc {
+	case 0:
+		return nil
+	case -2:
+		return fmt.Errorf("unrecognised speaker_identity %q (expected real_person, synthetic or unknown)", identity)
+	default:
+		return fmt.Errorf("crispasr_session_set_speaker_identity failed (rc=%d)", int(rc))
+	}
+}
+
+// AcceptMarkingResponsibility attests that the caller accepts AI-content
+// marking/disclosure responsibility (EU AI Act Art. 50). It is REQUIRED before
+// SynthesizeRaw will return UNMARKED audio; the default Synthesize (watermarked)
+// is unaffected. `attestation` is a human-readable affirmation recorded for audit.
+func (s *CrispasrSession) AcceptMarkingResponsibility(attestation string) error {
+	ca := C.CString(attestation)
+	defer C.free(unsafe.Pointer(ca))
+	if C.crispasr_session_accept_marking_responsibility(s.handle, ca) != 0 {
+		return errors.New("crispasr_session_accept_marking_responsibility failed")
+	}
+	return nil
+}
+
+// SynthesizeRaw converts `text` to UNMARKED 24 kHz mono PCM (no watermark), for
+// callers that must post-process (speed/mix/concat) before embedding the mark
+// themselves. It is hard-refused unless AcceptMarkingResponsibility was called
+// first. Most callers should use Synthesize, which watermarks by default.
+func (s *CrispasrSession) SynthesizeRaw(text string) ([]float32, error) {
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+	var n C.int
+	ptr := C.crispasr_session_synthesize_raw(s.handle, ctext, &n)
+	if ptr == nil || n <= 0 {
+		return nil, errors.New("crispasr_session_synthesize_raw: no audio (attestation required? call AcceptMarkingResponsibility first)")
+	}
+	defer C.crispasr_pcm_free(ptr)
+	samples := make([]float32, int(n))
+	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
+	copy(samples, src)
+	return samples, nil
+}
+
 // SpeechToSpeechResult holds the output of a speech-to-speech call.
 type SpeechToSpeechResult struct {
 	PCM        []float32 // output audio at 24 kHz mono
@@ -1005,7 +1151,8 @@ type SpeechToSpeechResult struct {
 }
 
 // SpeechToSpeech runs end-to-end audio-in → audio-out on backends with
-// S2S capability (lfm2-audio, mini-omni2). Input is 16 kHz mono float32 PCM.
+// S2S capability (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). Input is
+// 16 kHz mono float32 PCM.
 func (s *CrispasrSession) SpeechToSpeech(samples []float32) (*SpeechToSpeechResult, error) {
 	if len(samples) == 0 {
 		return nil, errors.New("SpeechToSpeech: empty input")
@@ -1061,6 +1208,13 @@ type TranscribeSegment struct {
 	// <|nospeech|> posterior) in [0, 1]. Whisper-only; other backends leave
 	// the -1.0 "no data" sentinel.
 	NoSpeechProb float32
+	// Speaker is a native per-segment speaker label from a backend that
+	// diarizes on its own, in the "(Speaker N) " form the CLI prefixes into
+	// text/srt/vtt output, or "" when the backend produced none. Populated
+	// today by vibevoice, whose model answers with a Start/End/Speaker/Content
+	// array. The ordinals are CHUNK-LOCAL: "Speaker 1" in one transcribe call
+	// is not necessarily the same voice as "Speaker 1" in the next.
+	Speaker string
 }
 
 // TranscribeWord is one word with timing and confidence.
@@ -1200,6 +1354,7 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 		seg.T0 = int64(C.crispasr_session_result_segment_t0(r, C.int(i)))
 		seg.T1 = int64(C.crispasr_session_result_segment_t1(r, C.int(i)))
 		seg.NoSpeechProb = float32(C.crispasr_session_result_segment_no_speech_prob(r, C.int(i)))
+		seg.Speaker = C.GoString(C.crispasr_session_result_segment_speaker(r, C.int(i)))
 		nWords := int(C.crispasr_session_result_n_words(r, C.int(i)))
 		seg.Words = make([]TranscribeWord, nWords)
 		for j := 0; j < nWords; j++ {
@@ -1366,6 +1521,9 @@ const (
 	DiarizeXCorr    DiarizeMethod = 1 // stereo-only, cross-correlation
 	DiarizeVADTurns DiarizeMethod = 2 // mono-friendly, gap-based
 	DiarizePyannote DiarizeMethod = 3 // pyannote v3 segmentation model
+	// DiarizeMethodFoxNose: WeSpeaker embeddings + spectral clustering (#324).
+	// Requires FoxNoseOpts.EmbedderPath.
+	DiarizeMethodFoxNose DiarizeMethod = 4
 )
 
 // DiarizeSeg is one input/output segment for diarization.
@@ -1378,8 +1536,29 @@ type DiarizeSeg struct {
 // DiarizeSegments assigns speaker labels to pre-segmented audio.
 // leftPCM is the mono or left-channel audio; rightPCM is the right channel
 // (nil for mono). segs are modified in-place with Speaker fields filled.
+// FoxNoseOpts configures DiarizeMethodFoxNose (#324). Nil for other methods.
+type FoxNoseOpts struct {
+	EmbedderPath string // WeSpeaker GGUF; required
+	MinSpeakers  int    // 0 -> 1
+	MaxSpeakers  int    // 0 -> 8
+	NumSpeakers  int    // >0 pins the count and skips estimation
+}
+
+// DiarizeSegments keeps its original signature for source compatibility;
+// DiarizeSegmentsFoxNose adds the #324 options.
 func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	method DiarizeMethod, nThreads int, pyannoteModel string) error {
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil)
+}
+
+// DiarizeSegmentsFoxNose runs the WeSpeaker + spectral-clustering diarizer.
+func DiarizeSegmentsFoxNose(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	nThreads int, fox *FoxNoseOpts) error {
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox)
+}
+
+func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) error {
 	if len(segs) == 0 {
 		return nil
 	}
@@ -1405,6 +1584,18 @@ func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 		n_threads:           C.int(nThreads),
 		slice_t0_cs:         0,
 		pyannote_model_path: cPyannote,
+	}
+	if fox != nil {
+		// DiarizeMethodFoxNose (#324) consumes the embedder path and speaker
+		// bounds; every other method ignores them.
+		if fox.EmbedderPath != "" {
+			cEmb := C.CString(fox.EmbedderPath)
+			defer C.free(unsafe.Pointer(cEmb))
+			opts.foxnose_embedder_path = cEmb
+		}
+		opts.min_speakers = C.int(fox.MinSpeakers)
+		opts.max_speakers = C.int(fox.MaxSpeakers)
+		opts.num_speakers = C.int(fox.NumSpeakers)
 	}
 	stereo := C.int(0)
 	if isStereo {
@@ -1645,6 +1836,31 @@ type RegistryEntry struct {
 	Size     string
 }
 
+// RegistryArtifactKind identifies an artifact's role in a default bundle.
+type RegistryArtifactKind int
+
+const (
+	RegistryArtifactPrimary RegistryArtifactKind = iota
+	RegistryArtifactCompanion
+	RegistryArtifactExtra
+)
+
+// RegistryArtifact is one file in a backend's canonical default bundle.
+type RegistryArtifact struct {
+	Kind     RegistryArtifactKind
+	Filename string
+	URL      string
+	Size     string
+}
+
+// RegistryBundle is the exact artifact set downloaded by `-m auto`.
+type RegistryBundle struct {
+	Backend            string
+	License            string
+	RequiresAcceptance bool
+	Artifacts          []RegistryArtifact
+}
+
 // RegistryLookup returns the default model filename + download URL for a backend.
 func RegistryLookup(backend string) (RegistryEntry, error) {
 	cb := C.CString(backend)
@@ -1659,6 +1875,61 @@ func RegistryLookup(backend string) (RegistryEntry, error) {
 		URL:      C.GoString(&url[0]),
 		Size:     C.GoString(&sz[0]),
 	}, nil
+}
+
+// RegistryDefaultBundle returns the backend's exact canonical `-m auto`
+// artifact bundle. It does not apply a preferred quant.
+func RegistryDefaultBundle(backend string) (RegistryBundle, error) {
+	cb := C.CString(backend)
+	defer C.free(unsafe.Pointer(cb))
+	var canonical [256]C.char
+	var license [1024]C.char
+	var requiresAcceptance C.int
+	count := C.crispasr_registry_default_bundle_info_abi(
+		cb, &canonical[0], C.int(len(canonical)), &license[0], C.int(len(license)),
+		&requiresAcceptance,
+	)
+	if count == 0 {
+		return RegistryBundle{}, fmt.Errorf("no default registry bundle for backend %q", backend)
+	}
+	if count < 0 {
+		return RegistryBundle{}, fmt.Errorf(
+			"default registry bundle lookup failed for backend %q (rc=%d)",
+			backend, int(count),
+		)
+	}
+
+	bundle := RegistryBundle{
+		Backend:            C.GoString(&canonical[0]),
+		License:            C.GoString(&license[0]),
+		RequiresAcceptance: requiresAcceptance != 0,
+		Artifacts:          make([]RegistryArtifact, 0, int(count)),
+	}
+	for index := C.int(0); index < count; index++ {
+		var kind C.int
+		var filename [256]C.char
+		var url [2048]C.char
+		var size [64]C.char
+		rc := C.crispasr_registry_default_bundle_artifact_abi(
+			cb, index, &kind,
+			&filename[0], C.int(len(filename)),
+			&url[0], C.int(len(url)),
+			&size[0], C.int(len(size)),
+		)
+		if rc != 0 || kind < 0 || kind > 2 {
+			return RegistryBundle{}, fmt.Errorf(
+				"default registry bundle artifact %d failed (rc=%d, kind=%d)",
+				int(index), int(rc), int(kind),
+			)
+		}
+		bundle.Artifacts = append(bundle.Artifacts, RegistryArtifact{
+			Kind:     RegistryArtifactKind(kind),
+			Filename: C.GoString(&filename[0]),
+			URL:      C.GoString(&url[0]),
+			Size:     C.GoString(&size[0]),
+		})
+	}
+	return bundle, nil
 }
 
 // CacheEnsureFile downloads a file into the model cache if not already present.
@@ -1770,7 +2041,7 @@ func AvailableBackends() []string {
 // DetectedLanguage returns the acoustic language Whisper detected on the last
 // transcribe as an ISO-639-1 code (e.g. "en"). Whisper-only; other backends
 // return the session's source-language hint, or "unknown".
-func (s *Session) DetectedLanguage() string {
+func (s *CrispasrSession) DetectedLanguage() string {
 	var buf [32]C.char
 	C.crispasr_session_detected_language(s.handle, &buf[0], 32)
 	return C.GoString(&buf[0])
@@ -2120,13 +2391,24 @@ type SpeakerDB struct {
 	dirPath string
 }
 
-// SpeakerDBLoad opens a speaker database directory.
-func SpeakerDBLoad(dirPath string) (*SpeakerDB, error) {
+// SpeakerDBOpen opens a speaker database directory for closed-roster
+// matching (issue #266). expectedNames is the comma-separated list of
+// enrolled participants you assert are present in the audio (e.g.
+// "Alice,Bob") — the db is narrowed to exactly those profiles; open 1:N
+// identification is deliberately unsupported. consentAttested affirms a
+// lawful basis + explicit consent from every enrolled person (GDPR
+// Art. 9); the call fails without it.
+func SpeakerDBOpen(dirPath, expectedNames string, consentAttested bool) (*SpeakerDB, error) {
+	if !consentAttested {
+		return nil, fmt.Errorf("speaker db requires an explicit consent attestation (GDPR Art. 9)")
+	}
 	cd := C.CString(dirPath)
 	defer C.free(unsafe.Pointer(cd))
-	h := C.crispasr_speaker_db_load(cd)
+	cn := C.CString(expectedNames)
+	defer C.free(unsafe.Pointer(cn))
+	h := C.crispasr_speaker_db_open(cd, cn, 1)
 	if h == nil {
-		return nil, fmt.Errorf("crispasr_speaker_db_load failed for %s", dirPath)
+		return nil, fmt.Errorf("crispasr_speaker_db_open failed for %s", dirPath)
 	}
 	return &SpeakerDB{handle: h, dirPath: dirPath}, nil
 }
@@ -2149,14 +2431,19 @@ func (db *SpeakerDB) Match(embedding []float32, threshold float32) (string, floa
 	return n, float32(score)
 }
 
-// Enroll adds a speaker to the database.
-func (db *SpeakerDB) Enroll(name string, embedding []float32) error {
+// Enroll adds a speaker to the database. consentAttested affirms the
+// enrolled person's explicit consent (GDPR Art. 9); it is recorded in
+// the profile and enrollment refuses without it.
+func (db *SpeakerDB) Enroll(name string, embedding []float32, consentAttested bool) error {
+	if !consentAttested {
+		return fmt.Errorf("enrollment requires an explicit consent attestation (GDPR Art. 9)")
+	}
 	cd := C.CString(db.dirPath)
 	defer C.free(unsafe.Pointer(cd))
 	cn := C.CString(name)
 	defer C.free(unsafe.Pointer(cn))
-	rc := C.crispasr_speaker_db_enroll(cd, cn,
-		(*C.float)(unsafe.Pointer(&embedding[0])), C.int(len(embedding)))
+	rc := C.crispasr_speaker_db_enroll2(cd, cn,
+		(*C.float)(unsafe.Pointer(&embedding[0])), C.int(len(embedding)), 1)
 	if rc != 0 {
 		return fmt.Errorf("speaker_db_enroll failed (rc=%d)", int(rc))
 	}
@@ -2190,11 +2477,18 @@ func WatermarkLoadModel(ggufPath string) error {
 
 // WatermarkEmbed embeds an AI-generated watermark into PCM audio in-place.
 // Uses AudioSeal if a model was loaded, otherwise spread-spectrum.
+//
+// Passes alpha <= 0, which selects the band-limited default strength that makes
+// the mark reliably DETECTABLE — the property EU AI Act Art. 50(2) requires, and
+// the reason this is the call SynthesizeRaw users need to discharge marking
+// themselves. It used to hardcode 0.005, the strength the C ABI documents as
+// too faint to reliably detect on real speech: an explicit positive alpha is
+// used verbatim and bypasses the robust default.
 func WatermarkEmbed(pcm []float32) {
 	if len(pcm) == 0 {
 		return
 	}
-	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), 0.005)
+	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), -1.0)
 }
 
 // WatermarkDetect returns a confidence score [0, 1] indicating whether

@@ -354,6 +354,29 @@ purposes.
 
 
 ────────────────────────────────────────────────────────────────────────────────
+OmniVoice prompt vocabularies (https://github.com/k2-fsa/OmniVoice)
+Apache License 2.0
+────────────────────────────────────────────────────────────────────────────────
+
+Copyright 2026 Xiaomi Corp. (authors: Han Zhu)
+
+third_party/omnivoice/lang_map.py and third_party/omnivoice/voice_design.py are
+verbatim, unmodified copies of omnivoice/utils/lang_map.py (commit
+c8c0a6257b9b652dc7d239df9d911dbb1f9dabdf) and omnivoice/utils/voice_design.py
+(commit 9c3ab463713d15e94e252f468ac02f55bdba640b). The Apache-2.0 headers and
+copyright notices are retained in the files themselves.
+
+They are vendored as the generator inputs for src/core/omnivoice_lang_table.h
+(the ISO 639-3 language ids) and src/core/omnivoice_instruct_table.h (the
+voice-design instruct vocabulary) — the two literal vocabularies the OmniVoice
+prompt is conditioned on — so that the CI drift gates are hermetic. The
+generated headers are derived data tables, not translations of any OmniVoice
+source code; the CrispASR runtime is an independent implementation. Licensed
+under the Apache License, Version 2.0; full text at
+http://www.apache.org/licenses/LICENSE-2.0
+
+
+────────────────────────────────────────────────────────────────────────────────
 RUNTIME-ONLY COMPONENTS (not bundled in binaries)
 ────────────────────────────────────────────────────────────────────────────────
 
@@ -375,3 +398,32 @@ complying with their respective licenses.
     Building with -DCRISPASR_WITH_ESPEAK_NG=ON links espeak-ng at build
     time, making the resulting binary a GPL-3.0 derivative that cannot be
     distributed under MIT-only terms.
+
+────────────────────────────────────────────────────────────────────────────────
+WeSpeaker ResNet34-LM speaker embedding model — MODEL WEIGHTS
+(https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM)
+Creative Commons Attribution 4.0 International (CC-BY-4.0)
+────────────────────────────────────────────────────────────────────────────────
+
+CrispASR redistributes GGUF conversions of the WeSpeaker VoxCeleb ResNet34-LM
+speaker-embedding weights, used by the `--diarize-method foxnose` diarizer
+(issue #324).
+
+  Source model : Wespeaker/wespeaker-voxceleb-resnet34-LM
+  Upstream     : https://github.com/wenet-e2e/wespeaker
+  Licence      : CC-BY-4.0 — https://creativecommons.org/licenses/by/4.0/
+
+CC-BY-4.0 permits redistribution and modification, including commercially,
+PROVIDED attribution is given. This notice, and the `license: cc-by-4.0` tag
+plus credit on the converted model card, constitute that attribution.
+
+Note: some downstream projects describe these weights as Apache-2.0. That is
+incorrect — the wenet-e2e/wespeaker CODE is Apache-2.0, but the published
+WEIGHTS are CC-BY-4.0, which carries the attribution requirement above.
+
+No source code from wenet-e2e/wespeaker or from FoxNoseTech/diarize (both
+Apache-2.0) is incorporated into CrispASR. The GGUF converter, the ggml
+runtime and the clustering stack are independent implementations written from
+the published architecture and algorithms; the upstream packages are used only
+as measurement oracles by the reference dumper, never vendored or linked.
+

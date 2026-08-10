@@ -3,10 +3,308 @@
 Branch: `fix/omnivoice-254-voiceclone-rtf` (rebased onto `main` on top of the
 stranded GPU commit `feat/omnivoice-gpu` = "run the LLM on GPU").
 
+## LANDED 2026-08-08 — encode diff wired to the harness front door, and the gate can finally go red
+
+`crispasr-diff omnivoice` was a stub (loaded the model, printed the ref token
+count, compared nothing, exited 0) while the REAL per-stage comparison —
+`omnivoice_encode_diff()`, #254 — hid behind `CRISPASR_OMNIVOICE_ENCODE_DIFF`
+in the CLI adapter. Worse, `run_encode_diff` returned 0 unconditionally: a run
+with the corrupt tokenizer printed `acoustic_enc … FAIL` and `FULL wav→codes
+15.0%` and still exited clean. Both fixed:
+
+- The diff-main branch now resolves the audio tokenizer
+  (`CRISPASR_OMNIVOICE_TOKENIZER_GGUF` env, else next-to-model candidates) and
+  runs the encode diff as a counted harness stage.
+- `run_encode_diff` counts main-chain failures and returns nonzero. New
+  explicit gates: RVQ ≥ 99.5% exact (measured 99.9%), FULL wav→codes ≥ 95%
+  (measured 99.0%; residual = our resampler vs torchaudio Hann sinc, the
+  documented optional item — corrupt-tokenizer failure mode sits at 15%).
+
+Current metrics (M1, q4_k LLM + f16 tokenizer `710ef610`, vs
+`omnivoice-encode-ref.gguf`): acoustic_enc / encoder_semantic / concat+fc all
+cos_min=1.000000, RVQ 2197/2200, FULL 2178/2200. Verified red-first: corrupt
+tokenizer → 2 stages FAILED, `crispasr-diff` rc=6, CLI env path rc=1.
+
+**⚠ Local-disk trap, defused:** `/Volumes/backups/ai/crispasr-gguf/` still had
+the CORRUPT Jul-11 `omnivoice-tokenizer-f16.gguf` under the canonical name the
+env-live-tests default and next-to-model discovery both resolve — the clean
+regen only existed as `-fixed`. HF has shipped the fixed bytes under the
+canonical name since Jul 14 (verified `710ef610` == HF LFS oid). Locally the
+corrupt file is renamed `*.CORRUPT-block4-zeroed` and the canonical name is now
+a hard link to the fixed file. Also stale in the #254 log below: "Ship the GGUF
+fix" HAS shipped (HF replaced); the registry carries URLs, not shas, so no
+registry bump was ever needed.
+
+## LANDED 2026-08-07 — `--instruct` had the SAME three defects, found by blueprint review
+
+Not from a report. After the language fix I went back and diffed our runtime
+against the blueprint properly, including the step I had skipped —
+**prompt-token parity** (dev-guide step 0). The language path came out clean
+(below); its sibling did not.
+
+**The language path, now actually proven.** Our style ids vs
+`AutoTokenizer.from_pretrained(<lm-src>)`: `de`/`en`/`arb`/`zh`, `None`, and the
+`<|denoise|>` clone variant are all byte-identical. Also confirmed: Qwen2's
+tokenizer has no BOS, so the blueprint's `add_special_tokens=True` on the style
+path (vs `False` on the text path) is a no-op, not a divergence; the uncond CFG
+arm is target-audio-only in both, so the tag lives only in the cond branch; and
+`normalize_text` is language-dependent but defaults off and the official CLI
+never passes it. One thing I had wrong: treating `"auto"` as cleared is not an
+addition on top of the blueprint — `demo.py:186` does exactly that.
+`CRISPASR_OMNIVOICE_DEBUG` now prints the style ids so this stays a one-command
+check.
+
+**`_resolve_instruct` sits ten lines below `_resolve_language`, and we mirrored
+neither.** The instruct is a CLOSED 48-item vocabulary (6 mutually-exclusive
+categories, each item with an EN/ZH counterpart). Upstream lowercases, repairs
+half/full-width separators, unifies to one language and **raises** on anything
+else. We stored the raw string and dropped it into `<|instruct_start|>`:
+
+    'Male, British Accent'  -> [151672, 36421, 11,  7855, 81809, 151673]
+    'male, british accent'  -> [151672, 36476, 11, 93927, 29100, 151673]
+
+Not one shared id, for what a user considers the same request. And it had the
+*same* per-call bug: `omnivoice_set_instruct` ran only in `init()`, so the
+server's per-request `"instructions"` field was dead after the first line —
+identical to the language defect, in the same function, missed the first time.
+
+**Fixed, mirroring upstream (rejection, not degradation).**
+`src/core/omnivoice_instruct.h` + a generated table from the vendored
+`voice_design.py`. Two-phase on purpose: `parse()` is text-independent
+(validation, conflict checks) and runs at set time; `render()` needs the text,
+because a dialect forces Chinese, an accent forces English, and otherwise it
+follows whether the *target text* is Chinese — so it runs per synthesis. Baking
+the rendered string at set time would freeze one line's EN/ZH choice onto every
+later line on a reused context.
+
+Verified against the blueprint resolver and the HF tokenizer:
+
+| input | resolved | our style ids |
+|---|---|---|
+| `Male, British Accent` (EN text) | `male, british accent` | match HF exactly |
+| `Male, Elderly` (**Chinese** text) | `男，老年` | match HF exactly |
+| `britsh accent` | rejected | CLI rc=13, server `400 invalid_instructions`, with did-you-mean |
+| `male, female` | rejected | conflict, 400 |
+| three different instructs, one server process | each applied | codes DIFFERENT per request |
+
+Suggestion text is the one deliberate non-parity: upstream uses difflib's
+Ratcliff/Obershelp, we use an LCS ratio at the same 0.6 cutoff. It changes no
+model input, only the error string — noted in the header.
+
+**Correction + closed (2026-08-07, follow-up):** I reported "there is no session
+instruct setter at all". Wrong — `crispasr_session_set_instruct` has existed all
+along, handling qwen3-tts and parler; **omnivoice fell through to `return -3`**,
+i.e. "this backend has no instruct contract". So it was the same wiring bug a
+third time, not a missing feature. Now dispatched, which makes voice design
+reachable from every binding (the Python `set_instruct` needed no change beyond
+its docstring). Guarded by a source test scoped to the function body.
+
+**Coverage after the audit.** Two things had been verified by hand only and are
+now gates:
+
+- `tests/test-omnivoice-style-tokens.sh` (live) — prompt-token parity against
+  the real vocabulary. The unit tests pin the style STRING; this pins what it
+  tokenizes to, which is what the model consumes and the one link no hermetic
+  test can see. 9 cases, ids from the reference Qwen2Tokenizer. Verified it goes
+  red (one wrong id → rc=1). Pin provenance recorded in the test header
+  (upstream rev `c5fdb5cc` + tokenizer.json sha256, re-derived byte-identical
+  2026-08-07) so a red run can tell whether our side or upstream moved without
+  vendoring the 7 MB tokenizer.json.
+- `tests/test-omnivoice-surface-parity.sh` (live) — CLI / server / session must
+  produce identical codes for the same request. Source guards catch a MISSING
+  call site; only this catches one that is present and wrong. Compares CODES,
+  never the watermarked WAV, and every comparison includes an arm whose expected
+  answer is IDENTICAL (an all-DIFFERENT suite is what a broken harness produces).
+
+Both SKIP cleanly without a model; env registered in `tests/env-live-tests.sh`.
+
+## LANDED 2026-08-07 — SubtitleEdit-13273: the language menu was decoration
+
+The reporter: "we have a menu where you can select the target language … nothing
+changes when you select it, and you can hear the strong accent of the original."
+Correct on the first half, and it was dead on **three** surfaces at once, each
+for its own reason — the classic multi-surface dispatch trap (dev guide point 6).
+
+**What was broken**
+
+1. `crispasr_backend_omnivoice.cpp::synthesize()` applied only `tts_num_steps`
+   per call; `omnivoice_set_language` ran ONLY in `init()`. The server owns one
+   backend instance for the whole session, so after the first line the menu
+   could never change anything — even though `crispasr_server.cpp` has parsed
+   `language`/`target_lang` into `rp.language` since #249/#304.
+2. `crispasr_c_api.cpp` — the session's omnivoice arm was a bare
+   `omnivoice_synthesize()`. `set_target_language` never reached it, so
+   bindings / Flutter / Android had no language knob by any route. This is
+   #329's cosyvoice3 bug, one backend over.
+3. `omnivoice.cpp` dropped the string VERBATIM into `<|lang_start|>…<|lang_end|>`.
+   The blueprint (`_resolve_language`, `omnivoice/models/omnivoice.py:1472`) is
+   ID-passthrough → lowercase-name lookup → **None**, and we did none of it, so
+   `de-DE` / `German` / a typo conditioned the model on tokens it never saw in
+   that slot while looking like it worked.
+
+**The fix.** `src/core/omnivoice_lang.h` mirrors `_resolve_language()` over a
+generated 646-ID table (`tools/gen-omnivoice-lang-map.py` ← upstream
+`lang_map.py`; regenerate rather than hand-edit). The runtime resolves centrally
+inside `omnivoice_set_language`, so no surface can forget to; unrecognized
+values warn with a did-you-mean and fall back to language-agnostic. Both the
+adapter and the session arm now apply it per call.
+
+**Verified at the CODE level, not the WAV level** — output is watermarked and
+carries a spoken disclaimer, so `cmp` on the audio measures the watermark. Use
+`CRISPASR_OMNIVOICE_DUMP_CODES` + `--no-spoken-disclaimer`. All three surfaces,
+English `jfk.wav` reference → German target:
+
+| comparison | result | what it proves |
+|---|---|---|
+| `-l de` vs none | DIFFERENT | the tag reaches the model |
+| `-l German` vs `-l de` | **IDENTICAL** | name→ID resolution is exact |
+| `-l de-DE` vs none | **IDENTICAL** | unrecognized really is agnostic, not a poisoned prompt |
+| session vs CLI, same lang | **IDENTICAL** | surface parity restored |
+| server vs CLI, same lang | **IDENTICAL** | three sequential requests on ONE process each honoured their own language |
+
+**⚠ NEGATIVE RESULT — the accent half of the report is NOT fixed, and probably
+cannot be here.** Two findings:
+
+- *No measurable accent change.* whisper-large-v3-turbo LID over 3 German
+  sentences: sentence 1 went 0.927 → 0.998 with the tag, but sentences 2 and 3
+  were already 0.9993 / 0.9996 untagged and the tag moved neither (0.9996 /
+  0.9995 — one slightly DOWN). The sentence-1 gap was one-clip noise, exactly
+  what the A/B rule warns about. Content round-trips clean on every arm, so the
+  tag is safe; it is just not demonstrably an accent lever. LID is also a poor
+  accent metric by construction — it is trained to be accent-robust. A real
+  verdict needs a listener, which the reporter now can be, because the knob
+  finally does something.
+- *#329's fix does not transfer, by design.* OmniVoice has no cross-lingual
+  drop-ref path: `create_voice_clone_prompt` either takes `ref_text` or
+  auto-transcribes it, and `_combine_text` lays `ref_text + " " + target` into
+  ONE stream whose tokens are positioned before the reference audio frames.
+  Dropping the transcript while keeping the audio desynchronizes the two — a
+  structural break, not a mode. Do not port the cosyvoice3 behaviour here
+  without new evidence; the language tag is the only lever the architecture
+  exposes.
+
+**Adjacent bug fixed in passing:** `/v1/audio/speech` advertises a per-request
+`seed` and the omnivoice adapter dropped it, so re-rendering one subtitle line
+could not be reproduced. Now applied when non-zero (0 = the runtime's own
+default 42, so nothing changes unless a caller asks). Verified: `--seed 999`
+differs from the default and is byte-identical across two runs.
+
+**SE-side gap, worked around (2026-08-07, follow-up):** `OmniVoiceCrispAsr.Speak()`
+accepts `TtsLanguage? language` and never sends it — the payload is
+`{input, response_format, speed}` — and the launch args carry no `-l`. Rather
+than leave the fix blocked on someone else's release, omnivoice now **guesses
+the language from the target text when nobody supplied one**
+(`CRISPASR_OMNIVOICE_AUTO_LANG`, default ON;
+`core_omnivoice_lang::auto_detect` = `core_tts_lang::detect` → `resolve`).
+
+*The measurement that justifies guessing, and would retract it.* Guessing is
+normally the wrong instinct; here it is defensible only because the **harm side
+was measured and is benign**. German text deliberately mis-tagged `-l en`:
+ASR round-trip word-perfect, whisper LID still `de` at 0.984 — the same band as
+the correct tag (0.947) and no tag (0.998), i.e. no ordering at all. So a bad
+guess costs nothing detectable, while the upside is what upstream documents
+("performance is slightly better if you specify the language"). **If a later
+measurement shows a wrong tag DOES degrade output, flip this back to opt-in** —
+the asymmetry is the entire argument, not the detection accuracy.
+
+Verified end to end (codes, `--no-spoken-disclaimer`):
+
+| arm | vs | result |
+|---|---|---|
+| no `-l` at all, fallback on | explicit `-l de` | **IDENTICAL** |
+| `CRISPASR_OMNIVOICE_AUTO_LANG=0` | old untagged behaviour | **IDENTICAL** (clean opt-out) |
+| explicit `-l en` on German text | the pre-existing `-l en` result | **IDENTICAL** (the guess never overrides) |
+| **SE-shaped POST** `{input, response_format}`, no language field | explicit `-l de` | **IDENTICAL** |
+
+Two implementation details that are load-bearing, both guarded in
+`tests/test-omnivoice-lang.cpp`:
+
+- **Detect over the TARGET text, not `combined_text`.** The combined stream has
+  the reference transcript glued to its front, so guessing from it would drag
+  every German subtitle toward an English reference clip's language — silently,
+  and only when cloning, which is exactly when it matters.
+- **Per call, into a local — never written back to `ctx->language`.** The server
+  reuses one context across requests; a sticky guess would leak line N's
+  detection onto line N+1, which is the per-call-vs-init bug this whole change
+  set exists to fix.
+
+Sending the field is still better than being guessed at (explicit wins, and it
+covers the languages the detector does not know), so the SE-side change is still
+worth having — it is just no longer a blocker. Reported on the issue.
+
 ## NOW — active work
 
-**Status (2026-07-15): OmniVoice RTF #2 — codec-decode FASTCONV landed on branch
-`perf/omnivoice-254-decode-rtf` (worktree `.claude/worktrees/omnivoice-rtf-decode`).**
+**Status (2026-07-16): OmniVoice RTF #4 — fused stage0 step graph, branch
+`feat/omnivoice-rtf-stage0` (worktree `.claude/worktrees/omnivoice-rtf-stage0`).**
+
+Reporter re-benched after single-shot (#254 last comment): CUDA RTF still 0.17
+vs omnivoice.cpp 0.144 — gen 3.55 s vs their 3.02 s for ~22 s audio (decode now
+free). Structural read of the step loop found the residual ~44 ms/step of host
+overhead: per-step ~18 MB audio-embedding readback + single-threaded codebook
+sum + ~5 MB embed re-upload, a full-sequence ~39 MB logits readback (only the
+target slice is used), single-threaded triple-log-softmax CFG scoring (~13M
+`exp`/step), and multi-MB per-step vector allocs (+ a full `u_logits` copy).
+
+- ✅ **Fused per-step graph (`OMNIVOICE_FUSED_STEP`, default ON when persistent):**
+  token ids in (→ ~140 KB int32 upload), in-graph `get_rows` + cb-ascending
+  chained adds (bitwise == host sum) + concat with a device-resident text-embed
+  tensor (own buffer, gallocr-alias-proof), transformer unchanged, `ggml_cont`
+  view of ONLY the target logit slices out. Modes: cond-only / uncond-only /
+  unified. Embed tables are F16 even in quant GGUFs (quantize rule), so the
+  in-graph `get_rows` stays CUDA-graph-capture-safe (fork's
+  TAG_GET_ROWS_CUDA_GRAPHS disables capture only for quantized `get_rows`).
+- ✅ **Threaded CFG scoring** (`ov_parallel_for` over target positions; the
+  position-Gumbel draws are precomputed serially so the rng stream is
+  bit-identical; sampled path `class_temp>0` stays serial). Scoring buffers
+  hoisted; interval-CFG uses the persistent `u_buf` — no more 18 MB/step copy.
+- ✅ **Byte-identity (M1 Metal, q8_0, `OMNIVOICE_DUMP_CODES` + cmp):** legacy vs
+  fused BYTE-IDENTICAL on ALL five config classes — (a) reporter's paragraph,
+  2-forward path (modes 0+1, 4360 codes); (b) fox + `OMNIVOICE_UNIFIED_CFG=1`
+  (mode 2, 520 codes); (c) fox + `OMNIVOICE_CFG_INTERVAL=2` (interval-CFG
+  u_buf caching); (d) fox + `OMNIVOICE_GUIDANCE=0` (cond-only, no uncond arm).
+  ASR roundtrip on the fused paragraph clean (all #254 words present). 907/907
+  unit tests pass.
+- ✅ **Default policy:** fused ON for CPU/Metal (proven above); **legacy stays
+  the default on CUDA** until the roundtrip runs there (LEARNING 35 — never
+  flip a GPU default blind). `OMNIVOICE_FUSED_STEP=1` opts in on CUDA.
+- ⏳ **CUDA A/B blocked on quota:** both Kaggle accounts exhausted (30 h/wk,
+  ~2 days to reset); alternative: the A1000 box. Kernel is ready:
+  `tools/kaggle/omnivoice-fused-step-ab/` (legacy vs fused vs fused+2-forward,
+  reporter's paragraph, byte-identity gate + median gen s + per-stage bench;
+  `CRISPASR_REF=main`). Local M1 timing is load-noise (loadavg 100–290 all
+  day; legacy vs fused gen 370→234 s directional only, decode-stage noise
+  3.8× between arms of identical code).
+- ✅ **Reference-voice disk cache shipped (2026-07-16):** the reporter's last
+  ask (omnivoice.cpp `--ref-rvq` parity). Automatic content-addressed cache of
+  the RVQ ref codes (FNV-1a over preprocessed pcm + encoder fingerprint, OVC1
+  file, same dir resolution as the pocket_tts latents cache);
+  `CRISPASR_OMNIVOICE_VOICE_CACHE=0` disables. Verified: run 2 logs "voice
+  codes loaded from cache", codes byte-identical, WAV audio data bit-identical.
+- ✅ **M1 matched-load per-stage A/B (load≈29 both arms):** fused vs legacy gen
+  is NEUTRAL on Metal (96.3 s vs 93.7 s totals, per-forward medians within
+  noise) — unified memory made the legacy host overhead nearly free (embeds
+  0.9 s of ~94 s), so the fused win is CUDA-specific (2.3×). Default fused
+  everywhere stands (identical output, neutral Metal, big CUDA).
+  Same-box omnivoice.cpp: its Metal backend fails to init on macOS 26 (bf16
+  Metal-shader compile error in their ggml), CPU-only path is gen 728 s
+  (RTF 34) vs our Metal ~90-116 s — CrispASR is the only implementation with
+  a working GPU path on this Mac.
+- ✅ **CUDA A/B verdict IN (2026-07-16, reporter, RTX 5070 Ti):** `cmp`
+  byte-identical on CUDA; gen 3.55 s → **1.53 s (2.3×)**, RTF 0.17 → **0.07**
+  (vs omnivoice.cpp 0.144 — CrispASR is now ~2× FASTER than the reference
+  implementation); single CUDA-graph warmup. Per-step 45.9 ms = fwd 27.4 +
+  score_cfg 11.6 + read_logits 5.2 + sample 1.5. → **CUDA default flipped to
+  fused** (this commit). Reporter's remaining ask: reference-voice caching to
+  disk (omnivoice.cpp feature parity) — next work item.
+- 📣 **Reporter A/B requested (2026-07-16):** asked the #254 reporter (RTX
+  5070 Ti — the exact platform) to run `OMNIVOICE_FUSED_STEP=0` vs `=1` with
+  `OMNIVOICE_DUMP_CODES` + `cmp` on current main
+  (issue comment 4995155233). Whichever lands first — reporter, Kaggle
+  quota (~07-18), or the A1000 — gates the CUDA default flip.
+- **Next (when GPU access returns):** run the Kaggle/A1000 A/B → if
+  byte-identical + faster on CUDA, flip the CUDA default to fused and ask the
+  reporter to re-bench. Expected: kills the ~44 ms/step host overhead that is
+  the residual RTF 0.17-vs-0.144 gap.
 
 Reporter's residual complaint after the over-length + word-drop fixes: "CrispASR
 is still slower than alternative implementations" and "decoding is on cpu, which
@@ -31,17 +329,15 @@ copies amortized over few frames).
   summary at normal verbosity (`gen Xs + decode Ys = Zs for Ws audio (RTF …)`) —
   no more wrapping in `time`.
 - ✅ **Landed on `main`** (`6a1b1903b`, rebased past the 0.8.11 release bump).
-- 🧪 **GPU/Metal codec decode (`OMNIVOICE_CODEC_GPU`, default OFF, shipped as scaffold):**
+- ✅ **GPU codec decode (`OMNIVOICE_CODEC_GPU`, default ON for CUDA, opt-in elsewhere):**
   every decode op is Metal-supported (CONV_TRANSPOSE_1D/IM2COL/MUL_MAT/SIN/CAST/
   GET_ROWS), output equivalent (max |Δ| ≈ 54/32768, inaudible). **But on M1 Metal it
   LOSES to CPU-FASTCONV:** decode 1.15→1.73 s (short) and 11.2→19.6 s (437-frame) —
-  ~40 modest-channel convs are dispatch-bound on Metal and contend with the
-  concurrently-Metal LLM (the dev-guide "small-op GPU dispatch is launch-bound"
-  case). Kept OFF (verified-but-slower → opt-in). **May still win on CUDA** (the
-  unified-CFG precedent in this same PLAN flipped a Metal-loser into a +13% CUDA
-  win) → needs a Kaggle CUDA A/B before any default flip. Box was loaded (gen
-  37→58 s between runs) so numbers are directional, not clean — but the conservative
-  default (OFF) is unaffected.
+  ~40 modest-channel convs are dispatch-bound on Metal, so Metal remains CPU by
+  default. CUDA validation on RTX 5070 Ti reduced a 7.52 s clip's decode from
+  ~1.4 s on CPU to ~34 ms with PCM cosine 0.99999986; issue #254 independently
+  reported 0.05–0.11 s CUDA decode. `OMNIVOICE_CODEC_GPU=0` restores CPU placement,
+  while `=1` opts non-CUDA GPU backends into the existing path.
 - ⏭ **Remaining lever:** the LLM `gen` phase is already at per-step parity with
   omnivoice.cpp, so headroom there is kernel-level (their ggml fork). A persistent
   decode graph (build/alloc once, reuse across chunks) could cut the GPU dispatch
@@ -53,6 +349,41 @@ copies amortized over few frames).
   default 32 (quality). Env `OMNIVOICE_NUM_STEPS=N` for quick A/B. Validated ASR
   roundtrip stays clean down to N≈16 (2× fewer forwards); see sweep in this doc.
   Tunable from EVERY consumer (CLI/server-per-request/C-ABI/Python/Go/Dart).
+
+### Single-shot synthesis (#254 reporter: "reduce chunking")
+Reporter (CUDA, q8_0, `OMNIVOICE_CODEC_GPU=1`) benched CrispASR at RTF 0.17–0.21 vs
+omnivoice.cpp 0.144 on the SAME text/params — a 15–20% gap traced entirely to
+**chunking**: CrispASR sentence-split the paragraph into 3 chunks (292+197+54
+frames), each a different T, so the CUDA graph re-warmed per chunk (visible
+`warmup complete`/`reset` spam) and stage0 ran 3×32 iterations. omnivoice.cpp does
+the whole paragraph as one T=544 MaskGIT pass (one warmup, 32 steps). Their decode
+was already free on CUDA (0.05 s via `OMNIVOICE_CODEC_GPU=1` — the gate wins on CUDA,
+as predicted).
+
+- ✅ **Fix:** added `omnivoice` to the single-shot whitelist in
+  `crispasr_tts_plan_chunks_for_backend` (alongside vibevoice/qwen3-tts/tada/dots-tts).
+  OmniVoice is masked-iterative — it synthesizes the whole target span in one
+  fixed-`num_steps` pass with a single length estimate (no per-token duration head,
+  no `MAX_FRAMES` truncation), exactly like omnivoice.cpp. Verified: the reporter's
+  paragraph now renders as ONE 410-frame generation (one decode), ASR-complete.
+- ⚖️ **Tradeoff + M1 A/B:** single-shot has the SAME linear compute but ~2.7× the
+  attention (O(T²)) vs 3 chunks. BUT it also does 1 decode + 1 forward-graph build
+  instead of 3 — and that consolidation more than pays for the attention. M1 A/B
+  (q8_0, reporter paragraph, interleaved; abs numbers load-garbage — load hit 79 —
+  so read the RELATIVE pair only):
+
+  | path | gen | decode | total |
+  |------|-----|--------|-------|
+  | single-shot | 103.96 s (+6%, O(T²)) | **9.09 s** | **113.0 s** |
+  | chunked (×3) | 98.11 s | 23.65 s (3 graph builds) | 121.8 s |
+
+  So single-shot is **net faster even on M1** — the decode consolidation (2.6×
+  fewer graph builds, load-independent structural win) outweighs the ~6% gen
+  penalty. This flips the earlier worry that it would regress Metal. On CUDA the
+  gen graph-reuse is an additional, larger win (the reporter's case).
+- 🔌 **Escape hatch:** `CRISPASR_OMNIVOICE_CHUNK=1` forces the legacy sentence-split
+  path (also the A/B toggle) — for a Metal user feeding pathologically long text
+  where O(T²) attention could dominate.
 
 ### stage0 breakdown (M1, clean full-synth log) — what's worth optimizing
 `fwd_cond 49.9% + fwd_uncond 44.3% + sampling 4.6% + embeds 1.1%`. So the embed

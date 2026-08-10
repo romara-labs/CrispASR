@@ -23,6 +23,10 @@
 #include "timer.h"
 #include "voice-design.h"
 
+#include "core/crispasr_env.h"
+#include "core/omnivoice_instruct.h"
+#include "core/omnivoice_lang.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -694,6 +698,16 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
         return {};
     }
 
+    // Byte-exact A/B hook used by the cross-surface regression harness. A
+    // long-form request may contain several chunks, in which case the final
+    // chunk wins; the harness deliberately uses a single short utterance.
+    if (const char * dump_path = crispasr_env::get("CRISPASR_OMNIVOICE_DUMP_CODES")) {
+        if (FILE * f = std::fopen(dump_path, "wb")) {
+            std::fwrite(tokens.data(), sizeof(int32_t), tokens.size(), f);
+            std::fclose(f);
+        }
+    }
+
     const int K       = pt->lm.num_audio_codebook;
     const int mask_id = pt->lm.audio_mask_id;
     if ((int) tokens.size() != K * T) {
@@ -1187,6 +1201,27 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
     return OV_STATUS_OK;
 }
 
+bool pipeline_tts_resolve_language(const std::string & text, const std::string & raw, std::string * out) {
+    if (!out) {
+        return false;
+    }
+
+    const auto resolved = core_omnivoice_lang::resolve(raw);
+    *out                = resolved.id;
+    if (resolved.status == core_omnivoice_lang::Status::unrecognized) {
+        const std::string hint = core_omnivoice_lang::suggest(raw);
+        ov_log(OV_LOG_WARN, "[TTS] OmniVoice language '%s' is not supported%s%s; using language-agnostic synthesis",
+               raw.c_str(), hint.empty() ? "" : " (did you mean '", hint.empty() ? "" : (hint + "')").c_str());
+    }
+
+    const char * auto_lang = crispasr_env::get("CRISPASR_OMNIVOICE_AUTO_LANG");
+    const bool auto_enabled = !auto_lang || !*auto_lang || std::strcmp(auto_lang, "0") != 0;
+    if (out->empty() && auto_enabled) {
+        *out = core_omnivoice_lang::auto_detect(text);
+    }
+    return true;
+}
+
 // Validate and normalise the raw instruct string against the voice-design
 // vocabulary. Picks the target language from the synthesis text: any CJK
 // ideograph -> Chinese, otherwise English.
@@ -1194,12 +1229,18 @@ bool pipeline_tts_resolve_instruct(const VoiceDesign * vd,
                                    const std::string & text,
                                    const std::string & raw,
                                    std::string *       out) {
-    bool        use_zh = voice_design_has_cjk(text);
-    std::string err;
-    if (!voice_design_normalize(vd, raw, use_zh, out, &err)) {
-        ov_log(OV_LOG_ERROR, "[TTS] %s", err.c_str());
+    (void) vd;
+    if (!out) {
         return false;
     }
+
+    const core_omnivoice_instruct::Parsed parsed = core_omnivoice_instruct::parse(raw);
+    if (parsed.status != core_omnivoice_instruct::Status::ok &&
+        parsed.status != core_omnivoice_instruct::Status::cleared) {
+        ov_log(OV_LOG_ERROR, "[TTS] %s", parsed.error.c_str());
+        return false;
+    }
+    *out = core_omnivoice_instruct::render(parsed, core_omnivoice_instruct::text_is_zh(text));
     return true;
 }
 
@@ -1323,6 +1364,13 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     std::string raw_instruct(params->instruct ? params->instruct : "");
     std::string ref_text(params->ref_text ? params->ref_text : "");
 
+    std::string resolved_lang;
+    if (!pipeline_tts_resolve_language(text, lang, &resolved_lang)) {
+        ov_set_error("ov_synthesize : failed to resolve target language");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    lang = std::move(resolved_lang);
+
     // Mirror Python preprocess_prompt: append a terminal "." (or
     // ideographic full stop for CJK) when missing. Applied before the
     // raw/tokens routing so both reference formats see the same text.
@@ -1355,16 +1403,16 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     // Keep the diagnostic knobs from the original runtime available on the
     // unified ABI. They are intentionally process-local overrides used for
     // CFG/temperature/step bisects and do not alter the normal defaults.
-    if (const char * e = std::getenv("OMNIVOICE_GUIDANCE")) {
+    if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_GUIDANCE")) {
         mg_cfg.guidance_scale = (float) std::atof(e);
     }
-    if (const char * e = std::getenv("OMNIVOICE_POS_TEMP")) {
+    if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_POS_TEMP")) {
         mg_cfg.position_temperature = (float) std::atof(e);
     }
-    if (const char * e = std::getenv("OMNIVOICE_CLASS_TEMP")) {
+    if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_CLASS_TEMP")) {
         mg_cfg.class_temperature = (float) std::atof(e);
     }
-    if (const char * e = std::getenv("OMNIVOICE_NUM_STEPS")) {
+    if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_NUM_STEPS")) {
         const int n = std::atoi(e);
         if (n > 0) {
             mg_cfg.num_step = n;

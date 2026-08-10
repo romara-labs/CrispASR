@@ -11,8 +11,12 @@
 #include "crispasr_diarize_internal.h"
 #include "crispasr_speaker_cluster.h"
 #include "crispasr_speaker_embedder.h"
+#include "crispasr_subprocess.h"
 #include "pyannote_seg.h"
+#include "speaker_db.h"
 #include "whisper_params.h"
+
+#include "core/spectral_diarize.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -31,8 +36,6 @@
 #include <io.h>
 #include <sys/stat.h>
 #define close _close
-#define popen _popen
-#define pclose _pclose
 #define mkdir(d, m) _mkdir(d)
 static int mkstemps(char* t, int s) {
     (void)s;
@@ -42,6 +45,15 @@ static int mkstemps(char* t, int s) {
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+// #324: conservative ceiling for foxnose speaker-count estimation. See the
+// comment at its use site — this is an empirical value, not a guess.
+// Was 4 while the BIC + silhouette estimator saturated at whatever ceiling it
+// was given. The eigengap estimator (now the default) is robust to a loose
+// bound — measured 2 speakers at max=8 on samples/multispeaker.wav where BIC
+// reported 8 — so this no longer has to be defensively small, and a genuine
+// 5-6 speaker meeting is reachable again.
+static constexpr int kFoxnoseDefaultMaxSpeakers = 8;
 
 namespace {
 
@@ -130,6 +142,17 @@ struct SherpaSegment {
     int speaker;
 };
 
+std::vector<std::string> make_sherpa_args(const std::string& bin, const whisper_params& params,
+                                          const std::string& wav_path) {
+    return {
+        bin,
+        "--clustering.num-clusters=" + std::to_string(params.sherpa_num_clusters),
+        "--segmentation.pyannote-model=" + params.sherpa_segment_model,
+        "--embedding.model=" + params.sherpa_embedding_model,
+        wav_path,
+    };
+}
+
 // Parse a line emitted by sherpa-onnx-offline-speaker-diarization.
 //   "0.320 -- 3.680 speaker_00 duration=3.360"   — newer format
 //   "0.320 3.680 0"                               — older format
@@ -203,7 +226,7 @@ bool apply_sherpa(const std::vector<float>& mono, int64_t slice_t0_cs, std::vect
         return false;
     }
 
-    if (bin.find('/') != std::string::npos) {
+    if (bin.find('/') != std::string::npos || bin.find('\\') != std::string::npos) {
         struct stat st;
         if (::stat(bin.c_str(), &st) != 0) {
             fprintf(stderr,
@@ -220,30 +243,29 @@ bool apply_sherpa(const std::vector<float>& mono, int64_t slice_t0_cs, std::vect
         return false;
     }
 
-    std::ostringstream cmd;
-    // clang-format off
-    cmd << bin
-        << " --clustering.num-clusters=" << params.sherpa_num_clusters
-        << " --segmentation.pyannote-model='" << params.sherpa_segment_model << "'"
-        << " --embedding.model='" << params.sherpa_embedding_model << "'"
-        << " '" << wav_path << "'";
-    // clang-format on
+    const auto args = make_sherpa_args(bin, params, wav_path);
     if (!params.no_prints)
-        fprintf(stderr, "crispasr[diarize]: %s\n", cmd.str().c_str());
-    cmd << " 2>/dev/null";
+        fprintf(stderr, "crispasr[diarize]: %s\n", crispasr_cli_process::join_cmdline(args).c_str());
 
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd.str().c_str(), "r"), pclose);
-    if (!pipe) {
-        fprintf(stderr, "crispasr[diarize]: failed to spawn sherpa subprocess\n");
+    const int timeout_sec =
+        crispasr_cli_process::timeout_from_audio_samples("CRISPASR_SHERPA_TIMEOUT_SEC", (int)mono.size());
+    const auto run = crispasr_cli_process::run_capture_stdout(args, timeout_sec);
+    if (run.timed_out) {
+        fprintf(stderr, "crispasr[diarize]: sherpa subprocess timed out after %d s\n", timeout_sec);
         std::remove(wav_path.c_str());
         return false;
     }
-
+    if (run.exit_code != 0) {
+        fprintf(stderr, "crispasr[diarize]: sherpa subprocess failed with exit code %d\n", run.exit_code);
+        std::remove(wav_path.c_str());
+        return false;
+    }
     std::vector<SherpaSegment> parsed;
-    char linebuf[1024];
-    while (fgets(linebuf, sizeof(linebuf), pipe.get())) {
+    std::istringstream lines(run.output);
+    std::string line;
+    while (std::getline(lines, line)) {
         SherpaSegment s;
-        if (parse_sherpa_line(linebuf, s))
+        if (parse_sherpa_line(line, s))
             parsed.push_back(s);
     }
     std::remove(wav_path.c_str());
@@ -283,6 +305,20 @@ std::string resolve_pyannote_model(const whisper_params& params) {
     }
     if (mp.size() < 5 || mp.compare(mp.size() - 5, 5, ".gguf") != 0)
         return {}; // not GGUF → caller can fall back to sherpa subprocess
+    return mp;
+}
+
+// #324: resolve the WeSpeaker embedder path, auto-downloading the canonical
+// GGUF on first use when the user passed "auto" (or left it as the registry
+// default). ⚠ CC-BY-4.0 weights — see THIRD_PARTY_NOTICES.txt.
+std::string resolve_foxnose_embedder(const whisper_params& params) {
+    std::string mp = params.diarize_embedder;
+    if (mp.empty() || mp == "auto") {
+        mp = crispasr_cache::ensure_cached_file(
+            "wespeaker-resnet34-lm.gguf",
+            "https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF/resolve/main/wespeaker-resnet34-lm.gguf",
+            params.no_prints, "crispasr[diarize]", params.cache_dir);
+    }
     return mp;
 }
 
@@ -467,81 +503,34 @@ void split_segments_on_pyannote_turns(std::vector<crispasr_segment>& segs, const
             }
         }
 
-        // Stability filter: pyannote-seg without speaker embeddings
-        // can flip its local track index mid-phrase, producing one-word
-        // "(speaker 2)" stubs inside a contiguous "(speaker 1)" run.
-        // We collapse any run shorter than MIN_RUN_CS into the longer
-        // adjacent run before emitting sub-segments. Tuned at 50 cs
-        // (0.5 s) — long enough to suppress per-word flips, short enough
-        // to keep genuine turns in fast back-and-forth conversation.
+        // Stability filter (#107/#267): pyannote-seg without speaker
+        // embeddings can flip its local track index mid-phrase, producing
+        // one-word "(speaker 2)" stubs inside a contiguous "(speaker 1)"
+        // run. group_words_into_speaker_runs folds any run shorter than
+        // MIN_RUN_CS (0.5 s) into the longer adjacent run — long enough to
+        // suppress per-word flips, short enough to keep genuine turns in
+        // fast back-and-forth conversation.
         constexpr int64_t MIN_RUN_CS = 50;
-        auto word_duration_cs = [&](size_t a, size_t b /*exclusive*/) -> int64_t {
-            if (b <= a || b > word_spk.size())
-                return 0;
-            int64_t t0 = seg.words[a].t0;
-            int64_t t1 = seg.words[b - 1].t1;
-            if (t0 <= 0)
-                t0 = seg.t0;
-            if (t1 <= 0)
-                t1 = seg.t1;
-            return std::max<int64_t>(0, t1 - t0);
-        };
-        // Build initial runs as [start, end_exclusive, speaker] triples.
-        struct Run {
-            size_t s, e;
-            int spk;
-        };
-        std::vector<Run> runs;
-        {
-            size_t rs = 0;
-            while (rs < word_spk.size()) {
-                const int rspk = word_spk[rs];
-                size_t re = rs + 1;
-                while (re < word_spk.size() && word_spk[re] == rspk)
-                    re++;
-                runs.push_back({rs, re, rspk});
-                rs = re;
-            }
+        // Sanitize per-word bounds (fall back to segment bounds for missing
+        // word timestamps) so each run's span is well-defined.
+        std::vector<int64_t> word_t0(seg.words.size()), word_t1(seg.words.size());
+        for (size_t i = 0; i < seg.words.size(); i++) {
+            word_t0[i] = seg.words[i].t0 > 0 ? seg.words[i].t0 : seg.t0;
+            word_t1[i] = seg.words[i].t1 > 0 ? seg.words[i].t1 : seg.t1;
         }
-        // Iterate: fold every run shorter than MIN_RUN_CS into the
-        // longer neighbour. Repeat until stable.
-        bool changed = true;
-        while (changed && runs.size() >= 2) {
-            changed = false;
-            for (size_t i = 0; i < runs.size(); i++) {
-                if (word_duration_cs(runs[i].s, runs[i].e) >= MIN_RUN_CS)
-                    continue;
-                int merge_into = -1;
-                if (i == 0)
-                    merge_into = (int)i + 1;
-                else if (i == runs.size() - 1)
-                    merge_into = (int)i - 1;
-                else {
-                    int64_t prev_dur = word_duration_cs(runs[i - 1].s, runs[i - 1].e);
-                    int64_t next_dur = word_duration_cs(runs[i + 1].s, runs[i + 1].e);
-                    merge_into = (prev_dur >= next_dur) ? (int)i - 1 : (int)i + 1;
-                }
-                if (merge_into == (int)i + 1) {
-                    runs[i + 1].s = runs[i].s;
-                } else if (merge_into == (int)i - 1) {
-                    runs[i - 1].e = runs[i].e;
-                }
-                runs.erase(runs.begin() + i);
-                changed = true;
-                break;
-            }
-        }
+        const auto runs =
+            crispasr_diarize_internal::group_words_into_speaker_runs(word_spk, word_t0, word_t1, MIN_RUN_CS);
 
         // Collect distinct speakers across the (now-filtered) runs to
         // decide whether to actually split.
         int first_spk = -1;
         bool multi = false;
         for (const auto& r : runs) {
-            if (r.spk < 0)
+            if (r.speaker < 0)
                 continue;
             if (first_spk < 0) {
-                first_spk = r.spk;
-            } else if (r.spk != first_spk) {
+                first_spk = r.speaker;
+            } else if (r.speaker != first_spk) {
                 multi = true;
                 break;
             }
@@ -554,9 +543,9 @@ void split_segments_on_pyannote_turns(std::vector<crispasr_segment>& segs, const
 
         // Emit one sub-segment per run.
         for (size_t ri = 0; ri < runs.size(); ri++) {
-            const size_t run_start = runs[ri].s;
-            const size_t run_end = runs[ri].e;
-            const int run_spk = runs[ri].spk;
+            const size_t run_start = runs[ri].start;
+            const size_t run_end = runs[ri].end;
+            const int run_spk = runs[ri].speaker;
 
             crispasr_segment sub;
             sub.t0 = seg.words[run_start].t0 > 0 ? seg.words[run_start].t0 : seg.t0;
@@ -580,6 +569,102 @@ void split_segments_on_pyannote_turns(std::vector<crispasr_segment>& segs, const
         }
     }
 
+    segs = std::move(out);
+}
+
+// #324: split segments at FoxNose turn boundaries.
+//
+// The pyannote splitter above scores each word against pyannote's frame
+// posteriors, which FoxNose does not have — it produces explicit TURNS
+// instead. Everything after per-word labelling is identical, so this reuses
+// group_words_into_speaker_runs and the same sub-segment emission.
+//
+// Without this, labels attach at the caller's segment granularity: an ASR
+// emitting one 26 s segment across several speakers gets ONE label, however
+// good the turns are.
+void split_segments_on_foxnose_turns(std::vector<crispasr_segment>& segs, const std::vector<CrispasrDiarizeTurn>& turns,
+                                     int64_t slice_t0_cs) {
+    if (turns.empty() || segs.empty())
+        return;
+
+    // Speaker covering the centre of [t0, t1] (centiseconds, absolute).
+    auto speaker_at = [&](int64_t t0, int64_t t1) -> int {
+        const double mid = ((double)(t0 + t1) * 0.5 - (double)slice_t0_cs) / 100.0;
+        for (const auto& t : turns)
+            if (mid >= t.start_s && mid < t.end_s)
+                return t.speaker;
+        return -1;
+    };
+
+    std::vector<crispasr_segment> out;
+    out.reserve(segs.size());
+    for (auto& seg : segs) {
+        if (seg.words.empty()) {
+            out.push_back(std::move(seg));
+            continue;
+        }
+        std::vector<int> word_spk(seg.words.size(), -1);
+        int last_known = -1;
+        for (size_t i = 0; i < seg.words.size(); i++) {
+            const auto& w = seg.words[i];
+            int spk = (w.t1 > w.t0) ? speaker_at(w.t0, w.t1) : -1;
+            if (spk < 0)
+                spk = last_known; // keep unaligned words attached to their neighbour
+            word_spk[i] = spk;
+            if (spk >= 0)
+                last_known = spk;
+        }
+        for (size_t i = 0; i < word_spk.size() && word_spk[i] < 0; i++)
+            for (size_t j = i + 1; j < word_spk.size(); j++)
+                if (word_spk[j] >= 0) {
+                    word_spk[i] = word_spk[j];
+                    break;
+                }
+
+        constexpr int64_t MIN_RUN_CS = 50;
+        std::vector<int64_t> word_t0(seg.words.size()), word_t1(seg.words.size());
+        for (size_t i = 0; i < seg.words.size(); i++) {
+            word_t0[i] = seg.words[i].t0 > 0 ? seg.words[i].t0 : seg.t0;
+            word_t1[i] = seg.words[i].t1 > 0 ? seg.words[i].t1 : seg.t1;
+        }
+        const auto runs =
+            crispasr_diarize_internal::group_words_into_speaker_runs(word_spk, word_t0, word_t1, MIN_RUN_CS);
+
+        int first_spk = -1;
+        bool multi = false;
+        for (const auto& r : runs) {
+            if (r.speaker < 0)
+                continue;
+            if (first_spk < 0)
+                first_spk = r.speaker;
+            else if (r.speaker != first_spk) {
+                multi = true;
+                break;
+            }
+        }
+        if (!multi) {
+            out.push_back(std::move(seg));
+            continue;
+        }
+
+        for (size_t ri = 0; ri < runs.size(); ri++) {
+            const size_t rs = runs[ri].start, re = runs[ri].end;
+            crispasr_segment sub;
+            sub.t0 = seg.words[rs].t0 > 0 ? seg.words[rs].t0 : seg.t0;
+            sub.t1 = seg.words[re - 1].t1 > 0 ? seg.words[re - 1].t1 : seg.t1;
+            sub.speaker_turn_next = (ri + 1 < runs.size());
+            sub.words.assign(seg.words.begin() + (long)rs, seg.words.begin() + (long)re);
+            for (size_t j = rs; j < re; j++) {
+                if (!sub.text.empty() && !sub.words[j - rs].text.empty())
+                    sub.text += ' ';
+                sub.text += seg.words[j].text;
+            }
+            sub.tokens.clear(); // no per-word alignment; dividing them would be arbitrary
+            if (runs[ri].speaker >= 0)
+                sub.speaker = "(speaker " + std::to_string(runs[ri].speaker) + ") ";
+            out.push_back(std::move(sub));
+        }
+    }
     segs = std::move(out);
 }
 
@@ -638,25 +723,28 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
         return false;
     }
 
-    std::ostringstream cmd;
-    cmd << bin << " --clustering.num-clusters=" << params.sherpa_num_clusters << " --segmentation.pyannote-model='"
-        << params.sherpa_segment_model << "'" << " --embedding.model='" << params.sherpa_embedding_model << "'" << " '"
-        << wav_path << "'";
+    const auto args = make_sherpa_args(bin, params, wav_path);
     if (!params.no_prints)
-        fprintf(stderr, "crispasr[diarize]: %s\n", cmd.str().c_str());
-    cmd << " 2>/dev/null";
+        fprintf(stderr, "crispasr[diarize]: %s\n", crispasr_cli_process::join_cmdline(args).c_str());
 
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd.str().c_str(), "r"), pclose);
-    if (!pipe) {
-        fprintf(stderr, "crispasr[diarize]: failed to spawn sherpa subprocess for global cache\n");
+    const int timeout_sec = crispasr_cli_process::timeout_from_audio_samples("CRISPASR_SHERPA_TIMEOUT_SEC", n_samples);
+    const auto run = crispasr_cli_process::run_capture_stdout(args, timeout_sec);
+    if (run.timed_out) {
+        fprintf(stderr, "crispasr[diarize]: sherpa global run timed out after %d s\n", timeout_sec);
+        std::remove(wav_path.c_str());
+        return false;
+    }
+    if (run.exit_code != 0) {
+        fprintf(stderr, "crispasr[diarize]: sherpa global run failed with exit code %d\n", run.exit_code);
         std::remove(wav_path.c_str());
         return false;
     }
 
-    char linebuf[1024];
-    while (fgets(linebuf, sizeof(linebuf), pipe.get())) {
+    std::istringstream lines(run.output);
+    std::string line;
+    while (std::getline(lines, line)) {
         SherpaSegment s;
-        if (parse_sherpa_line(linebuf, s))
+        if (parse_sherpa_line(line, s))
             out.segments.push_back({s.t0_s, s.t1_s, s.speaker});
     }
     std::remove(wav_path.c_str());
@@ -668,6 +756,83 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
 
     if (!params.no_prints)
         fprintf(stderr, "crispasr[diarize]: sherpa global → %zu speaker regions\n", out.segments.size());
+    return true;
+}
+
+void crispasr_diarize_merged_by_slice(
+    std::vector<crispasr_segment>& segs, const std::vector<crispasr_audio_slice>& slices,
+    const std::function<void(const crispasr_audio_slice&, std::vector<crispasr_segment>&)>& diarize_slice) {
+    if (segs.empty() || slices.empty() || !diarize_slice)
+        return;
+
+    std::vector<crispasr_segment> out;
+    out.reserve(segs.size());
+
+    size_t seg_offset = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        // Segments belonging to this slice: everything up to the first one that
+        // starts at or after the NEXT slice's t0. The last slice takes the rest.
+        size_t seg_count = 0;
+        for (size_t j = seg_offset; j < segs.size(); ++j) {
+            if (i + 1 < slices.size() && segs[j].t0 >= slices[i + 1].t0_cs)
+                break;
+            seg_count++;
+        }
+        if (seg_count == 0)
+            continue;
+
+        std::vector<crispasr_segment> slice_segs(
+            std::make_move_iterator(segs.begin() + (ptrdiff_t)seg_offset),
+            std::make_move_iterator(segs.begin() + (ptrdiff_t)(seg_offset + seg_count)));
+        seg_offset += seg_count;
+
+        diarize_slice(slices[i], slice_segs);
+
+        // Append whatever came back — MORE than went in when the diarizer split
+        // a segment at a speaker turn, fewer if it dropped one. Neither case can
+        // lose a segment or index past the end here, which the old in-place
+        // copy-back of `seg_count` elements did both of (#324).
+        for (auto& s : slice_segs)
+            out.push_back(std::move(s));
+    }
+
+    // Anything the slice walk never claimed survives unlabelled rather than
+    // being dropped. The last slice takes the remainder, so this is normally
+    // empty — it keeps "never lose a segment" a property of this function
+    // instead of a consequence of that special case.
+    for (; seg_offset < segs.size(); ++seg_offset)
+        out.push_back(std::move(segs[seg_offset]));
+
+    segs = std::move(out);
+}
+
+bool crispasr_apply_foxnose_global(std::vector<crispasr_segment>& all_segs, const std::vector<float>& samples,
+                                   const whisper_params& params) {
+    if (!params.diarize || !params.diarize_embedder_is_foxnose() || all_segs.empty() || samples.empty())
+        return false;
+    if (params.diarize_embedder.empty()) {
+        fprintf(stderr, "crispasr[diarize]: foxnose needs --diarize-embedder <wespeaker.gguf>\n");
+        return false;
+    }
+
+    CrispasrDiarizeOptions opts;
+    opts.method = CrispasrDiarizeMethod::FoxNose;
+    opts.n_threads = params.n_threads;
+    opts.slice_t0_cs = 0; // all_segs timestamps are absolute
+    opts.foxnose_embedder_path = resolve_foxnose_embedder(params);
+    opts.max_speakers = params.diarize_max_speakers_explicit ? params.diarize_max_speakers : kFoxnoseDefaultMaxSpeakers;
+    opts.num_speakers = params.diarize_num_speakers;
+
+    auto lib_segs = lib_view(all_segs);
+    std::vector<CrispasrDiarizeTurn> turns;
+    const float* pcm = samples.data();
+    if (!crispasr_diarize_segments(pcm, pcm, (int)samples.size(), /*is_stereo=*/false, lib_segs, opts, &turns))
+        return false;
+    apply_int_speakers_to_crispasr_segments(lib_segs, all_segs);
+    split_segments_on_foxnose_turns(all_segs, turns, /*slice_t0_cs=*/0);
+    if (!params.no_prints)
+        fprintf(stderr, "crispasr[diarize]: foxnose global pass — %zu turn(s) over %.1f s\n", turns.size(),
+                samples.size() / 16000.0);
     return true;
 }
 
@@ -694,6 +859,14 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
         lib_method = CrispasrDiarizeMethod::VadTurns;
     } else if (method == "pyannote") {
         lib_method = CrispasrDiarizeMethod::Pyannote;
+    } else if (method == "foxnose" || method == "foxnose-diarize") {
+        // The unified runner diarizes foxnose GLOBALLY after transcription
+        // (crispasr_apply_foxnose_global) so speaker identities are consistent
+        // across slices. Doing it per slice as well would reload the embedder
+        // for every slice and produce labels the global pass then overwrites.
+        if (params.diarize_foxnose_global)
+            return true;
+        lib_method = CrispasrDiarizeMethod::FoxNose;
     } else {
         use_lib = false;
     }
@@ -742,12 +915,28 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
         opts.slice_t0_cs = slice_t0_cs;
         if (lib_method == CrispasrDiarizeMethod::Pyannote)
             opts.pyannote_model_path = resolve_pyannote_model(params);
+        if (lib_method == CrispasrDiarizeMethod::FoxNose) {
+            // Reuses the existing --diarize-embedder / --diarize-max-speakers
+            // knobs rather than inventing parallel ones.
+            opts.foxnose_embedder_path = resolve_foxnose_embedder(params);
+            // MEASURED (docs/foxnose-diarize/PLAN.md): silhouette saturates
+            // and climbs monotonically to the ceiling on real speaker
+            // embeddings, so a loose bound is actively harmful — on
+            // samples/multispeaker.wav a bound of 8 yields 8 speakers with
+            // heavy flicker while a bound of 4 yields the correct 2. Upstream
+            // defaults to 20. Default conservatively; an explicit
+            // --diarize-max-speakers always wins.
+            opts.max_speakers =
+                params.diarize_max_speakers_explicit ? params.diarize_max_speakers : kFoxnoseDefaultMaxSpeakers;
+            opts.num_speakers = params.diarize_num_speakers;
+        }
 
         auto lib_segs = lib_view(segs);
         const int n = (int)left.size();
         const float* l = left.data();
         const float* r = (is_stereo && !right.empty()) ? right.data() : l;
-        if (!crispasr_diarize_segments(l, r, n, is_stereo, lib_segs, opts)) {
+        std::vector<CrispasrDiarizeTurn> foxnose_turns;
+        if (!crispasr_diarize_segments(l, r, n, is_stereo, lib_segs, opts, &foxnose_turns)) {
             // pyannote model load failed — try sherpa subprocess fallback
             // when we can (mono input is what sherpa is best at).
             if (lib_method == CrispasrDiarizeMethod::Pyannote) {
@@ -761,6 +950,12 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
             return false;
         }
         apply_int_speakers_to_crispasr_segments(lib_segs, segs);
+        // #324 phase 2: FoxNose derives real speaker TURNS from the audio, so
+        // a caller segment spanning several speakers can be split at word-
+        // aligned boundaries instead of collapsing to one label. Segments
+        // without word timestamps keep their segment-level label.
+        if (lib_method == CrispasrDiarizeMethod::FoxNose)
+            split_segments_on_foxnose_turns(segs, foxnose_turns, slice_t0_cs);
         return true;
     }
 
@@ -783,23 +978,15 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
     return false;
 }
 
-void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
-                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params) {
-    if (!embedder || segs.empty() || !full_audio || n_samples <= 0)
-        return;
-
-    // Skip very short segments — TitaNet (and similar) need ~250 ms+
-    // of speech to produce a reliable embedding. Shorter segments
-    // keep their existing pyannote-local label; clustering then
-    // ignores them.
+// Embed every segment long enough for a reliable speaker embedding
+// (~250 ms+; shorter clips give noisy vectors on TitaNet and similar).
+// Fills `embed_idx` with the segs indices that produced an embedding
+// and `embeddings` with embed_idx.size()*dim floats, row-major.
+static void crispasr_embed_segments(const std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                    CrispasrSpeakerEmbedder* embedder, int d, std::vector<size_t>& embed_idx,
+                                    std::vector<float>& embeddings) {
     constexpr int64_t MIN_EMBED_CS = 25; // 0.25 s
 
-    const int d = embedder->dim();
-    if (d <= 0)
-        return;
-
-    std::vector<size_t> embed_idx;
-    std::vector<float> embeddings;
     embed_idx.reserve(segs.size());
     embeddings.reserve((size_t)segs.size() * (size_t)d);
 
@@ -818,27 +1005,163 @@ void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs,
         embed_idx.push_back(i);
         embeddings.insert(embeddings.end(), tmp.begin(), tmp.end());
     }
+}
+
+void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params,
+                                            CrispasrClusterEmbeddings* out_clusters) {
+    if (!embedder || segs.empty() || !full_audio || n_samples <= 0)
+        return;
+
+    const int d = embedder->dim();
+    if (d <= 0)
+        return;
+
+    std::vector<size_t> embed_idx;
+    std::vector<float> embeddings;
+    crispasr_embed_segments(segs, full_audio, n_samples, embedder, d, embed_idx, embeddings);
+
     if (embed_idx.size() < 2) {
         // Nothing to cluster — either zero or one usable segment.
         if (embed_idx.size() == 1) {
             // Force the one embeddable segment to (speaker 0) so the
             // global label exists even on single-speaker inputs.
             segs[embed_idx[0]].speaker = "(speaker 0) ";
+            if (out_clusters) {
+                out_clusters->seg_idx = std::move(embed_idx);
+                out_clusters->embeddings = std::move(embeddings);
+                out_clusters->labels = {0};
+                out_clusters->dim = d;
+                out_clusters->n_clusters = 1;
+            }
         }
         return;
     }
 
     const float thr = params.diarize_cluster_threshold;
     const int max_spk = params.diarize_max_speakers > 0 ? params.diarize_max_speakers : 8;
-    std::vector<int> labels = crispasr_agglomerative_cluster(embeddings, (int)embed_idx.size(), d, thr, max_spk);
+    const int n_emb = (int)embed_idx.size();
+
+    // #326: estimate the speaker COUNT instead of letting the cap decide it.
+    //
+    // This used to be single-linkage agglomerative with a fixed 0.5 cosine
+    // merge threshold and a hard max_speakers cap. Single linkage chains, and
+    // a fixed threshold does not adapt to the embedder's spread on a given
+    // recording, so on real audio the merge loop never got below the cap and
+    // the CAP became the answer. On the VoxConverse dev shard it pinned to
+    // --diarize-max-speakers 8 on 4 of 8 files (esrit 8 hypothesised vs 5
+    // real, mesob 8 vs 4, nnqfq 8 vs 5, fsaal 8 vs 7), and mesob alone scored
+    // 33.03% DER.
+    //
+    // core_spectral::cluster_speakers (#324) estimates the count first — PCA
+    // + full-covariance GMM/BIC, refined on silhouette — then runs
+    // Ng-Jordan-Weiss spectral clustering and a spherical refinement. It is
+    // the same clusterer that gets --diarize-method foxnose to 7.32% on these
+    // files, so this is reuse of validated in-tree code, not a new heuristic.
+    //
+    // --diarize-cluster-threshold still works, but only when the caller
+    // actually passes it: the threshold is meaningless to the spectral path,
+    // so honouring its DEFAULT would just reinstate the bug.
+    std::vector<int> labels;
+    if (params.diarize_cluster_threshold_explicit) {
+        labels = crispasr_agglomerative_cluster(embeddings, n_emb, d, thr, max_spk);
+    } else {
+        core_spectral::SpeakerEstimate est;
+        labels = core_spectral::cluster_speakers(embeddings.data(), n_emb, d, /*min_speakers=*/1, max_spk,
+                                                 /*num_speakers=*/params.diarize_num_speakers, &est);
+        if (std::getenv("CRISPASR_DIARIZE_DEBUG"))
+            fprintf(stderr, "crispasr[diarize]: n_emb=%d dim=%d -> k=%d (%s, cos_p10=%.4f, pca=%d)\n", n_emb, d,
+                    est.best_k, est.reason, est.cosine_sim_p10, est.pca_dim);
+    }
 
     // Rewrite segment speakers from clustering output. Segments that
     // couldn't be embedded (too short) keep their existing pyannote-
     // local label as a best-effort fallback.
+    int n_clusters = 0;
     for (size_t k = 0; k < embed_idx.size(); k++) {
         const int spk = labels[k];
         if (spk < 0)
             continue;
+        n_clusters = std::max(n_clusters, spk + 1);
         segs[embed_idx[k]].speaker = "(speaker " + std::to_string(spk) + ") ";
     }
+
+    if (out_clusters) {
+        out_clusters->seg_idx = std::move(embed_idx);
+        out_clusters->embeddings = std::move(embeddings);
+        out_clusters->labels = std::move(labels);
+        out_clusters->dim = d;
+        out_clusters->n_clusters = n_clusters;
+    }
+}
+
+int crispasr_identify_speaker_clusters(std::vector<crispasr_segment>& segs, const CrispasrClusterEmbeddings& ce,
+                                       const struct speaker_db* db, float threshold, bool no_prints) {
+    if (!ce.valid() || !db || speaker_db_count(db) <= 0)
+        return 0;
+
+    const auto centroids = crispasr_cluster_centroids(ce.embeddings, ce.labels, (int)ce.seg_idx.size(), ce.dim);
+    if ((int)centroids.size() < ce.n_clusters * ce.dim)
+        return 0;
+
+    int n_named = 0;
+    for (int c = 0; c < ce.n_clusters; c++) {
+        float score = 0.0f;
+        const char* name = speaker_db_match(db, centroids.data() + (size_t)c * ce.dim, ce.dim, threshold, &score);
+        if (!name) {
+            if (!no_prints)
+                fprintf(stderr, "crispasr: speaker-db: cluster %d -> unmatched, keeps (speaker %d) (best cos %.2f)\n",
+                        c, c, score);
+            continue;
+        }
+        const std::string label = std::string("(") + name + ") ";
+        for (size_t k = 0; k < ce.seg_idx.size(); k++) {
+            if (ce.labels[k] == c)
+                segs[ce.seg_idx[k]].speaker = label;
+        }
+        if (!no_prints)
+            fprintf(stderr, "crispasr: speaker-db: cluster %d -> '%s' (cos %.2f)\n", c, name, score);
+        n_named++;
+    }
+    return n_named;
+}
+
+bool crispasr_identify_single_speaker(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                      CrispasrSpeakerEmbedder* embedder, const struct speaker_db* db, float threshold,
+                                      bool no_prints) {
+    if (!embedder || segs.empty() || !full_audio || n_samples <= 0 || !db || speaker_db_count(db) <= 0)
+        return false;
+
+    const int d = embedder->dim();
+    if (d <= 0)
+        return false;
+
+    std::vector<size_t> embed_idx;
+    std::vector<float> embeddings;
+    crispasr_embed_segments(segs, full_audio, n_samples, embedder, d, embed_idx, embeddings);
+    if (embed_idx.empty())
+        return false;
+
+    const std::vector<int> labels(embed_idx.size(), 0);
+    const auto centroid = crispasr_cluster_centroids(embeddings, labels, (int)embed_idx.size(), d);
+    if ((int)centroid.size() < d)
+        return false;
+
+    float score = 0.0f;
+    const char* name = speaker_db_match(db, centroid.data(), d, threshold, &score);
+    if (!name) {
+        if (!no_prints)
+            fprintf(stderr, "crispasr: speaker-db: recording unmatched, labels stay anonymous (best cos %.2f)\n",
+                    score);
+        return false;
+    }
+
+    // No diarization ran, so the recording is asserted single-speaker:
+    // the one matched identity labels every segment, short ones included.
+    const std::string label = std::string("(") + name + ") ";
+    for (auto& seg : segs)
+        seg.speaker = label;
+    if (!no_prints)
+        fprintf(stderr, "crispasr: speaker-db: recording -> '%s' (cos %.2f)\n", name, score);
+    return true;
 }

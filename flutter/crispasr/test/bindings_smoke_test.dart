@@ -8,7 +8,7 @@
 import 'dart:ffi';
 import 'dart:io';
 
-import 'package:crispasr/crispasr.dart' show LidMethod;
+import 'package:crispasr/crispasr.dart' show DiarizeMethod, LidMethod;
 import 'package:ffi/ffi.dart';
 import 'package:test/test.dart';
 
@@ -101,6 +101,8 @@ void main() {
       'crispasr_cache_dir_abi',
       'crispasr_registry_lookup_abi',
       'crispasr_registry_lookup_by_filename_abi',
+      'crispasr_registry_default_bundle_info_abi',
+      'crispasr_registry_default_bundle_artifact_abi',
       // Canonical C-ABI version symbol (was `crispasr_dart_helpers_version`
       // before the file moved to `src/crispasr_c_api.cpp`).
       'crispasr_c_api_version',
@@ -319,6 +321,22 @@ void main() {
     expect(LidMethod.ecapa.index, 3);
     expect(LidMethod.values.length, 4,
         reason: 'extending LidMethod without bumping the C-side enum '
+            'will silently drop the new variant');
+  });
+
+  test('DiarizeMethod enum indexes match the C-side CrispasrDiarizeMethod', () {
+    // diarizeSegments dispatches on `method.index`; the C side's
+    // `enum class CrispasrDiarizeMethod` hard-codes Energy=0, Xcorr=1,
+    // VadTurns=2, Pyannote=3, FoxNose=4 (see src/crispasr_diarize.h).
+    // Same trap as LidMethod above: a reorder or mid-enum insertion
+    // silently routes calls to the wrong diarizer (#332).
+    expect(DiarizeMethod.energy.index, 0);
+    expect(DiarizeMethod.xcorr.index, 1);
+    expect(DiarizeMethod.vadTurns.index, 2);
+    expect(DiarizeMethod.pyannote.index, 3);
+    expect(DiarizeMethod.foxNose.index, 4);
+    expect(DiarizeMethod.values.length, 5,
+        reason: 'extending DiarizeMethod without bumping the C-side enum '
             'will silently drop the new variant');
   });
 }

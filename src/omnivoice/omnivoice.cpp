@@ -23,6 +23,9 @@
 #include "voice-design.h"
 
 #include "core/audio_resample.h"
+#include "core/crispasr_env.h"
+#include "core/omnivoice_instruct.h"
+#include "core/omnivoice_lang.h"
 #include "core/wav_reader.h"
 
 #include <atomic>
@@ -404,7 +407,12 @@ enum ov_status ov_synthesize_codes(struct ov_context * ov,
 
     try {
         const std::string text(params->text ? params->text : "");
-        const std::string lang(params->lang ? params->lang : "");
+        const std::string raw_lang(params->lang ? params->lang : "");
+        std::string lang;
+        if (!pipeline_tts_resolve_language(text, raw_lang, &lang)) {
+            ov_set_error("ov_synthesize_codes: failed to resolve target language");
+            return OV_STATUS_INVALID_PARAMS;
+        }
         std::string ref_text(params->ref_text ? params->ref_text : "");
         if (params->preprocess_prompt && !ref_text.empty()) {
             ref_text = add_punctuation(ref_text);
@@ -424,16 +432,16 @@ enum ov_status ov_synthesize_codes(struct ov_context * ov,
         mg_cfg.position_temperature = params->mg_position_temperature;
         mg_cfg.class_temperature    = params->mg_class_temperature;
         mg_cfg.seed                 = params->mg_seed;
-        if (const char * e = std::getenv("OMNIVOICE_GUIDANCE")) {
+        if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_GUIDANCE")) {
             mg_cfg.guidance_scale = (float) std::atof(e);
         }
-        if (const char * e = std::getenv("OMNIVOICE_POS_TEMP")) {
+        if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_POS_TEMP")) {
             mg_cfg.position_temperature = (float) std::atof(e);
         }
-        if (const char * e = std::getenv("OMNIVOICE_CLASS_TEMP")) {
+        if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_CLASS_TEMP")) {
             mg_cfg.class_temperature = (float) std::atof(e);
         }
-        if (const char * e = std::getenv("OMNIVOICE_NUM_STEPS")) {
+        if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_NUM_STEPS")) {
             const int n = std::atoi(e);
             if (n > 0) {
                 mg_cfg.num_step = n;
@@ -767,7 +775,17 @@ int omnivoice_set_language(struct omnivoice_context * ctx, const char * lang) {
     if (!ctx) {
         return -1;
     }
-    ctx->language = lang ? lang : "";
+
+    const std::string requested = lang ? lang : "";
+    const auto resolved = core_omnivoice_lang::resolve(requested);
+    ctx->language = resolved.id;
+    if (resolved.status == core_omnivoice_lang::Status::unrecognized) {
+        const std::string hint = core_omnivoice_lang::suggest(requested);
+        std::fprintf(stderr, "crispasr[omnivoice]: language '%s' is unsupported%s%s; using language-agnostic synthesis\n",
+                     requested.c_str(), hint.empty() ? "" : " (did you mean '",
+                     hint.empty() ? "" : (hint + "')").c_str());
+        return -2;
+    }
     return 0;
 }
 
@@ -775,7 +793,16 @@ int omnivoice_set_instruct(struct omnivoice_context * ctx, const char * instruct
     if (!ctx) {
         return -1;
     }
-    ctx->instruct = instruct ? instruct : "";
+
+    const std::string requested = instruct ? instruct : "";
+    const core_omnivoice_instruct::Parsed parsed = core_omnivoice_instruct::parse(requested);
+    if (parsed.status != core_omnivoice_instruct::Status::ok &&
+        parsed.status != core_omnivoice_instruct::Status::cleared) {
+        std::fprintf(stderr, "crispasr[omnivoice]: %s\n", parsed.error.c_str());
+        ctx->instruct.clear();
+        return -2;
+    }
+    ctx->instruct = requested;
     return 0;
 }
 
@@ -794,6 +821,14 @@ int omnivoice_set_num_steps(struct omnivoice_context * ctx, int num_steps) {
     if (num_steps > 0) {
         ctx->num_steps = num_steps;
     }
+    return 0;
+}
+
+int omnivoice_set_seed(struct omnivoice_context * ctx, uint64_t seed) {
+    if (!ctx) {
+        return -1;
+    }
+    ctx->seed = seed;
     return 0;
 }
 
@@ -887,12 +922,12 @@ void omnivoice_set_n_threads(struct omnivoice_context * ctx, int n_threads) {
     }
 }
 
-int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_path) {
-    if (!ctx || !ctx->ov || !ref_gguf_path || !*ref_gguf_path) {
+int ov_encode_diff(struct ov_context * ov, const char * ref_gguf_path) {
+    if (!ov || !ref_gguf_path || !*ref_gguf_path) {
         return -1;
     }
-    if (!ctx->ov->codec_loaded) {
-        ov_set_error("omnivoice_encode_diff: codec not loaded");
+    if (!ov->codec_loaded) {
+        ov_set_error("ov_encode_diff: codec not loaded");
         return -1;
     }
 
@@ -905,7 +940,7 @@ int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_
         if (ref) {
             gguf_free(ref);
         }
-        ov_set_error("omnivoice_encode_diff: cannot open '%s'", ref_gguf_path);
+        ov_set_error("ov_encode_diff: cannot open '%s'", ref_gguf_path);
         return -1;
     }
 
@@ -914,12 +949,12 @@ int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_
     if (!wav_t || !code_t || wav_t->type != GGML_TYPE_F32) {
         gguf_free(ref);
         ggml_free(ref_ctx);
-        ov_set_error("omnivoice_encode_diff: archive needs F32 input_wav24k and codes tensors");
+        ov_set_error("ov_encode_diff: archive needs F32 input_wav24k and codes tensors");
         return -1;
     }
 
     const int n_samples = (int) ggml_nelements(wav_t);
-    std::vector<int32_t> mine = pipeline_codec_encode(&ctx->ov->pc, (const float *) wav_t->data, n_samples);
+    std::vector<int32_t> mine = pipeline_codec_encode(&ov->pc, (const float *) wav_t->data, n_samples);
     const size_t n_ref = ggml_nelements(code_t);
     std::vector<int32_t> expected(n_ref);
     if (code_t->type == GGML_TYPE_I32) {
@@ -932,7 +967,7 @@ int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_
     } else {
         gguf_free(ref);
         ggml_free(ref_ctx);
-        ov_set_error("omnivoice_encode_diff: unsupported codes tensor type");
+        ov_set_error("ov_encode_diff: unsupported codes tensor type");
         return -1;
     }
 
@@ -947,10 +982,14 @@ int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_
     gguf_free(ref);
     ggml_free(ref_ctx);
     if (!pass) {
-        ov_set_error("omnivoice_encode_diff: generated codes differ from '%s'", ref_gguf_path);
+        ov_set_error("ov_encode_diff: generated codes differ from '%s'", ref_gguf_path);
         return -1;
     }
     return 0;
+}
+
+int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_path) {
+    return ctx && ctx->ov ? ov_encode_diff(ctx->ov, ref_gguf_path) : -1;
 }
 
 }  // extern "C"

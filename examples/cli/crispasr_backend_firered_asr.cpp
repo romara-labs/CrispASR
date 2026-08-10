@@ -9,6 +9,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
+#include "core/ngram_loop_fix.h" // core_ngram::fix_loops (PLAN.md §W1b)
 
 class FireredAsrBackend : public CrispasrBackend {
 public:
@@ -39,7 +41,7 @@ public:
         firered_asr_context_params cp = firered_asr_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("FIRERED_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_FIRERED_BENCH"))
             cp.verbosity = 2;
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 3;
@@ -123,6 +125,30 @@ public:
         }
 
         firered_asr_result_free(r);
+
+        // PLAN.md §W1b: this adapter had NO core_ngram::fix_loops. The only
+        // guard was the decode-time core_repeat::tail_is_repetition break in
+        // firered_asr.cpp, which is wired into the beam_size==1 branch only —
+        // so a beam run had nothing at all, and even a greedy run keeps
+        // whatever residue the break stopped at. firered is Mandarin + 20+
+        // Chinese dialects, i.e. exactly the script the collapse was blind to
+        // until §W1 gave it a code-point path.
+        {
+            std::vector<std::string> tok_texts;
+            tok_texts.reserve(seg.tokens.size());
+            for (const auto& t : seg.tokens)
+                tok_texts.push_back(t.text);
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(tok_texts);
+            if (keep.size() < seg.tokens.size()) {
+                std::vector<crispasr_token> kept;
+                kept.reserve(keep.size());
+                for (int ki : keep)
+                    if (ki >= 0 && ki < (int)seg.tokens.size())
+                        kept.push_back(seg.tokens[(size_t)ki]);
+                seg.tokens = std::move(kept);
+            }
+            seg.text = core_ngram::fix_loops(seg.text);
+        }
 
         if (!seg.text.empty())
             out.push_back(std::move(seg));

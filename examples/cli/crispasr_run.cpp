@@ -19,8 +19,16 @@
 #include "crispasr_mic_cli.h"
 #include "crispasr_speaker.h"
 #include "crispasr_popen.h"
+#include "crispasr_beats_cli.h"
+#include "crispasr_chords_cli.h"
+#include "crispasr_tab_cli.h"
+#include "crispasr_piano_cli.h"
+#include "crispasr_pitch_cli.h"
+#include "crispasr_separate_cli.h"
 #include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
+#include "crispasr_strict.h"          // #311: shared strict-pipeline reqs (also used by the server)
+#include "crispasr_phonemes_policy.h" // #316: who can be driven by phonemes
 #include "crispasr_punctuation_policy.h"
 #include "crispasr_punc_loader.h"
 #include "crispasr_truecase_loader.h"
@@ -32,6 +40,7 @@
 #include "crispasr_lid.h" // crispasr_lid_free_cache()
 #include "crispasr_diarize_cli.h"
 #include "crispasr_speaker_embedder.h"
+#include "tiron_link.h"
 #include "crispasr_mem.h"
 #include "crispasr_stream_finalize.h"
 #include "crispasr_stream_partial_decode.h"
@@ -45,18 +54,26 @@
 #include "titanet.h"
 #include "speaker_db.h"
 
+#include "core/audio_window.h"
 #include "core/crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
-#include "crispasr_watermark.h"
+#include "crispasr_consent_record.h"
+#include "crispasr_voice_clone_policy.h"
+#include "crispasr_voice_provenance.h"
+#include "core/crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
-#include "crispasr_wav_writer.h"
+#include "crispasr_watermark_stats.h"
+#include "core/crispasr_wav_writer.h"
+#include "core/segment_hygiene.h" // PLAN.md §W2/§W5/§W6 opt-in segment cleanup
 #include "crispasr_mp3_writer.h"  // MP3 output via in-tree glint encoder
 #include "crispasr_aac_writer.h"  // AAC-LC (ADTS) output via in-tree glint encoder
+#include "crispasr_mp4_writer.h"  // AAC/Opus-in-MP4 muxer (C2PA-capable container)
 #include "crispasr_opus_writer.h" // Ogg Opus output via in-tree glint encoder
 #include "common-crispasr.h"      // read_audio_data
 
 #include <algorithm>
+#include <regex>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -68,8 +85,10 @@
 #include <fcntl.h>
 #include <io.h>
 #endif
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -91,6 +110,89 @@ static std::string crispasr_resolve_watermark_model(const whisper_params& params
     return params.watermark_model;
 }
 
+// True if the container implied by `out_path` will carry a C2PA manifest under
+// the current build and CRISPASR_NO_C2PA_REMUX setting. WAV/MP3/M4A/MP4 always
+// can; raw ADTS .aac / Ogg .opus can only when remux to MP4 is enabled (the
+// default). When C2PA is compiled out (CRISPASR_NO_C2PA_NATIVE and no c2pa-rs)
+// nothing carries it. Used to keep the CLI watertight: when this is false the
+// audio watermark is the only robust AI mark, so --no-watermark must not strip
+// it (see crispasr_wm_dispatch::set_forced). Must mirror the container decision
+// in crispasr_write_synth_audio below.
+static bool crispasr_output_carries_c2pa(const std::string& out_path, bool no_c2pa = false) {
+    if (no_c2pa)
+        return false; // C2PA signing disabled (--no-c2pa) ⇒ watermark is the only floor
+    if (out_path.empty())
+        return false; // no container (e.g. raw PCM --tts-stream) ⇒ no manifest
+#if defined(CRISPASR_HAVE_C2PA) || !defined(CRISPASR_NO_C2PA_NATIVE)
+    auto ends_ci = [&](const char* suf) {
+        const size_t n = std::strlen(suf);
+        if (out_path.size() < n)
+            return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char)out_path[out_path.size() - n + i]) != std::tolower((unsigned char)suf[i]))
+                return false;
+        return true;
+    };
+    const bool is_aac = ends_ci(".aac");
+    const bool is_opus = ends_ci(".opus") || ends_ci(".ogg");
+    if (is_aac || is_opus)
+        return std::getenv("CRISPASR_NO_C2PA_REMUX") == nullptr; // raw container ⇒ no manifest
+    return true; // wav/mp3/m4a/mp4 (and the wav default) all carry a manifest
+#else
+    (void)out_path;
+    return false;
+#endif
+}
+
+// Watertight-CLI guarantee: no CLI output path may ever emit a fully unmarked
+// AI file/stream. If `out_path` can't carry a C2PA manifest, force the audio
+// watermark on (overriding --no-watermark / CRISPASR_NO_WATERMARK) so at least
+// one robust machine-readable mark remains. Call once, after set_disabled(), and
+// before the watermark embed for that output. Pass an empty path for --tts-stream.
+static void crispasr_enforce_cli_watermark_floor(const std::string& out_path, const whisper_params& params) {
+    const bool carries = crispasr_output_carries_c2pa(out_path, params.tts_no_c2pa);
+    crispasr_wm_dispatch::set_forced(!carries);
+    if (!carries && (params.tts_no_watermark || std::getenv("CRISPASR_NO_WATERMARK") != nullptr)) {
+        fprintf(stderr,
+                "crispasr: note: '%s' can't carry a C2PA manifest, so --no-watermark is "
+                "overridden — the audio watermark is kept so the output stays marked as "
+                "AI-generated. Use a C2PA-capable container (WAV/MP3/M4A/MP4, the default) "
+                "to allow --no-watermark.\n",
+                out_path.empty() ? "<pcm-stream>" : out_path.c_str());
+    }
+}
+
+// Enforce the marking-responsibility attestation (hard-refuse policy, #294
+// follow-up). Any provenance opt-out (--no-watermark / --no-spoken-disclaimer)
+// requires an explicit --accept-marking-responsibility, mirroring the voice-clone
+// --i-have-rights gate. Returns 0 if OK, or an exit code to hard-refuse. Emits a
+// [MARKING] audit line (parallel to [CONSENT]) when an opt-out is honored.
+static int crispasr_check_marking_attestation(const whisper_params& params) {
+    const char* which = params.tts_no_watermark           ? "--no-watermark"
+                        : params.tts_no_spoken_disclaimer ? "--no-spoken-disclaimer"
+                        : params.tts_no_c2pa              ? "--no-c2pa"
+                                                          : nullptr;
+    if (!which)
+        return 0; // no opt-out requested → nothing to attest
+    if (!params.tts_marking_responsibility_accepted) {
+        fprintf(stderr,
+                "crispasr: error: %s requires --accept-marking-responsibility.\n"
+                "  Disabling AI-content provenance marking shifts the marking/disclosure\n"
+                "  duty to you, the operator. By passing --accept-marking-responsibility\n"
+                "  you affirm you accept that responsibility for this output.\n"
+                "  Usage: crispasr --tts \"text\" %s --accept-marking-responsibility\n",
+                which, which);
+        return 12;
+    }
+    std::time_t t = std::time(nullptr);
+    char ts[64];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+    fprintf(stderr, "[MARKING] ts=%s no_watermark=%s no_spoken_disclaimer=%s no_c2pa=%s attestation=\"%s\"\n", ts,
+            params.tts_no_watermark ? "yes" : "no", params.tts_no_spoken_disclaimer ? "yes" : "no",
+            params.tts_no_c2pa ? "yes" : "no", params.tts_marking_attestation.c_str());
+    return 0;
+}
+
 // Serialize synthesized (TTS/S2S) float32 PCM to `out_path` — WAV by
 // default, MP3 or AAC-LC/ADTS (in-tree glint encoder) when the path
 // ends in .mp3 / .aac. All carry AI-provenance metadata (WAV LIST/INFO
@@ -100,7 +202,7 @@ static std::string crispasr_resolve_watermark_model(const whisper_params& params
 // (caller's exit code).
 static int crispasr_write_synth_audio(const std::string& out_path, const float* pcm, int n_samples, int sample_rate,
                                       const std::string& c2pa_cert, const std::string& c2pa_key,
-                                      const std::string& cache_dir = "") {
+                                      const std::string& cache_dir = "", bool sign_c2pa = true) {
     auto has_ext = [&](const char* lo, const char* up) {
         return out_path.size() >= 4 &&
                (out_path.compare(out_path.size() - 4, 4, lo) == 0 || out_path.compare(out_path.size() - 4, 4, up) == 0);
@@ -118,18 +220,64 @@ static int crispasr_write_synth_audio(const std::string& out_path, const float* 
     };
     const bool is_mp3 = has_ext(".mp3", ".MP3");
     const bool is_aac = has_ext(".aac", ".AAC");
+    const bool is_m4a = has_ext(".m4a", ".M4A");
+    const bool is_mp4 = has_ext(".mp4", ".MP4");
     const bool is_opus = ends_with_ci(".opus") || ends_with_ci(".ogg");
+
+    // Native C2PA embeds in ISO-BMFF (MP4) but NOT raw ADTS AAC / Ogg Opus. So
+    // when C2PA is active we mux AAC/Opus into an MP4 container (.m4a / .mp4) so
+    // the output carries a real manifest, not just the watermark. Explicit
+    // .m4a/.mp4 output is always AAC-in-MP4. Set CRISPASR_NO_C2PA_REMUX=1 to keep
+    // the raw .aac/.opus container (watermark + metadata provenance only).
+#if defined(CRISPASR_HAVE_C2PA) || !defined(CRISPASR_NO_C2PA_NATIVE)
+    const bool c2pa_active = std::getenv("CRISPASR_NO_C2PA_REMUX") == nullptr;
+#else
+    const bool c2pa_active = false;
+#endif
+    const bool opus_mp4 = is_opus && c2pa_active;
+    const bool aac_mp4 = is_m4a || is_mp4 || (is_aac && c2pa_active);
+
+    std::string path = out_path; // may change extension when upgrading a raw container
     std::string blob;
-    // C2PA MIME/format for this container ("" = c2pa can't embed here, e.g. AAC
-    // (ADTS) / Opus (Ogg) — those get watermark + tag provenance only).
-    const char* c2pa_fmt = is_mp3 ? "audio/mpeg" : (is_aac || is_opus) ? "" : "audio/wav";
-    if (is_mp3 || is_aac || is_opus) {
-        const char* codec = is_mp3 ? "MP3" : (is_aac ? "AAC" : "Opus");
-        blob = is_mp3   ? crispasr_make_mp3(pcm, n_samples, sample_rate)
-               : is_aac ? crispasr_make_aac(pcm, n_samples, sample_rate)
-                        : crispasr_make_opus(pcm, n_samples, sample_rate);
+    const char* c2pa_fmt = "audio/wav";
+    if (aac_mp4 || opus_mp4) {
+        blob = opus_mp4 ? crispasr_mp4::make_opus_mp4(pcm, n_samples, sample_rate)
+                        : crispasr_mp4::make_aac_mp4(pcm, n_samples, sample_rate);
         if (blob.empty()) {
-            fprintf(stderr, "crispasr: error: %s encoding failed for '%s'\n", codec, out_path.c_str());
+            fprintf(stderr, "crispasr: error: MP4 encoding failed for '%s'\n", path.c_str());
+            return 16;
+        }
+        c2pa_fmt = "audio/mp4";
+        if (is_aac) {
+            path.erase(path.size() - 4); // drop ".aac"
+            path += ".m4a";
+            fprintf(stderr,
+                    "crispasr: note: emitting '%s' (AAC-in-MP4) so C2PA can embed a manifest; "
+                    "set CRISPASR_NO_C2PA_REMUX=1 for raw .aac\n",
+                    path.c_str());
+        } else if (is_opus) {
+            if (const size_t dot = path.find_last_of('.'); dot != std::string::npos)
+                path.erase(dot); // drop the extension
+            path += ".mp4";
+            fprintf(stderr,
+                    "crispasr: note: emitting '%s' (Opus-in-MP4) so C2PA can embed a manifest; "
+                    "set CRISPASR_NO_C2PA_REMUX=1 for raw .opus\n",
+                    path.c_str());
+        }
+    } else if (is_mp3) {
+        blob = crispasr_make_mp3(pcm, n_samples, sample_rate);
+        c2pa_fmt = "audio/mpeg";
+        if (blob.empty()) {
+            fprintf(stderr, "crispasr: error: MP3 encoding failed for '%s'\n", path.c_str());
+            return 16;
+        }
+    } else if (is_aac || is_opus) {
+        // C2PA remux opted out — raw ADTS/Ogg, watermark + tag only.
+        blob =
+            is_aac ? crispasr_make_aac(pcm, n_samples, sample_rate) : crispasr_make_opus(pcm, n_samples, sample_rate);
+        c2pa_fmt = "";
+        if (blob.empty()) {
+            fprintf(stderr, "crispasr: error: %s encoding failed for '%s'\n", is_aac ? "AAC" : "Opus", path.c_str());
             return 16;
         }
     } else {
@@ -141,17 +289,25 @@ static int crispasr_write_synth_audio(const std::string& out_path, const float* 
     // compiled in) an auto-provisioned per-install self-signed cert. Signing is
     // best-effort provenance: any failure or an unembeddable container leaves
     // the watermark + metadata tag as the provenance signal.
-    if (c2pa_fmt && *c2pa_fmt) {
+    if (!sign_c2pa) {
+        // --no-c2pa: attested provenance opt-out. On the CLI the audio watermark
+        // is forced on (crispasr_enforce_cli_watermark_floor) so output is still
+        // marked; here we simply skip embedding the manifest.
+        fprintf(stderr,
+                "crispasr: note: C2PA signing disabled (--no-c2pa); '%s' written without a manifest "
+                "(audio watermark still applied)\n",
+                path.c_str());
+    } else if (c2pa_fmt && *c2pa_fmt) {
         crispasr_c2pa_sign_auto(blob, c2pa_fmt, c2pa_cert, c2pa_key, cache_dir);
     } else if (!c2pa_cert.empty() || !c2pa_key.empty()) {
         fprintf(stderr,
                 "crispasr: note: C2PA cannot embed a manifest in this container; "
                 "'%s' written unsigned (watermark + metadata provenance still applied)\n",
-                out_path.c_str());
+                path.c_str());
     }
-    FILE* fout = fopen(out_path.c_str(), "wb");
+    FILE* fout = fopen(path.c_str(), "wb");
     if (!fout) {
-        fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
+        fprintf(stderr, "crispasr: error: cannot write '%s'\n", path.c_str());
         return 16;
     }
     fwrite(blob.data(), 1, blob.size(), fout);
@@ -282,6 +438,17 @@ int warn_unsupported(const CrispasrBackend& backend, const whisper_params& p) {
 }
 
 // Merge individual-slice results into a flat list preserving time order.
+//
+// PLAN.md §W2/§W5/§W6 hygiene runs HERE rather than at the four
+// `merge_segments(...)` call sites, because this is the structural chokepoint
+// they all pass through — a hand-patched list of call sites is the exact shape
+// of bug the copies-in-sync guard was built for (it covered 1 of 14 files for
+// months). Every stage is opt-in via env; with none set this is byte-for-byte
+// the old function.
+//
+// It also has to be here rather than per-slice: §W5 collapses runs of
+// near-identical segments, and a loop that straddles a slice boundary is only
+// visible once the slices are flat.
 std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_segment>>&& per_slice,
                                              const std::vector<crispasr_audio_slice>& /*slices*/) {
     std::vector<crispasr_segment> out;
@@ -293,7 +460,51 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
         for (auto& s : v)
             out.push_back(std::move(s));
     }
-    return out;
+
+    const auto hy = core_seg_hygiene::config_from_env();
+    if (!core_seg_hygiene::any_enabled(hy))
+        return out;
+
+    std::vector<core_seg_hygiene::Seg> view;
+    view.reserve(out.size());
+    for (const auto& s : out)
+        view.push_back({s.text, s.t0, s.t1, 0.0f, false});
+
+    int dropped = 0;
+    const auto kept = core_seg_hygiene::apply_all(view, hy, &dropped);
+
+    // Map each surviving view back onto its original, so every field the view
+    // does not carry (speaker, words, tokens, chunk_id) is preserved rather
+    // than reconstructed. apply_all only removes segments and rewrites
+    // text/t1 — it never reorders — so a forward scan on t0 is exact.
+    //
+    // Resolve the whole mapping BEFORE touching `out`: the bail-out below
+    // returns `out` unchanged, which is only true if nothing has been moved
+    // out of it yet. Matching first, mutating second, keeps that promise.
+    std::vector<size_t> pick;
+    pick.reserve(kept.size());
+    size_t oi = 0;
+    for (const auto& k : kept) {
+        while (oi < out.size() && out[oi].t0 != k.t0)
+            oi++;
+        if (oi >= out.size())
+            break;
+        pick.push_back(oi++);
+    }
+    if (pick.size() != kept.size()) // unmatched view: never silently lose content
+        return out;
+
+    std::vector<crispasr_segment> res;
+    res.reserve(pick.size());
+    for (size_t i = 0; i < pick.size(); i++) {
+        crispasr_segment seg = std::move(out[pick[i]]);
+        seg.text = kept[i].text;
+        seg.t1 = kept[i].t1; // a merged run spans to the end of its last member
+        res.push_back(std::move(seg));
+    }
+    if (dropped > 0 || res.size() != out.size())
+        fprintf(stderr, "crispasr[hygiene]: %zu -> %zu segments (%d dropped)\n", out.size(), res.size(), dropped);
+    return res;
 }
 
 bool crispasr_words_have_positive_span(const std::vector<crispasr_word>& words) {
@@ -341,6 +552,152 @@ static void crispasr_warn_if_empty_transcript(bool have_text, const std::vector<
 // it's an uncontended lock when n_processors == 1.
 std::mutex g_stdout_mutex;
 
+// Global post-merge speaker stages (issue #266). Runs on the FULL merged
+// segment list so anonymous clustering and named identification share one
+// foundation and one execution order:
+//   global embedding clustering  ->  per-cluster speaker-db matching
+// Identification is a closed-roster confirmation: the db is narrowed to
+// params.expect_speakers before any match, each cluster is matched
+// independently against the claimed profiles, unmatched clusters keep
+// their anonymous "(speaker N) " labels, and nothing runs after this
+// stage that could overwrite a matched name.
+// Tiron (#295): thin CLI wrapper over the library-hoisted linker
+// (crispasr_tiron_link_transcript) so the CLI, session C-ABI, and server all
+// share ONE implementation. Returns true if the segments were tiron output.
+static bool crispasr_apply_tiron_linking(std::vector<crispasr_segment>& segs, const std::vector<float>& samples,
+                                         const whisper_params& params) {
+    // Cross-window linking is opt-in (auto-downloads a speaker embedder); without
+    // a diarization flag keep the model's window-local <|speakerN|> markers.
+    const bool want_link = params.diarize || !params.diarize_embedder.empty();
+    const std::string spec = want_link ? (!params.diarize_embedder.empty() ? params.diarize_embedder : "auto") : "";
+
+    std::vector<TironTranscriptSeg> ts(segs.size());
+    for (size_t i = 0; i < segs.size(); i++) {
+        ts[i].text = segs[i].text;
+        ts[i].t0_cs = segs[i].t0;
+        ts[i].t1_cs = segs[i].t1;
+        ts[i].chunk_id = segs[i].chunk_id;
+    }
+    const int n_spk = crispasr_tiron_link_transcript(ts, samples.data(), (int)samples.size(), spec.c_str(),
+                                                     params.n_threads, params.cache_dir.c_str());
+    if (n_spk < 0)
+        return false; // not tiron
+
+    // Copy the (stripped) text + labels back; drop bare-marker segments.
+    std::vector<crispasr_segment> kept;
+    kept.reserve(segs.size());
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (ts[i].drop)
+            continue;
+        segs[i].text = ts[i].text;
+        if (!ts[i].speaker.empty())
+            segs[i].speaker = ts[i].speaker;
+        kept.push_back(std::move(segs[i]));
+    }
+    if (n_spk > 0)
+        segs = std::move(kept);
+    if (n_spk > 0 && !params.no_prints) {
+        fprintf(stderr, "crispasr[tiron]: linked across windows -> %d meeting-level speakers\n", n_spk);
+    }
+    return true;
+}
+
+static void crispasr_apply_global_speaker_stages(std::vector<crispasr_segment>& all_segs,
+                                                 const std::vector<float>& samples, const whisper_params& params) {
+    // Tiron output uses the model's own local speaker markers; link them into
+    // global SPEAKER_NN and skip the generic pyannote/embedding diarizer.
+    if (crispasr_apply_tiron_linking(all_segs, samples, params))
+        return;
+
+    // #324: foxnose runs here, once, over the whole audio — this is what makes
+    // its speaker numbering consistent across slices.
+    if (crispasr_apply_foxnose_global(all_segs, samples, params))
+        return; // foxnose owns the labels; the TitaNet remap must not re-run
+
+    const bool want_cluster =
+        params.diarize && !params.diarize_embedder.empty() && !params.diarize_embedder_is_foxnose();
+    const bool want_ident = !params.speaker_db.empty() && params.speaker_db_consent && !params.expect_speakers.empty();
+    if ((!want_cluster && !want_ident) || all_segs.empty() || samples.empty())
+        return;
+
+    // One embedder for both stages. Identification without --diarize uses
+    // the enrollment-side model (--titanet-model / auto) so dimensions
+    // match the enrolled profiles.
+    const std::string spec = !params.diarize_embedder.empty()
+                                 ? params.diarize_embedder
+                                 : (!params.titanet_model.empty() ? params.titanet_model : std::string("auto"));
+    auto embedder = crispasr_make_speaker_embedder(spec, params.n_threads, params.cache_dir);
+    if (!embedder)
+        return;
+
+    CrispasrClusterEmbeddings clusters;
+    if (want_cluster)
+        crispasr_remap_speakers_via_embeddings(all_segs, samples.data(), (int)samples.size(), embedder.get(), params,
+                                               want_ident ? &clusters : nullptr);
+
+    if (!want_ident)
+        return;
+
+    speaker_db* db = speaker_db_load(params.speaker_db.c_str());
+    if (!db)
+        return;
+    const int claimed = speaker_db_retain(db, params.expect_speakers.c_str());
+    if (claimed <= 0) {
+        fprintf(stderr,
+                "crispasr: speaker-db: none of the claimed speakers (--expect-speakers '%s') are\n"
+                "  enrolled in '%s' — all labels stay anonymous\n",
+                params.expect_speakers.c_str(), params.speaker_db.c_str());
+    } else if (want_cluster) {
+        crispasr_identify_speaker_clusters(all_segs, clusters, db, params.speaker_threshold, params.no_prints);
+    } else {
+        crispasr_identify_single_speaker(all_segs, samples.data(), (int)samples.size(), embedder.get(), db,
+                                         params.speaker_threshold, params.no_prints);
+    }
+    speaker_db_free(db);
+}
+
+// ── Issue #311: strict pipeline requirements ──────────────────────────────
+// Distinct non-zero exit codes so integrations can tell which required stage
+// failed without parsing stderr.
+enum crispasr_strict_rc {
+    CRISPASR_STRICT_RC_VAD = 30,   // required VAD model failed to load / run
+    CRISPASR_STRICT_RC_WORDS = 31, // required word timestamps missing on a non-empty segment
+    CRISPASR_STRICT_RC_PUNC = 32,  // required punctuation model failed to load
+};
+
+// `crispasr_strict_reqs` + `crispasr_compute_strict_reqs` + the missing-word-ts
+// counter are shared with the HTTP server via crispasr_strict.h (included above)
+// so the two front-ends can't drift.
+
+// Post-hoc word-timestamp gate: when required, (a) an explicitly requested
+// aligner must have loaded (case 4 — caught even if native word timestamps
+// would otherwise mask the failure), and (b) every segment with non-empty text
+// must carry word timestamps, native or aligned (case 5). Returns 0 when
+// satisfied / not required, else CRISPASR_STRICT_RC_WORDS after printing a
+// machine-stable error. Empty/no-speech transcripts pass vacuously.
+static int crispasr_strict_check_words(const std::vector<crispasr_segment>& segs, bool required,
+                                       const std::string& fname_inp, bool aligner_load_failed = false) {
+    if (!required)
+        return 0;
+    if (aligner_load_failed) {
+        fprintf(stderr,
+                "crispasr: error: the explicitly requested forced aligner failed to load for '%s' "
+                "(--require-word-timestamps/--strict-pipeline).\n",
+                fname_inp.c_str());
+        return CRISPASR_STRICT_RC_WORDS;
+    }
+    int missing = crispasr_count_missing_word_ts(segs);
+    if (missing > 0) {
+        fprintf(stderr,
+                "crispasr: error: word timestamps required (--require-word-timestamps/--strict-pipeline) but %d "
+                "non-empty segment(s) in '%s' have none — the aligner failed to load/produce words, or the backend "
+                "emitted no native word timing.\n",
+                missing, fname_inp.c_str());
+        return CRISPASR_STRICT_RC_WORDS;
+    }
+    return 0;
+}
+
 // Process a single input file end-to-end with the given backend instance.
 // Pulled out of the main loop so the parallel-processors path can call
 // it from worker threads. Each call holds its own audio buffers + segment
@@ -351,6 +708,10 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                       whisper_params params, fireredpunc_context* punc_ctx = nullptr,
                       truecaser_context* tc_ctx = nullptr, pcs_context* pcs_ctx = nullptr,
                       truecaser_crf_context* tc_crf_ctx = nullptr, truecaser_lstm_context* tc_lstm_ctx = nullptr) {
+    // #311: OR-accumulated across every forced-aligner call in this file so the
+    // strict word-timestamp gate can fail an explicitly-requested aligner that
+    // could not load, even when the backend's native word timing masks it.
+    bool aligner_load_failed = false;
     // Resolve the output path base for this input. -of FNAME (passed via
     // `fname_out`) wins; otherwise we strip the audio extension off the
     // input path and append the format extension. Mirrors the whisper
@@ -363,10 +724,41 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     std::vector<float> samples;
     std::vector<std::vector<float>> stereo;
     const bool want_stereo = params.diarize;
-    if (!read_audio_data(fname_inp, samples, stereo, want_stereo)) {
+    // Load audio at the backend's native rate (e.g. 24 kHz for kyutai/vibevoice)
+    // to avoid the lossy 16k→Nk double-resample path (issue #263).
+    const int native_rate = backend.input_sample_rate();
+    if (!read_audio_data(fname_inp, samples, stereo, want_stereo, native_rate)) {
         fprintf(stderr, "crispasr: error: failed to read audio '%s'\n", fname_inp.c_str());
         return 20;
     }
+
+    // #91: --offset-t MS / --duration MS — restrict processing to a time
+    // window of the input. The whisper backend honours these via its own
+    // seek (cli.cpp); this dispatcher (all other backends) had no window
+    // support, so apply it to the raw decoded PCM here — VAD, chunking and
+    // transcription then all operate on the window, and reported timestamps
+    // are shifted back by the offset at emit time (process_slice below) so
+    // they stay in original-audio time.
+    {
+        const auto win =
+            core_audio_window::compute((int64_t)samples.size(), params.offset_t_ms, params.duration_ms, native_rate);
+        if (win.active && win.past_end) {
+            fprintf(stderr, "crispasr: error: --offset-t %d ms is past the end of '%s' (%.1f s)\n", params.offset_t_ms,
+                    fname_inp.c_str(), (double)samples.size() / native_rate);
+            return 0;
+        }
+        if (win.active) {
+            core_audio_window::trim(samples, win);
+            for (auto& ch : stereo)
+                core_audio_window::trim(ch, win);
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: processing window [%.2f s, %.2f s) of '%s'\n",
+                        (double)win.start / native_rate, (double)(win.start + win.len) / native_rate,
+                        fname_inp.c_str());
+            }
+        }
+    }
+
     // When --verbose (-v) or CRISPASR_VERBOSE=1 is set, activate ALL
     // backend-specific debug/bench/verbose env vars. Only sets if not
     // already set, so explicit per-backend vars still take precedence.
@@ -396,7 +788,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
     crispasr_log_mem(params.verbose, "after audio decode");
     if (params.verbose) {
-        double dur = (double)samples.size() / 16000.0;
+        double dur = (double)samples.size() / (double)native_rate;
         double est = crispasr_estimate_mem_mb(dur, backend.name());
         fprintf(stderr, "crispasr[verbose]: audio %.1fs (%zu samples, %.1f MB PCM), est encoder mem ~%.0f MB\n", dur,
                 samples.size(), samples.size() * 4.0 / 1e6, est);
@@ -416,7 +808,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             have_stereo = false;
     }
 
-    constexpr int SR = 16000;
+    const int SR = native_rate;
     if (!params.no_prints) {
         fprintf(stderr, "crispasr: audio: %d samples (%.1f s) @ %d Hz, %d threads\n", (int)samples.size(),
                 (double)samples.size() / SR, SR, params.n_threads);
@@ -462,7 +854,8 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             db_dir = params.cache_dir.empty()
                          ? std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.cache/crispasr/speakers"
                          : params.cache_dir + "/speakers";
-        if (!speaker_db_enroll(db_dir.c_str(), params.enroll_speaker.c_str(), emb, dim)) {
+        if (!speaker_db_enroll(db_dir.c_str(), params.enroll_speaker.c_str(), emb, dim,
+                               /*consent_attested=*/params.speaker_db_consent)) {
             fprintf(stderr, "crispasr: error: failed to enroll speaker '%s'\n", params.enroll_speaker.c_str());
             return 24;
         }
@@ -470,11 +863,52 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     }
 
     // Optional language-identification pre-step.
-    const bool want_auto_lang = params.detect_language || params.language == "auto";
+    bool want_auto_lang = params.detect_language || params.language == "auto";
     const bool has_native_lid = (backend.capabilities() & CAP_LANGUAGE_DETECT) != 0;
     const bool lid_disabled = params.lid_backend == "off" || params.lid_backend == "none";
     crispasr_lid_info lid_info; // stored for JSON output
+
+    // #227: a monolingual backend (e.g. moonshine, English-only) can only emit
+    // one language, so on a plain `-l auto` transcription resolve it directly and
+    // skip external LID — no point downloading/running whisper-tiny to "detect"
+    // a language the backend can't change. An explicit --detect-language still
+    // runs LID: the user is asking for the audio's actual language, which the
+    // backend's sole output language may not reflect.
+    if (const char* sole_lang = backend.sole_language();
+        sole_lang && params.language == "auto" && !params.detect_language) {
+        params.language = sole_lang;
+        if (params.source_lang.empty())
+            params.source_lang = sole_lang;
+        want_auto_lang = false;
+        if (!params.no_prints)
+            fprintf(stderr, "crispasr: %s is %s-only — skipping language detection\n", backend.name(), sole_lang);
+    }
+
+    // Some backends can identify the language with the model already loaded
+    // (cohere probes its own supported set). Prefer that over an external
+    // detector when the user did not name one explicitly: it downloads
+    // nothing, and — the real reason — it can only return a language the
+    // backend actually supports, whereas whisper-tiny LID knows 99 and will
+    // happily hand back one the model was never trained on.
+    bool probed_ok = false;
     if (want_auto_lang && !has_native_lid && !lid_disabled) {
+        crispasr_lid_result probe;
+        if (crispasr_backend_probe_language(backend, samples.data(), (int)samples.size(), params, probe)) {
+            lid_info.lang_code = probe.lang_code;
+            lid_info.confidence = probe.confidence;
+            lid_info.source = probe.source;
+            params.language = probe.lang_code;
+            if (params.source_lang.empty())
+                params.source_lang = probe.lang_code;
+            probed_ok = true;
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: LID -> language = '%s' (%s, p=%.3f)\n", probe.lang_code.c_str(),
+                        probe.source.c_str(), probe.confidence);
+            }
+        }
+    }
+
+    if (want_auto_lang && !has_native_lid && !lid_disabled && !probed_ok) {
         crispasr_lid_result lid;
         if (crispasr_detect_language_cli(samples.data(), (int)samples.size(), params, lid)) {
             lid_info.lang_code = lid.lang_code;
@@ -540,7 +974,10 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // encoder quality loss from reduced context is inherent to the
     // architecture.
     int effective_chunk_seconds = params.chunk_seconds;
-    if (!params.chunk_seconds_explicit && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
+    if (!params.chunk_seconds_explicit && (backend.capabilities() & (CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING))) {
+        // A backend that streams unbounded input OR chunks internally (tiron's
+        // fixed 30 s windows) gets the whole clip; slicing it here would
+        // double-chunk / duplicate overlap.
         effective_chunk_seconds = 0;
     }
     // Issue #257: a backend that chunks internally (parakeet / canary — full-
@@ -579,7 +1016,16 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // (e.g. parakeet-ja) auto-enable VAD for long audio so the model
     // gets silence-bounded segments matching its training distribution.
     const bool is_long_audio = (int)samples.size() > kLongAudioFallbackChunkSeconds * SR;
-    if (backend.prefers_vad() && is_long_audio && !params.vad && params.vad_model.empty() &&
+    // A backend that declares its OWN safe single-pass window (vad_slice_cap_seconds
+    // — 12 s for parakeet-ja, #89) has to be protected at that window, not at the
+    // unrelated 30 s global long-audio constant. Otherwise every JA clip in the
+    // 12–30 s gap is "not long audio", skips the auto-VAD safeguard, and runs one
+    // full pass past the encoder's trained range: the 14 s JA regression fixture
+    // degraded to a hallucinated leading + trailing sentence and misread digits
+    // (`6対3` → `0失点`). With VAD it reproduces the pinned reference core exactly.
+    const int backend_window_s = backend.vad_slice_cap_seconds();
+    const bool exceeds_backend_window = backend_window_s > 0 && (int)samples.size() > backend_window_s * SR;
+    if (backend.prefers_vad() && (is_long_audio || exceeds_backend_window) && !params.vad && params.vad_model.empty() &&
         !params.chunk_seconds_explicit) {
         params.vad = true;
         if (!params.no_prints) {
@@ -629,10 +1075,119 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         (slice_chunk_seconds == 0 || slice_chunk_seconds > vad_cap)) {
         slice_chunk_seconds = vad_cap;
     }
-    const auto slices =
-        crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, slice_chunk_seconds, params);
+    // Issue #227: when --vad-import is given, read the segment boundaries from
+    // the JSON file instead of running VAD (skips the VAD model entirely). This
+    // lets the same audio be transcribed by several backends while paying the
+    // VAD cost only once (--vad-export writes the boundaries on the first run).
+    std::vector<crispasr_audio_slice> slices;
+    if (!params.vad_import_file.empty()) {
+        std::ifstream in(params.vad_import_file, std::ios::binary);
+        if (!in) {
+            fprintf(stderr, "crispasr: error: cannot open --vad-import file '%s'\n", params.vad_import_file.c_str());
+            return 1;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        int imported_sr = 0;
+        float imported_chunk = 0.0f;
+        bool imported_raw = false;
+        if (!crispasr_parse_vad_slices(ss.str(), slices, &imported_sr, &imported_chunk, &imported_raw)) {
+            fprintf(stderr, "crispasr: error: malformed --vad-import file '%s'\n", params.vad_import_file.c_str());
+            return 1;
+        }
+        // Issue #227: the slices are CHUNK boundaries, so they are only valid
+        // for the chunk length that produced them. Reusing a 30 s export under
+        // --chunk-seconds 5 would silently transcribe with the wrong chunking,
+        // which looks like a model regression rather than a stale file.
+        // Compare the REQUESTED chunk length on both sides, not the effective
+        // one. --vad-export runs before backend init (it needs no ASR model),
+        // so it cannot know the effective value -- that depends on the
+        // backend's CAP_UNBOUNDED_INPUT and vad_slice_cap_seconds. Comparing
+        // export-requested against import-EFFECTIVE is apples to oranges: with
+        // whisper + --vad the effective value collapses to 0, so a correct
+        // reuse was rejected with the advice "run with --chunk-seconds 0.00".
+        const float requested_chunk = params.chunk_seconds > 0 ? (float)params.chunk_seconds : 30.0f;
+        if (!imported_raw && crispasr_vad_chunk_mismatch(imported_chunk, requested_chunk)) {
+            // WARN, do not fail, unless asked. The boundaries are still usable
+            // -- they are just chunked differently than this run requested --
+            // and turning a working --vad-import script into rc=1 on upgrade is
+            // a worse outcome than a wrong chunk size the user can see.
+            fprintf(stderr,
+                    "crispasr: %s: --vad-import file was exported at --chunk-seconds %.2f but this run requests "
+                    "%.2f.\n"
+                    "       The exported boundaries are chunk boundaries, not raw speech segments, so the "
+                    "chunking will not match this run.\n"
+                    "       Re-export at %.2f, or pass --chunk-seconds %.2f, to make them agree.\n",
+                    params.vad_import_strict ? "error" : "warning", imported_chunk, requested_chunk, requested_chunk,
+                    imported_chunk);
+            if (params.vad_import_strict)
+                return 1;
+        }
+
+        // Boundaries are sample indices at the rate they were computed. If that
+        // differs from this run's rate, rescale to keep them aligned in time
+        // (t0_cs/t1_cs are rate-independent centiseconds — left as-is).
+        if (imported_sr > 0 && imported_sr != SR) {
+            fprintf(stderr, "crispasr: --vad-import boundaries were computed at %d Hz, this run is %d Hz — rescaling\n",
+                    imported_sr, SR);
+            for (auto& s : slices) {
+                s.start = (int)((int64_t)s.start * SR / imported_sr);
+                s.end = (int)((int64_t)s.end * SR / imported_sr);
+            }
+        }
+        // Clamp to the current buffer and drop empty/invalid slices so a stale
+        // or hand-edited file can't index out of bounds.
+        const int n_samp = (int)samples.size();
+        std::vector<crispasr_audio_slice> clean;
+        clean.reserve(slices.size());
+        for (auto& s : slices) {
+            if (s.start < 0)
+                s.start = 0;
+            if (s.end > n_samp)
+                s.end = n_samp;
+            if (s.end > s.start)
+                clean.push_back(s);
+        }
+        const size_t dropped = slices.size() - clean.size();
+        slices = std::move(clean);
+
+        // A raw-segment export carries no chunking, so re-chunk it for THIS run
+        // exactly as a fresh VAD pass would (issue #227). This is what makes a
+        // raw export reusable across runs with different chunk lengths without
+        // ever tripping the mismatch gate: the segments are the model output,
+        // the chunking is re-derived here.
+        if (imported_raw && slice_chunk_seconds > 0) {
+            slices = crispasr_rechunk_slices(slices, samples.data(), (int)samples.size(), SR, slice_chunk_seconds);
+        }
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr: imported %zu %s from '%s'%s\n", slices.size(),
+                    imported_raw ? "VAD speech segment(s)" : "chunk boundary/boundaries",
+                    params.vad_import_file.c_str(),
+                    dropped ? (" (" + std::to_string(dropped) + " out-of-range dropped)").c_str() : "");
+        }
+    } else {
+        bool vad_load_failed = false;
+        slices = crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, slice_chunk_seconds, params,
+                                               &vad_load_failed);
+        // #311: a required VAD model that failed to load must fail the run
+        // *before* the slices.empty() no-speech path below silently succeeds
+        // (and before any energy-chunk fallback is used for transcription).
+        if (vad_load_failed && crispasr_compute_strict_reqs(params).vad) {
+            fprintf(stderr,
+                    "crispasr: error: required VAD model '%s' failed to load for '%s' "
+                    "(--require-vad/--strict-pipeline) — refusing to fall back to fixed chunking.\n",
+                    params.vad_model.c_str(), fname_inp.c_str());
+            return CRISPASR_STRICT_RC_VAD;
+        }
+    }
+
+    // NOTE: --vad-export is now handled before backend init
+    // (crispasr_run_backend, issue #227). This site is no longer reached
+    // when vad_export_file is set.
 
     if (slices.empty()) {
+        // A loaded VAD that found no speech is a valid, successful outcome
+        // (#311 acceptance case 2) — distinct from the load failure above.
         fprintf(stderr, "crispasr: warning: no speech detected in '%s'\n", fname_inp.c_str());
         return 0;
     }
@@ -701,8 +1256,10 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 const int s = (int)((double)seg.t0 / 100.0 * SR);
                 const int e = std::min((int)samples.size(), (int)((double)seg.t1 / 100.0 * SR));
                 if (e > s) {
+                    bool load_failed = false;
                     auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + s, e - s, seg.t0,
-                                                    params.n_threads);
+                                                    params.n_threads, &load_failed);
+                    aligner_load_failed = aligner_load_failed || load_failed;
                     if (crispasr_words_have_positive_span(words)) {
                         seg.t0 = words.front().t0;
                         seg.t1 = words.back().t1;
@@ -712,11 +1269,61 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             }
         }
 
+        // Issue #267: diarize the stitched result AFTER alignment so
+        // word timestamps are available for speaker-turn splitting.
+        // The stitched path transcribes all VAD segments as one buffer,
+        // so diarize operates on the whole result with original-audio
+        // timestamps already remapped.
+        if (params.diarize && !segs.empty()) {
+            // Build caches over the full original audio (same logic as
+            // the per-slice path below, but scoped to the stitched block
+            // since it returns before the per-slice declarations).
+            CrispasrSherpaCache stitch_sherpa_cache;
+            if (params.diarize_method == "sherpa" || params.diarize_method == "sherpa-onnx" ||
+                params.diarize_method == "ecapa") {
+                const float* full = samples.data();
+                std::vector<float> mono_buf;
+                if (have_stereo && !stereo[0].empty() && !stereo[1].empty()) {
+                    const size_t n = std::min(stereo[0].size(), stereo[1].size());
+                    mono_buf.resize(n);
+                    for (size_t mi = 0; mi < n; mi++)
+                        mono_buf[mi] = 0.5f * (stereo[0][mi] + stereo[1][mi]);
+                    full = mono_buf.data();
+                }
+                if (!crispasr_compute_sherpa_cache(full, (int)samples.size(), params, stitch_sherpa_cache))
+                    stitch_sherpa_cache = {};
+            }
+            CrispasrPyannoteCache stitch_pyannote_cache;
+            if (params.diarize_method == "pyannote") {
+                const float* full = samples.data();
+                std::vector<float> mono_buf;
+                if (have_stereo && !stereo[0].empty() && !stereo[1].empty()) {
+                    const size_t n = std::min(stereo[0].size(), stereo[1].size());
+                    mono_buf.resize(n);
+                    for (size_t mi = 0; mi < n; mi++)
+                        mono_buf[mi] = 0.5f * (stereo[0][mi] + stereo[1][mi]);
+                    full = mono_buf.data();
+                }
+                if (!crispasr_compute_pyannote_cache(full, (int)samples.size(), params, stitch_pyannote_cache))
+                    stitch_pyannote_cache = {};
+            }
+            const CrispasrPyannoteCache* pya_ptr = stitch_pyannote_cache.valid() ? &stitch_pyannote_cache : nullptr;
+            const CrispasrSherpaCache* shp_ptr = stitch_sherpa_cache.valid() ? &stitch_sherpa_cache : nullptr;
+            if (have_stereo) {
+                crispasr_apply_diarize(stereo[0], stereo[1], /*is_stereo=*/true, 0, segs, params, pya_ptr, shp_ptr);
+            } else {
+                crispasr_apply_diarize(samples, samples, /*is_stereo=*/false, 0, segs, params, pya_ptr, shp_ptr);
+            }
+        }
+
         // Fall through to the shared output path below by wrapping
         // the stitched result into per_slice / all_segs.
         std::vector<std::vector<crispasr_segment>> stitched_per_slice(1);
         stitched_per_slice[0] = std::move(segs);
         auto all_segs = merge_segments(std::move(stitched_per_slice), slices);
+
+        // Issue #267: global speaker stages for the stitched path too.
+        crispasr_apply_global_speaker_stages(all_segs, samples, params);
 
         apply_punc_model(punc_ctx, all_segs);
         apply_truecase_model(tc_ctx, all_segs);
@@ -746,7 +1353,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             crispasr_print_stdout(disp, show_timestamps);
             if (params.show_alternatives)
                 crispasr_print_alternatives(all_segs, params.n_alternatives);
+            else if (params.print_confidence)
+                crispasr_print_confidence(all_segs);
         }
+        // #311: fail before writing output files if required word timestamps are missing.
+        if (int rc = crispasr_strict_check_words(all_segs, crispasr_compute_strict_reqs(params).words, fname_inp,
+                                                 aligner_load_failed))
+            return rc;
         if (params.output_txt)
             crispasr_write_txt(out_path(".txt"), disp);
         if (params.output_srt)
@@ -808,6 +1421,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             sherpa_cache = {};
         }
     }
+
+    // #324: foxnose diarizes in ONE global pass after transcription so speaker
+    // identities are consistent across slices; the per-slice path stands down.
+    if (params.diarize && params.diarize_embedder_is_foxnose())
+        const_cast<whisper_params&>(params).diarize_foxnose_global = true;
 
     CrispasrPyannoteCache pyannote_cache;
     if (params.diarize && params.diarize_method == "pyannote" && !samples.empty()) {
@@ -958,6 +1576,41 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 crispasr_gap_fill_slice(be, params, samples.data(), (int)samples.size(), SR, sl, segs);
         }
 
+        // Issue #267: run external CTC alignment BEFORE diarization so
+        // that word timestamps are available when the diarize step splits
+        // segments at speaker-turn boundaries. Previously diarize ran
+        // first and could only assign a dominant speaker to whole ASR
+        // segments; now it can split at word boundaries.
+        //
+        // Issue #62: --force-aligner bypasses CAP gate + already-aligned skip.
+        const bool want_align =
+            !params.aligner_model.empty() && ((backend.capabilities() & CAP_TIMESTAMPS_CTC) || params.force_aligner);
+        if (params.verbose) {
+            fprintf(stderr, "crispasr[verbose]: align[slice]: aligner='%s' caps_ctc=%d force=%d -> want=%d\n",
+                    params.aligner_model.c_str(), !!(backend.capabilities() & CAP_TIMESTAMPS_CTC),
+                    params.force_aligner ? 1 : 0, want_align ? 1 : 0);
+        }
+        if (want_align) {
+            for (auto& seg : segs) {
+                if (!seg.words.empty() && !params.force_aligner)
+                    continue;
+                bool load_failed = false;
+                auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + sl.start,
+                                                sl.end - sl.start, sl.t0_cs, params.n_threads, &load_failed);
+                aligner_load_failed = aligner_load_failed || load_failed;
+                if (crispasr_words_have_positive_span(words)) {
+                    seg.t0 = words.front().t0;
+                    seg.t1 = words.back().t1;
+                    seg.words = std::move(words);
+                }
+            }
+        }
+
+        // Issue #267: diarize AFTER alignment so word timestamps (native
+        // or externally aligned) are available for speaker-turn splitting.
+        // When no words are present (no aligner, no native timestamps),
+        // the diarize code falls back to segment-level dominant-speaker
+        // assignment — the same behaviour as before.
         if (params.diarize && !segs.empty()) {
             const CrispasrPyannoteCache* pya_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
             const CrispasrSherpaCache* shp_ptr = sherpa_cache.valid() ? &sherpa_cache : nullptr;
@@ -972,71 +1625,42 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             }
         }
 
-        // Speaker identification: match diarized speakers against profile DB.
-        // Also supports standalone speaker ID (without diarize) when --speaker-db is set.
-        //
-        // Biometric consent gate (1:N named identification, GDPR Art. 9):
-        // skip entirely unless the deployer affirmed --speaker-db-consent.
-        // Warn once (the slice loop may run on multiple workers).
-        if (!params.speaker_db.empty() && !params.speaker_db_consent) {
-            static std::once_flag spk_consent_warn;
-            std::call_once(spk_consent_warn, [] {
-                fprintf(stderr, "crispasr: --speaker-db ignored: 1:N matching against named voiceprints is\n"
-                                "  biometric identification (GDPR Art. 9). Re-run with --speaker-db-consent to\n"
-                                "  affirm consent + a lawful basis. For privacy-clean stable speaker labels\n"
-                                "  that identify no one, use --diarize-speakers instead.\n");
-            });
-        }
-        if (!params.speaker_db.empty() && params.speaker_db_consent && !segs.empty()) {
-            static titanet_context* spk_ctx = nullptr;
-            static speaker_db* spk_db = nullptr;
-            if (!spk_ctx) {
-                std::string tm = params.titanet_model;
-                if (tm.empty() || tm == "auto")
-                    tm = crispasr_resolve_model("auto", "titanet", params.no_prints, params.cache_dir,
-                                                params.auto_download, "");
-                if (!tm.empty())
-                    spk_ctx = titanet_init(tm.c_str(), params.n_threads);
-            }
-            if (!spk_db)
-                spk_db = speaker_db_load(params.speaker_db.c_str());
-            if (spk_ctx && spk_db && speaker_db_count(spk_db) > 0) {
-                // Extract embedding for the whole slice and match
-                float emb[192];
-                int dim = titanet_embed(spk_ctx, samples.data() + sl.start, sl.end - sl.start, emb);
-                if (dim > 0) {
-                    float score = 0;
-                    const char* name = speaker_db_match(spk_db, emb, dim, params.speaker_threshold, &score);
-                    if (name) {
-                        std::string label = std::string("(") + name + ") ";
-                        for (auto& seg : segs)
-                            seg.speaker = label;
-                    }
+        // NOTE (issue #266): speaker-db identification no longer runs here.
+        // One embedding per dispatcher slice assigned a single identity to
+        // every segment in the slice — wrong for mixed-speaker slices — and
+        // global clustering later overwrote the names anyway. Identification
+        // now runs once, post-merge, per global speaker cluster: see
+        // crispasr_apply_global_speaker_stages().
+
+        // #91: shift reported timestamps back into original-audio time when
+        // a --offset-t window trimmed the buffer (segs are in window-relative
+        // centiseconds at this point). This is the single choke point every
+        // output surface reads, and it re-runs cleanly on the file-output
+        // redo pass since each process_slice call rebuilds segs from scratch.
+        if (params.offset_t_ms > 0) {
+            const int64_t off_cs = (int64_t)params.offset_t_ms / 10;
+            for (auto& seg : segs) {
+                seg.t0 += off_cs;
+                seg.t1 += off_cs;
+                for (auto& w : seg.words) {
+                    w.t0 += off_cs;
+                    w.t1 += off_cs;
+                }
+                for (auto& tok : seg.tokens) {
+                    if (tok.t0 >= 0)
+                        tok.t0 += off_cs;
+                    if (tok.t1 >= 0)
+                        tok.t1 += off_cs;
                 }
             }
         }
 
-        // Issue #62: --force-aligner bypasses CAP gate + already-aligned skip.
-        const bool want_align =
-            !params.aligner_model.empty() && ((backend.capabilities() & CAP_TIMESTAMPS_CTC) || params.force_aligner);
-        if (params.verbose) {
-            fprintf(stderr, "crispasr[verbose]: align[slice]: aligner='%s' caps_ctc=%d force=%d -> want=%d\n",
-                    params.aligner_model.c_str(), !!(backend.capabilities() & CAP_TIMESTAMPS_CTC),
-                    params.force_aligner ? 1 : 0, want_align ? 1 : 0);
-        }
-        if (want_align) {
-            for (auto& seg : segs) {
-                if (!seg.words.empty() && !params.force_aligner)
-                    continue;
-                auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + sl.start,
-                                                sl.end - sl.start, sl.t0_cs, params.n_threads);
-                if (crispasr_words_have_positive_span(words)) {
-                    seg.t0 = words.front().t0;
-                    seg.t1 = words.back().t1;
-                    seg.words = std::move(words);
-                }
-            }
-        }
+        // #292: stamp the chunk index so a consumer can tell that "(speaker N)"
+        // labels are chunk-local and restart per chunk. Only when there is more
+        // than one chunk — a single-pass run leaves chunk_id at its -1 default.
+        if (slices.size() > 1)
+            for (auto& seg : segs)
+                seg.chunk_id = (int)i;
 
         per_slice[i] = std::move(segs);
 
@@ -1195,17 +1819,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 per_slice_redo[i] = std::move(per_slice[i]);
             }
             auto all_segs = merge_segments(std::move(per_slice_redo), slices);
-            // Mirror the embedding-based remap from the sequential
-            // path above so file outputs in the parallel/output-redo
-            // path get globally stable speaker IDs too (#107 P3).
-            if (params.diarize && !params.diarize_embedder.empty() && !all_segs.empty() && !samples.empty()) {
-                auto embedder =
-                    crispasr_make_speaker_embedder(params.diarize_embedder, params.n_threads, params.cache_dir);
-                if (embedder) {
-                    crispasr_remap_speakers_via_embeddings(all_segs, samples.data(), (int)samples.size(),
-                                                           embedder.get(), params);
-                }
-            }
+            // Mirror the global speaker stages from the sequential path
+            // below so file outputs in the parallel/output-redo path get
+            // globally stable speaker IDs (#107 P3) and cluster-level
+            // named identification (#266) too.
+            crispasr_apply_global_speaker_stages(all_segs, samples, params);
             apply_punc_model(punc_ctx, all_segs);
             apply_truecase_model(tc_ctx, all_segs);
             apply_truecase_crf_model(tc_crf_ctx, all_segs);
@@ -1217,6 +1835,10 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                     crispasr_strip_punctuation(seg);
             auto disp_all = crispasr_make_disp_segments(all_segs, params.max_len, params.split_on_punct);
 
+            // #311: fail before writing output files if required word timestamps are missing.
+            if (int rc = crispasr_strict_check_words(all_segs, crispasr_compute_strict_reqs(params).words, fname_inp,
+                                                     aligner_load_failed))
+                return rc;
             if (params.output_txt)
                 crispasr_write_txt(out_path(".txt"), disp_all);
             if (params.output_srt)
@@ -1267,18 +1889,12 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
     auto all_segs = merge_segments(std::move(per_slice), slices);
 
-    // Optional embedding-based clustering (#107 P3). When the user
-    // supplied --diarize-embedder, anchor speaker IDs globally across
-    // all slices by embedding each finalized segment and clustering
-    // on cosine similarity. The pluggable embedder dispatches to
-    // TitaNet today; future adapters drop in via the same factory.
-    if (params.diarize && !params.diarize_embedder.empty() && !all_segs.empty() && !samples.empty()) {
-        auto embedder = crispasr_make_speaker_embedder(params.diarize_embedder, params.n_threads, params.cache_dir);
-        if (embedder) {
-            crispasr_remap_speakers_via_embeddings(all_segs, samples.data(), (int)samples.size(), embedder.get(),
-                                                   params);
-        }
-    }
+    // Global speaker stages (#107 P3 clustering + #266 identification):
+    // embedding-based clustering anchors speaker IDs globally across all
+    // slices, then the optional speaker-db stage matches each CLUSTER
+    // against the claimed roster. Runs after merge so both label writers
+    // share one foundation and matched names can't be overwritten.
+    crispasr_apply_global_speaker_stages(all_segs, samples, params);
 
     apply_punc_model(punc_ctx, all_segs);
     apply_truecase_model(tc_ctx, all_segs);
@@ -1312,9 +1928,15 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         crispasr_print_stdout(disp, show_timestamps);
         if (params.show_alternatives) {
             crispasr_print_alternatives(all_segs, params.n_alternatives);
+        } else if (params.print_confidence) {
+            crispasr_print_confidence(all_segs);
         }
     }
 
+    // #311: fail before writing output files if required word timestamps are missing.
+    if (int rc = crispasr_strict_check_words(all_segs, crispasr_compute_strict_reqs(params).words, fname_inp,
+                                             aligner_load_failed))
+        return rc;
     if (params.output_txt)
         crispasr_write_txt(out_path(".txt"), disp);
     if (params.output_srt)
@@ -1437,8 +2059,179 @@ static int tada_run_aligner_pipeline(const whisper_params& params, const std::st
     return rc;
 }
 
+// Append a streamed segment's transcript text, prefixing its native
+// diarization label when the backend produced one. `seg.speaker` is empty
+// for non-diarizing backends (so this is a no-op there) and carries the
+// "(Speaker N) " form for native diarizers (moss-diarize, vibevoice) —
+// matching the file-mode `prefix_speaker()` convention in crispasr_output.cpp.
+// NOTE: like all streamed diarize labels, the speaker ordinals are
+// window/utterance-local — "Speaker 1" in one step is not guaranteed to be
+// the same physical voice as "Speaker 1" in a later step (no cross-window
+// clustering runs in streaming mode; see docs/streaming.md).
+static inline void crispasr_stream_append_seg(std::string& out, const crispasr_segment& s) {
+    out += s.speaker;
+    out += s.text;
+}
+
+// Distinct non-empty speaker label shared by every segment, or "" when the
+// segments carry no label or disagree (a mid-utterance speaker turn). Used to
+// attach a structured "speaker" field to a single-speaker `final` JSON event
+// without inlining labels into `text` (the JSON convention keeps `text` clean).
+static std::string crispasr_stream_common_speaker(const std::vector<crispasr_segment>& segs) {
+    std::string spk;
+    for (const auto& s : segs) {
+        if (s.speaker.empty())
+            continue;
+        if (spk.empty())
+            spk = s.speaker;
+        else if (spk != s.speaker)
+            return "";
+    }
+    // Trim a trailing space carried by the "(Speaker N) " form.
+    while (!spk.empty() && (spk.back() == ' ' || spk.back() == '\t'))
+        spk.pop_back();
+    return spk;
+}
+
 int crispasr_run_backend(const whisper_params& params_in) {
     whisper_params params = params_in;
+
+    // #311: validate strict-pipeline flag combinations up front. A per-stage
+    // --require-* whose stage was never requested is a configuration error
+    // (usage exit 2), distinct from a stage that ran and failed (exit 30-32).
+    // --require-word-timestamps has no precondition — it is a property of the
+    // output (native word timing OR the forced aligner satisfy it).
+    // #316: --tts-phonemes needs a backend with a phonemes-in entry point (see
+    // crispasr_phonemes_policy.h). Checked HERE, before any model is loaded,
+    // because it depends only on the requested backend name — failing after a
+    // multi-second load would be rude, and it made the refusal untestable
+    // without that backend's weights on disk.
+    if (!params.tts_phonemes.empty() && !crispasr_phonemes_policy::backend_supports(params.backend)) {
+        fprintf(stderr, "crispasr: error: %s\n", crispasr_phonemes_policy::unsupported_message(params.backend).c_str());
+        return 2;
+    }
+
+    if (params.require_vad && !(params.vad || !params.vad_model.empty())) {
+        fprintf(stderr, "crispasr: error: --require-vad needs VAD to be requested (pass --vad or --vad-model/-vm).\n");
+        return 2;
+    }
+    if (params.require_punctuation && params.punc_model.empty()) {
+        fprintf(stderr, "crispasr: error: --require-punctuation needs a punctuation model (pass --punc-model).\n");
+        return 2;
+    }
+
+    // §248: source separation is its own task (audio out, not transcripts).
+    // Route to the separation dispatcher before any transcribe backend is built.
+    if (params.separate)
+        return crispasr_run_separate(params);
+
+    // Chord recognition is its own task (a chord timeline out, not
+    // transcripts). Same early-dispatch rule as --separate.
+    if (params.chords)
+        return crispasr_run_chords(params);
+
+    // Guitar tablature is its own task (a per-frame string/fret score grid out,
+    // not transcripts). Same early-dispatch rule as --chords.
+    if (params.tab)
+        return crispasr_run_tab(params);
+
+    // Piano transcription is its own task (note EVENTS out, not transcripts).
+    // Same early-dispatch rule as --chords.
+    if (params.piano)
+        return crispasr_run_piano(params);
+
+    // Beat tracking is its own task (a beat/downbeat grid out, not
+    // transcripts). Same early-dispatch rule as --chords.
+    if (params.beats)
+        return crispasr_run_beats(params);
+
+    // Pitch (F0) is its own task too (pitch frames out, not transcripts).
+    // Same early-dispatch rule as --separate.
+    if (params.pitch)
+        return crispasr_run_pitch(params);
+
+    // ── Speaker-db policy gates (issue #266) ──────────────────────────────
+    // Named identification is recorded-file only, consent-gated, and a
+    // closed-roster confirmation. All three are hard invariants:
+    //  * never in streaming/live mode (a real-time identification path is
+    //    exactly what the EU AI Act's RBI regime restricts — Art. 5(1)(h));
+    //  * no consent affirmation, no biometric processing (GDPR Art. 9);
+    //  * no open 1:N scan — the deployer must claim WHO is present via
+    //    --expect-speakers; clusters match only against those profiles.
+    if (params.stream && (!params.speaker_db.empty() || !params.enroll_speaker.empty())) {
+        fprintf(stderr, "crispasr: error: --speaker-db/--enroll-speaker are not available in streaming mode.\n"
+                        "  Named speaker identification is restricted to recorded files (post-processing);\n"
+                        "  real-time identification is deliberately unsupported.\n");
+        return 26;
+    }
+    if (!params.speaker_db.empty() && params.enroll_speaker.empty()) {
+        if (!params.speaker_db_consent) {
+            fprintf(stderr, "crispasr: --speaker-db ignored: matching named voiceprints is biometric\n"
+                            "  identification (GDPR Art. 9). Re-run with --speaker-db-consent to affirm\n"
+                            "  consent + a lawful basis. For privacy-clean stable speaker labels that\n"
+                            "  identify no one, use --diarize-speakers instead.\n");
+            params.speaker_db.clear();
+        } else if (params.expect_speakers.empty()) {
+            fprintf(stderr, "crispasr: error: --speaker-db requires --expect-speakers \"NameA,NameB\".\n"
+                            "  Identification is a closed-roster confirmation of participants you assert are\n"
+                            "  present (and who consented at enrollment). An open \"who is this voice\" scan of\n"
+                            "  the whole database is deliberately unsupported: that would be 1:N remote\n"
+                            "  biometric identification (EU AI Act, Annex III 1(a)). Unmatched clusters keep\n"
+                            "  anonymous (speaker N) labels.\n");
+            return 27;
+        } else if (params.diarize && params.diarize_embedder.empty()) {
+            // Identification is defined per global speaker cluster, so
+            // --speaker-db with diarization implies the clustering
+            // embedder (same default as --diarize-speakers).
+            params.diarize_embedder = "auto";
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: --speaker-db with --diarize enables global speaker clustering "
+                                "(--diarize-embedder auto)\n");
+        }
+    }
+
+    // ── --print-speaker-identity: whose voice does this file produce? ─────
+    // Standalone verb, resolved with the SAME code the disclosure gate uses:
+    // the stamp inside the file first, then the researched legacy table. Runs
+    // before any backend/model resolution — it inspects a file, not a session.
+    //
+    // Exists so a script never has to restate a verdict. Anything that needs to
+    // know (the stamping driver, a packaging step, an operator asking "will
+    // this disclose?") asks the binary and gets the answer the runtime will
+    // actually act on, instead of keeping a third copy of the table that drifts.
+    //
+    // Prints one of real_person / synthetic / unknown on stdout. Exit 0 when
+    // the answer is established, 3 when it is unknown — so a shell driver can
+    // skip unknowns with `if crispasr --print-speaker-identity f; then ...`.
+    if (!params.print_speaker_identity_file.empty()) {
+        const std::string& path = params.print_speaker_identity_file;
+        // The stamp is authoritative wherever it exists; the tables are the
+        // legacy fallback for files published before it. Same strongest-duty
+        // combination the synthesis path applies, so this cannot report an
+        // answer weaker than the one that will be enforced.
+        const crispasr_voice::SpeakerIdentity stamped = crispasr_voice::read_model_speaker_identity(path);
+        const crispasr_voice::PackProvenance pack = crispasr_voice::read_pack_provenance(path);
+        // Both tables: this file may be a voice PACK or a MODEL, and the verb
+        // has no session to ask which. The model table keys on a backend name,
+        // so derive it from what the file declares about itself.
+        crispasr_voice::SpeakerIdentity table = crispasr_voice::identity_for_voice_pack(path);
+        if (table == crispasr_voice::SpeakerIdentity::Unknown) {
+            const std::string arch = crispasr_voice::read_gguf_architecture(path);
+            if (!arch.empty())
+                table = crispasr_voice::identity_for_model(crispasr_voice::backend_for_architecture(arch), path);
+        }
+        const crispasr_voice::SpeakerIdentity id = crispasr_voice::resolve_speaker_identity(
+            /*override=*/crispasr_voice::parse_speaker_identity(params.tts_speaker_identity),
+            /*pack=*/pack.identity == crispasr_voice::SpeakerIdentity::Unknown ? table : pack.identity,
+            /*backend=*/crispasr_voice::SpeakerIdentity::Unknown, stamped);
+        printf("%s\n", crispasr_voice::to_string(id));
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr: '%s' -> speaker_identity=%s (stamp=%s, table=%s)\n", path.c_str(),
+                    crispasr_voice::to_string(id), crispasr_voice::to_string(stamped),
+                    crispasr_voice::to_string(table));
+        }
+        return id == crispasr_voice::SpeakerIdentity::Unknown ? 3 : 0;
+    }
 
     // ── --detect-watermark: standalone watermark detection verb ───────────
     // Reads a WAV file, runs watermark detection, prints the result, exits.
@@ -1493,14 +2286,56 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         float confidence = crispasr_wm_dispatch::detect(pcm.data(), n_samples, (int)wav_sr);
 
+        const bool neural = crispasr_wm_dispatch::get_ctx() != nullptr;
+        const double dur_s = wav_sr > 0 ? (double)n_samples / (double)wav_sr : 0.0;
+
         fprintf(stdout, "File: %s\n", wav_path.c_str());
+        fprintf(stdout, "Detector: %s\n", neural ? "AudioSeal (neural)" : "spread-spectrum (built-in)");
+        fprintf(stdout, "Analysed: %.2f s\n", dur_s);
         fprintf(stdout, "Watermark confidence: %.4f\n", confidence);
-        if (confidence > 0.65f) {
-            fprintf(stdout, "Result: AI-GENERATED WATERMARK DETECTED\n");
-        } else if (confidence >= 0.4f) {
-            fprintf(stdout, "Result: UNCERTAIN\n");
+
+        if (neural) {
+            // AudioSeal returns a probability, not a bin-agreement fraction —
+            // the binomial null in crispasr_watermark_stats.h does not apply.
+            fprintf(stdout, "Result: %s\n",
+                    confidence > 0.5f ? "AI-GENERATED WATERMARK DETECTED"
+                                      : "No watermark detected (this does NOT mean the audio is human-made)");
         } else {
-            fprintf(stdout, "Result: No watermark detected\n");
+            // Spread-spectrum: the score is the fraction of CRISPASR_WATERMARK_NBINS
+            // pseudo-random bins agreeing with the embedder's sign pattern, so
+            // unwatermarked audio scores 0.5 on average — NOT 0. Report the exact
+            // probability of reaching this score by chance instead of a bare
+            // threshold: the old `> 0.65` bar is p = 0.055, i.e. it called roughly
+            // one in eighteen clean files watermarked, in the past tense.
+            if (crispasr_watermark_detect_uses_frames()) {
+                // Per-frame t + decoy specificity. The score is a calibrated
+                // confidence, not a bin count, so the binomial null does not
+                // apply and no p-value is printed — quoting one would invent an
+                // n that was never scored.
+                const auto verdict = crispasr_wm_stats::classify_frames(confidence);
+                fprintf(stdout, "Statistic: per-frame t + decoy specificity\n");
+                fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
+                if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 1.0) {
+                    fprintf(stdout,
+                            "Note: %.2f s is below the %d-frame minimum this statistic needs; it returns 0\n"
+                            "      rather than guess. A negative is not evidence the audio is human-made.\n",
+                            dur_s, crispasr_wm::kDetectMinFrames);
+                }
+            } else {
+                const double p = crispasr_wm_stats::p_value(confidence, CRISPASR_WATERMARK_NBINS);
+                const auto verdict = crispasr_wm_stats::classify(confidence, CRISPASR_WATERMARK_NBINS);
+                fprintf(stdout, "Statistic: bin-sign agreement (legacy)\n");
+                fprintf(stdout, "Chance of this score without a watermark: %.2g\n", p);
+                fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
+                if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 10.0) {
+                    fprintf(stdout,
+                            "Note: %.1f s is short for this detector — it averages spectra across frames, so\n"
+                            "      confidence grows with duration (measured: 69%% of 1 s clips vs 100%% of 10 s\n"
+                            "      clips clear the 0.65 bar). Unset CRISPASR_WATERMARK_DETECT to use the\n"
+                            "      per-frame statistic, which reads 97%% at 1 s with fewer false positives.\n",
+                            dur_s);
+                }
+            }
         }
 
         crispasr_wm_dispatch::shutdown();
@@ -1851,6 +2686,73 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // MUST STAY ABOVE crispasr_resolve_model_cli(): that call downloads the
+    // model, so leaving this below it made --vad-export fetch ggml-base.bin
+    // before exiting -- the standalone verb still required a network round trip
+    // and a model the run never used (issue #227, reported by AppleSheeple, who
+    // worked around it with `-m /dev/null`).
+    // Issue #227: VAD-export-only short circuit. --vad-export computes
+    // speech boundaries and writes them to a JSON file — no ASR model
+    // needed. The user can import the result on a second run with
+    // --vad-import. Loading the audio and running Silero VAD is cheap;
+    // loading an ASR backend is not, so we return before backend init.
+    if (!params.vad_export_file.empty()) {
+        int vad_rc = 0;
+        for (size_t fi = 0; fi < params.fname_inp.size(); fi++) {
+            const auto& fname = params.fname_inp[fi];
+            std::vector<float> samples;
+            std::vector<std::vector<float>> stereo_dummy;
+            if (!read_audio_data(fname, samples, stereo_dummy, false)) {
+                fprintf(stderr, "crispasr: error: cannot read audio '%s'\n", fname.c_str());
+                vad_rc = 20;
+                continue;
+            }
+            constexpr int SR = 16000;
+            // Raw export computes with chunk 0 so no post-split runs -- the
+            // result is merged VAD speech segments, independent of chunk length.
+            const float slice_chunk = params.vad_export_raw         ? 0.0f
+                                      : params.chunk_seconds > 0.0f ? params.chunk_seconds
+                                                                    : 30.0f;
+            bool export_vad_load_failed = false;
+            auto slices = crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, (int)slice_chunk,
+                                                        params, &export_vad_load_failed);
+            // #311 follow-up: --vad-export is a separate verb from the
+            // transcribe path, and only that path carried the strict check. A
+            // VAD model that failed to load here still wrote a file full of
+            // fixed chunk boundaries labelled as if VAD had produced them —
+            // and, with --strict-pipeline, still exited 0.
+            if (export_vad_load_failed && crispasr_compute_strict_reqs(params).vad) {
+                fprintf(stderr,
+                        "crispasr: error: required VAD model '%s' failed to load for '%s' "
+                        "(--require-vad/--strict-pipeline) — refusing to export fixed chunks as VAD output.\n",
+                        params.vad_model.c_str(), fname.c_str());
+                return CRISPASR_STRICT_RC_VAD;
+            }
+            // Multi-file: each input gets its own export path derived
+            // from the input name. Single-file: use the explicit path.
+            std::string export_path = params.vad_export_file;
+            if (params.fname_inp.size() > 1) {
+                export_path = crispasr_make_out_path(fname, ".vad.json");
+            }
+            std::ofstream out(export_path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                fprintf(stderr, "crispasr: warning: cannot write --vad-export file '%s'\n", export_path.c_str());
+                vad_rc = 1;
+            } else {
+                out << crispasr_serialize_vad_slices(slices, SR, slice_chunk, params.vad_export_raw);
+                if (!params.no_prints) {
+                    // Say which kind: they are NOT the same thing, and calling a
+                    // 30 s chunk a "VAD segment" is what made this confusing in
+                    // the first place (issue #227).
+                    fprintf(stderr, "crispasr: exported %zu %s to '%s'\n", slices.size(),
+                            params.vad_export_raw ? "VAD speech segment(s)" : "chunk boundary/boundaries",
+                            export_path.c_str());
+                }
+            }
+        }
+        return vad_rc;
+    }
+
     // Resolve "-m auto" via the model registry + curl/wget download.
     const std::string resolved = crispasr_resolve_model_cli(params.model, backend_name, params.no_prints,
                                                             params.cache_dir, params.auto_download, params.model_quant);
@@ -2022,7 +2924,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
             // Bake to a temp ref GGUF in the cache dir, keyed so repeat runs reuse it.
             std::string tmp = crispasr_cache::dir(params.cache_dir) + "/tada-inline-voice.gguf";
             if (tada_encoder_write_ref_gguf(tmp.c_str(), result, params.tts_ref_text.c_str(),
-                                            params.language.empty() ? nullptr : params.language.c_str()) != 0) {
+                                            params.language.empty() ? nullptr : params.language.c_str(),
+                                            /*cloned_from_recording=*/true,
+                                            params.tts_consent_attestation.c_str()) != 0) {
                 fprintf(stderr, "crispasr[tada-clone]: failed to write reference GGUF\n");
                 return 20;
             }
@@ -2040,7 +2944,18 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (!params.no_prints)
                 fprintf(stderr, "crispasr[tada-clone]: baked voice ref (%d tokens) → %s\n", result.n_tokens,
                         tmp.c_str());
+            // Remember the recording BEFORE the rewrite: consent was given for
+            // that file, so it is what the audit record hashes. The baked pack
+            // is derived and not byte-stable across runs.
+            params.tts_voice_source_recording = params.tts_voice;
             params.tts_voice = tmp; // backend init() now sees a .gguf reference
+            // The rewrite above erases the ONLY evidence this voice is a clone:
+            // the consent + spoken-disclosure gates below classify by suffix, so
+            // `--voice victim.wav` silently became a .gguf and stopped being a
+            // clone — no --i-have-rights demanded, no [CONSENT] line, no audible
+            // AI disclosure, on the flow docs/tts.md documents as the one-command
+            // clone. Remember it explicitly instead.
+            params.tts_voice_baked_from_wav = true;
         }
     }
 
@@ -2138,6 +3053,22 @@ int crispasr_run_backend(const whisper_params& params_in) {
             fprintf(stderr, "crispasr[%s]: requires --ref-text \"transcript of the audio\"\n", verb);
             return 20;
         }
+        // --make-ref extracts a reusable voiceprint from a person's recording —
+        // the clone itself, one step ahead of synthesis. It sat before the TTS
+        // block's consent gate and returned early, so it was the one way to build
+        // a clone with no attestation demanded anywhere. --align only emits word
+        // timestamps and stays ungated.
+        if (params.make_ref && !params.tts_voice_clone_consent) {
+            fprintf(stderr,
+                    "crispasr[make-ref]: building a voice reference requires the --i-have-rights flag.\n"
+                    "\n"
+                    "  --make-ref extracts a reusable voiceprint from '%s'. By passing\n"
+                    "  --i-have-rights you attest:\n"
+                    "  \"I have the consent of the speaker whose voice this clones,\n"
+                    "   or it is my own voice.\"\n",
+                    params.tts_voice.c_str());
+            return 17;
+        }
 
         const std::string out_path = params.make_ref_output.empty() ? "tada-ref-custom.gguf" : params.make_ref_output;
 
@@ -2187,6 +3118,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (fmt == "json") {
                 out = "[\n";
                 for (size_t i = 0; i < words.size(); i++) {
+                    // cppcheck-suppress containerOutOfBounds
                     double end = (i + 1 < words.size()) ? words[i + 1].start : clip_end;
                     std::string esc;
                     for (char c : words[i].text) {
@@ -2205,6 +3137,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     out += ts(w.start, false) + "\t" + w.text + "\n";
             } else { // srt (default)
                 for (size_t i = 0; i < words.size(); i++) {
+                    // cppcheck-suppress containerOutOfBounds
                     double end = (i + 1 < words.size()) ? words[i + 1].start : clip_end;
                     out += std::to_string(i + 1) + "\n" + ts(words[i].start, true) + " --> " + ts(end, true) + "\n" +
                            words[i].text + "\n\n";
@@ -2229,8 +3162,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // --make-ref: write the voice reference GGUF.
         fprintf(stderr, "crispasr[make-ref]: %d tokens × %d-d → %s\n", result.n_tokens, result.embed_dim,
                 out_path.c_str());
+        // Stamped as a clone: this pack came from a real recording, and the
+        // synthesis-time gates read the stamp back rather than guessing from the
+        // .gguf suffix (which is how --make-ref output used to reach a backend
+        // with no attestation demanded and no audible disclosure attached).
         rc = tada_encoder_write_ref_gguf(out_path.c_str(), result, params.tts_ref_text.c_str(),
-                                         params.language.empty() ? nullptr : params.language.c_str());
+                                         params.language.empty() ? nullptr : params.language.c_str(),
+                                         /*cloned_from_recording=*/true, params.tts_consent_attestation.c_str());
         if (rc != 0) {
             fprintf(stderr, "crispasr[make-ref]: failed to write GGUF (rc=%d)\n", rc);
             return 20;
@@ -2250,32 +3188,92 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!params.watermark_model.empty()) {
             crispasr_wm_dispatch::init(crispasr_resolve_watermark_model(params));
         }
+        // Any provenance opt-out requires the explicit marking attestation
+        // (hard-refuse without it), before we honor --no-watermark.
+        if (int rc = crispasr_check_marking_attestation(params))
+            return rc;
         // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
         crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
-        // Voice-cloning consent gate: if the voice is a .wav reference
-        // (i.e. voice cloning), require --i-have-rights attestation.
-        const bool is_voice_clone = !params.tts_voice.empty() && params.tts_voice.size() >= 4 &&
-                                    (params.tts_voice.compare(params.tts_voice.size() - 4, 4, ".wav") == 0 ||
-                                     params.tts_voice.compare(params.tts_voice.size() - 4, 4, ".WAV") == 0);
+        // Consent-record sink: --consent-log set this at parse time; the env
+        // var covers wrappers that cannot add a flag. Explicit flag wins.
+        crispasr_consent::init_log_path_from_env();
+
+        // Voice-cloning consent gate. A clone is a .wav reference, a voice baked
+        // from one during this run, or a pack that declares it was derived from a
+        // real recording — NOT merely "the path ends in .wav", which missed the
+        // inline-bake rewrite above and every .gguf-only cloning backend
+        // (chatterbox has no .wav path at all). See crispasr_voice_clone_policy.h.
+        const crispasr_voice::CloneDecision clone_decision = crispasr_voice::classify_voice(
+            params.tts_voice, params.tts_voice_dir, params.tts_voice_baked_from_wav, backend->voice_bank_path());
+        const bool is_voice_clone = clone_decision.is_clone;
         if (is_voice_clone && !params.tts_voice_clone_consent) {
-            fprintf(stderr, "crispasr: error: voice cloning requires the --i-have-rights flag.\n"
-                            "\n"
-                            "  By passing --i-have-rights you attest:\n"
-                            "  \"I have the consent of the speaker whose voice this clones,\n"
-                            "   or it is my own voice.\"\n"
-                            "\n"
-                            "  Usage: crispasr --tts \"text\" --voice speaker.wav --i-have-rights\n");
+            fprintf(stderr,
+                    "crispasr: error: voice cloning requires the --i-have-rights flag.\n"
+                    "\n"
+                    "  By passing --i-have-rights you attest:\n"
+                    "  \"I have the consent of the speaker whose voice this clones,\n"
+                    "   or it is my own voice.\"\n"
+                    "\n"
+                    "  Usage: crispasr --tts \"text\" --voice speaker.wav --i-have-rights\n"
+                    "  (this voice is a clone: %s)\n",
+                    clone_decision.reason);
             return 17;
         }
         if (is_voice_clone) {
-            // Log consent attestation with timestamp for audit trail
+            // Log consent attestation with timestamp for audit trail.
+            // `ref_sha256` binds the record to the BYTES that were cloned, not
+            // just the name they were cloned under — a name is not evidence,
+            // because the file can be swapped afterwards and the line still
+            // reads true. Hash whatever the backend will actually open (the
+            // --voice-dir resolution), so a bare name records the same thing a
+            // full path would. See crispasr_consent_record.h.
             auto now = std::chrono::system_clock::now();
             auto t = std::chrono::system_clock::to_time_t(now);
             char ts[64];
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
-            fprintf(stderr, "[CONSENT] ts=%s voice=%s attestation=\"%s\"\n", ts, params.tts_voice.c_str(),
-                    params.tts_consent_attestation.c_str());
+            // For an inline bake, hash the ORIGINAL recording rather than the
+            // temp pack it was baked into — that is the file consent covers.
+            const std::string ref_target =
+                !params.tts_voice_source_recording.empty()
+                    ? params.tts_voice_source_recording
+                    : crispasr_voice::resolve_voice_path(params.tts_voice, params.tts_voice_dir);
+            std::string ref = crispasr_consent::file_sha256(ref_target);
+            crispasr_consent::emit(
+                "CONSENT", ts,
+                {{"voice", params.tts_voice},
+                 {"clone_reason", clone_decision.reason},
+                 {"attestation", params.tts_consent_attestation, /*quoted=*/true},
+                 {"ref_sha256", ref.empty() ? "none" : ref},
+                 {"ref_is", params.tts_voice_source_recording.empty() ? "resolved-voice" : "source-recording"}});
+        }
+
+        // Art. 50(4) applies to a PRESET voice too when that voice is an
+        // identifiable person: the audience cannot tell which pipeline made the
+        // audio, and Art. 3(60) does not ask them to. Resolve whose voice this
+        // is — operator override, then the pack's declaration, then the
+        // backend's — and disclose on either ground. Notably this does NOT feed
+        // the consent gate above; see crispasr_speaker_identity.h.
+        bool identity_recognised = true;
+        const crispasr_voice::SpeakerIdentity identity_override =
+            crispasr_voice::parse_speaker_identity(params.tts_speaker_identity, &identity_recognised);
+        if (!identity_recognised) {
+            // Report the typo rather than silently treating it as Unknown: the
+            // operator meant to answer this question, and "real-person" landing
+            // as "unknown" would drop the disclosure they asked for.
+            fprintf(stderr,
+                    "crispasr: warning: unrecognised --speaker-identity '%s'; treating as 'unknown'. "
+                    "Expected real_person, synthetic or unknown.\n",
+                    params.tts_speaker_identity.c_str());
+        }
+        const crispasr_voice::SpeakerIdentity speaker_identity = crispasr_voice::resolve_speaker_identity(
+            identity_override, clone_decision.pack_identity, backend->declared_speaker_identity(params.model),
+            crispasr_voice::read_model_speaker_identity(params.model));
+        const bool needs_spoken_disclosure =
+            crispasr_voice::requires_spoken_disclosure(is_voice_clone, speaker_identity);
+        if (crispasr_voice::should_warn_unknown_identity(is_voice_clone, speaker_identity) &&
+            crispasr_voice::claim_unknown_identity_warning(backend_name)) {
+            fprintf(stderr, "%s\n", crispasr_voice::unknown_identity_warning(backend_name).c_str());
         }
 
         // Sample rate of the synthesized PCM — backend-declared. Most TTS
@@ -2300,6 +3298,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (params.tts_stream) {
             if (!params.no_prints)
                 fprintf(stderr, "crispasr: streaming TTS as s16le mono @ %d Hz to stdout\n", sr_in);
+            // Raw PCM stream carries no container ⇒ no C2PA floor. Keep the audio
+            // watermark on regardless of --no-watermark so the stream stays marked.
+            crispasr_enforce_cli_watermark_floor("", params);
             auto emit = [&](std::vector<float>& pcm) {
                 if (pcm.empty())
                     return;
@@ -2312,7 +3313,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
                 fflush(stdout);
             };
-            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+            if (needs_spoken_disclosure && !params.tts_no_spoken_disclaimer) {
                 const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
                 if (!disc.empty()) {
                     std::vector<float> d(disc.begin(), disc.end());
@@ -2367,12 +3368,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 15;
         }
 
-        // Prepend spoken AI-disclosure for voice-cloned output. The
-        // disclaimer is synthesized with the neutral/default voice (not
-        // the cloned voice) and cached. 300ms silence gap.
-        // Skipped when --no-spoken-disclaimer is set; watermark + C2PA
-        // provenance remain regardless.
-        if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+        // Prepend the spoken AI-disclosure — for a voice clone, and for a preset
+        // voice that belongs to an identifiable person (Art. 50(4) attaches to
+        // the audio, not to the pipeline). The disclaimer is synthesized with
+        // the neutral/default voice (not the cloned voice) and cached. 300ms
+        // silence gap. Skipped when --no-spoken-disclaimer is set; watermark +
+        // C2PA provenance remain regardless.
+        if (needs_spoken_disclosure && !params.tts_no_spoken_disclaimer) {
             crispasr_tts_prepend_disclaimer(audio, backend.get(), params);
         }
 
@@ -2401,25 +3403,76 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
+        // Resolve the output path first so we can enforce the watertight floor
+        // BEFORE embedding: if this container can't carry C2PA, --no-watermark is
+        // overridden so the file is never fully unmarked.
+        std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
+        crispasr_enforce_cli_watermark_floor(out_path, params);
+
         // Embed watermark (AudioSeal if loaded, otherwise spread-spectrum)
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_in);
 
         // Write output audio (backend-native sample rate, mono) — WAV by
         // default, MP3/AAC when --tts-output ends in .mp3/.aac.
-        std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
         if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_in, params.c2pa_cert,
-                                                params.c2pa_key, params.cache_dir))
+                                                params.c2pa_key, params.cache_dir, !params.tts_no_c2pa))
             return rc;
 
         // Post-embed watermark verification: re-detect on the in-memory
         // PCM (which has already been watermarked) and warn if confidence
         // is too low. This catches edge cases where the embed silently
         // failed or the audio is too short / silent to hold a watermark.
-        {
-            float conf = crispasr_wm_dispatch::detect(audio.data(), (int)audio.size(), sr_in);
-            if (conf < 0.6f) {
-                fprintf(stderr, "crispasr: warning: watermark verification LOW (confidence=%.3f)\n", conf);
+        // Only meaningful for the spread-spectrum detector, and only on audio
+        // long enough to score: the detector averages spectra across frames, so
+        // a short clip scores near chance (0.5) even when the embed worked
+        // perfectly. The old bare `< 0.6` bar therefore warned on most clips
+        // under a couple of seconds — a warning that fires on healthy output
+        // teaches operators to ignore it. Gate on duration and say what the
+        // number means. See crispasr_watermark_stats.h.
+        if (!crispasr_wm_dispatch::is_disabled() && crispasr_wm_dispatch::get_ctx() == nullptr) {
+            const double dur_s = sr_in > 0 ? (double)audio.size() / (double)sr_in : 0.0;
+            const float conf = crispasr_wm_dispatch::detect(audio.data(), (int)audio.size(), sr_in);
+            const bool frames = crispasr_watermark_detect_uses_frames();
+            const auto verdict = frames ? crispasr_wm_stats::classify_frames(conf)
+                                        : crispasr_wm_stats::classify(conf, CRISPASR_WATERMARK_NBINS);
+            // The per-frame statistic finds a fresh embed on ~100% of clips at
+            // 2.5 s and up, so the 5 s guard it needed is only about the legacy
+            // path. Keep it there; the self-check is a diagnostic either way and
+            // must never be read as the marking gate (embedding is unconditional).
+            const double min_dur = frames ? 2.5 : 5.0;
+            if (dur_s >= min_dur && verdict == crispasr_wm_stats::Verdict::NotDetected) {
+                if (frames) {
+                    fprintf(stderr,
+                            "crispasr: warning: watermark self-check did not find the mark it just embedded "
+                            "(score=%.3f over %.1fs). The file is still marked if C2PA signing succeeded; "
+                            "re-run --detect-watermark to confirm.\n",
+                            conf, dur_s);
+                } else {
+                    fprintf(stderr,
+                            "crispasr: warning: watermark self-check did not find the mark it just embedded "
+                            "(score=%.3f over %.1fs, p=%.2g). The file is still marked if C2PA signing "
+                            "succeeded; re-run --detect-watermark to confirm.\n",
+                            conf, dur_s, crispasr_wm_stats::p_value(conf, CRISPASR_WATERMARK_NBINS));
+                }
             }
+        }
+
+        // Close the loop on the consent record: the same run_id appears on the
+        // [CONSENT] line above, so a disputed clip can be walked back to the
+        // attestation that authorised it. Emitted for CLONES only — a preset
+        // needs no attestation, so there would be nothing to correlate to.
+        // out_sha256 is of the file as WRITTEN (watermarked, C2PA-signed), which
+        // is the artefact that leaves the machine.
+        if (is_voice_clone) {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char ts[64];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            std::string out_hash = crispasr_consent::file_sha256(out_path);
+            crispasr_consent::emit("CONSENT-OUTPUT", ts,
+                                   {{"output", out_path},
+                                    {"out_sha256", out_hash.empty() ? "none" : out_hash},
+                                    {"seconds", std::to_string((double)audio.size() / (double)sr_in)}});
         }
 
         if (!params.no_prints)
@@ -2469,6 +3522,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!params.watermark_model.empty()) {
             crispasr_wm_dispatch::init(crispasr_resolve_watermark_model(params));
         }
+        // Any provenance opt-out requires the explicit marking attestation
+        // (hard-refuse without it), before we honor --no-watermark.
+        if (int rc = crispasr_check_marking_attestation(params))
+            return rc;
         // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
         crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
@@ -2488,14 +3545,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
             printf("%s\n", transcript.c_str());
         }
 
+        // Resolve output path + enforce the watertight floor before embedding.
+        std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
+        crispasr_enforce_cli_watermark_floor(out_path, params);
+
         // Embed watermark
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_out);
 
         // Write output audio — WAV by default, MP3/AAC when --s2s-output
         // ends in .mp3/.aac.
-        std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
         if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_out, params.c2pa_cert,
-                                                params.c2pa_key, params.cache_dir))
+                                                params.c2pa_key, params.cache_dir, !params.tts_no_c2pa))
             return rc;
 
         if (!params.no_prints)
@@ -2556,6 +3616,18 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     fprintf(stderr, "crispasr: loaded PCS model '%s'\n", pcs_path.c_str());
             }
         }
+    }
+
+    // #311: strict punctuation — the two loadable kinds are fireredpunc and pcs.
+    // If punctuation is required but neither context loaded (missing/corrupt/
+    // unresolvable model), fail with a non-zero exit instead of the default
+    // "continuing without" warning.
+    if (crispasr_compute_strict_reqs(params).punc && !punc_ctx && !pcs_ctx) {
+        fprintf(stderr,
+                "crispasr: error: required punctuation model '%s' failed to load "
+                "(--require-punctuation/--strict-pipeline).\n",
+                params.punc_model.c_str());
+        return CRISPASR_STRICT_RC_PUNC;
     }
 
     // Optional truecaser post-processor.
@@ -2965,6 +4037,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     // replaced by an empty final. (Round 4 of #84: CKwasd
                     // report 2026-05-11 "empty finals on sub-2-s utterances".)
                     std::string final_text;
+                    // Native diarization label for this utterance, when the
+                    // redecode produced a single-speaker segment set. Emitted
+                    // as a structured "speaker" field so JSON consumers don't
+                    // parse inline labels; text stays clean. Window/utterance-
+                    // local (no cross-utterance clustering) — see docs.
+                    std::string final_speaker;
                     bool final_text_from_redecode = false;
                     if (params.stream_final_mode == "redecode") {
                         if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
@@ -2989,6 +4067,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             }
                             for (const auto& s : utt_segs)
                                 final_text += s.text;
+                            final_speaker = crispasr_stream_common_speaker(utt_segs);
                             final_text_from_redecode = !final_text.empty();
                         }
                         if (final_text.empty())
@@ -3001,9 +4080,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         final_text = apply_punc_text(punc_ctx.get(), final_text);
                     const double t0 = (double)utterance_start_sample / (double)SR;
                     const double t1 = (double)last_speech_end_sample / (double)SR;
+                    std::string spk_field;
+                    if (!final_speaker.empty())
+                        spk_field = ",\"speaker\":\"" + crispasr_json_escape(final_speaker) + "\"";
                     fprintf(stdout,
-                            "{\"type\":\"final\",\"utterance_id\":%lld,\"text\":\"%s\",\"t0\":%.3f,\"t1\":%.3f}\n",
-                            (long long)utterance_id, crispasr_json_escape(final_text).c_str(), t0, t1);
+                            "{\"type\":\"final\",\"utterance_id\":%lld,\"text\":\"%s\"%s,\"t0\":%.3f,\"t1\":%.3f}\n",
+                            (long long)utterance_id, crispasr_json_escape(final_text).c_str(), spk_field.c_str(), t0,
+                            t1);
                     fflush(stdout);
                     emitted_event_this_step = true;
                     // Round 3 (CKwasd #1): bookmark the finalized
@@ -3213,10 +4296,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (segs.empty())
                 continue;
 
-            // Build output text
+            // Build output text (native diarization labels prefixed inline,
+            // matching file-mode text/srt/vtt; no-op for non-diarizers).
             std::string text;
             for (const auto& s : segs)
-                text += s.text;
+                crispasr_stream_append_seg(text, s);
 
             // Output depends on mode:
             // Continuous: print each non-empty result as a new line
@@ -3268,6 +4352,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
             // EOF path: identical redecode→stitch-fallback contract to the
             // in-loop finalize_utterance. See crispasr_stream_finalize.h.
             std::string final_text;
+            std::string final_speaker; // native diarization label (single-speaker utterance); see in-loop finalize
             bool final_text_from_redecode = false;
             if (params.stream_final_mode == "redecode") {
                 if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
@@ -3288,6 +4373,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     }
                     for (const auto& s : utt_segs)
                         final_text += s.text;
+                    final_speaker = crispasr_stream_common_speaker(utt_segs);
                     final_text_from_redecode = !final_text.empty();
                 }
                 if (final_text.empty())
@@ -3300,8 +4386,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
             const double t0 = (double)utterance_start_sample / (double)SR;
             const double t1 = last_speech_end_sample > 0 ? (double)last_speech_end_sample / (double)SR
                                                          : (double)cumulative_samples / (double)SR;
-            fprintf(stdout, "{\"type\":\"final\",\"utterance_id\":%lld,\"text\":\"%s\",\"t0\":%.3f,\"t1\":%.3f}\n",
-                    (long long)utterance_id, crispasr_json_escape(final_text).c_str(), t0, t1);
+            std::string spk_field;
+            if (!final_speaker.empty())
+                spk_field = ",\"speaker\":\"" + crispasr_json_escape(final_speaker) + "\"";
+            fprintf(stdout, "{\"type\":\"final\",\"utterance_id\":%lld,\"text\":\"%s\"%s,\"t0\":%.3f,\"t1\":%.3f}\n",
+                    (long long)utterance_id, crispasr_json_escape(final_text).c_str(), spk_field.c_str(), t0, t1);
             fflush(stdout);
         }
         fprintf(stdout, "\n");
@@ -3455,7 +4544,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                     params.lid_backend == "none";
         if (want_auto_lang && !has_native_lid && !lid_disabled) {
             crispasr_lid_result lid;
-            if (crispasr_detect_language_cli(samples.data(), (int)samples.size(),
+            // Backend self-probe first (see crispasr_lid_cli.h); external LID
+            // only when it declines.
+            const bool probed = crispasr_backend_probe_language(*backend, samples.data(),
+                                                                (int)samples.size(), params, lid);
+            if (probed ||
+                crispasr_detect_language_cli(samples.data(), (int)samples.size(),
                                           params, lid)) {
                 params.language = lid.lang_code;
                 if (params.source_lang.empty()) {
@@ -3512,34 +4606,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     per_slice_logits.push_back({});
             }
 
-            // Apply the generic diarize post-step. Stereo-only methods
-            // (energy, xcorr) need have_stereo == true; mono-friendly
-            // methods (vad-turns, future sherpa/pyannote) work either
-            // way. Pass both channel buffers and an is_stereo hint;
-            // when have_stereo is false we point both at the mono
-            // buffer so the helper has data to look at without
-            // special-casing.
-            if (params.diarize && !segs.empty()) {
-                if (have_stereo) {
-                    std::vector<float> sl_l(stereo[0].begin() + sl.start,
-                                            stereo[0].begin() + sl.end);
-                    std::vector<float> sl_r(stereo[1].begin() + sl.start,
-                                            stereo[1].begin() + sl.end);
-                    crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true,
-                                           sl.t0_cs, segs, params);
-                } else {
-                    std::vector<float> mono_slice(samples.begin() + sl.start,
-                                                  samples.begin() + sl.end);
-                    crispasr_apply_diarize(mono_slice, mono_slice,
-                                           /*is_stereo=*/false,
-                                           sl.t0_cs, segs, params);
-                }
-            }
-
-            // Optional CTC forced alignment to attach word-level timestamps.
-            // Applies to backends that expose CAP_TIMESTAMPS_CTC and don't
-            // already have words populated. Runs per slice so absolute
-            // timestamps come out right.
+            // Issue #267: run CTC alignment BEFORE diarization so word
+            // timestamps are available for speaker-turn splitting.
+            //
             // Issue #62: --force-aligner overrides both gates so users
             // can prefer aligner timing over native timestamps.
             const bool want_align =
@@ -3568,6 +4637,27 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         seg.t1 = words.back().t1;
                         seg.words = std::move(words);
                     }
+                }
+            }
+
+            // Issue #267: diarize AFTER alignment so word timestamps
+            // (native or externally aligned) are available for
+            // speaker-turn splitting. Without words, falls back to
+            // segment-level dominant-speaker assignment.
+            if (params.diarize && !segs.empty()) {
+                if (have_stereo) {
+                    std::vector<float> sl_l(stereo[0].begin() + sl.start,
+                                            stereo[0].begin() + sl.end);
+                    std::vector<float> sl_r(stereo[1].begin() + sl.start,
+                                            stereo[1].begin() + sl.end);
+                    crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true,
+                                           sl.t0_cs, segs, params);
+                } else {
+                    std::vector<float> mono_slice(samples.begin() + sl.start,
+                                                  samples.begin() + sl.end);
+                    crispasr_apply_diarize(mono_slice, mono_slice,
+                                           /*is_stereo=*/false,
+                                           sl.t0_cs, segs, params);
                 }
             }
 
@@ -3612,6 +4702,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
              params.max_len > 0  || params.print_colors ||
              params.diarize);
         crispasr_print_stdout(disp, show_timestamps);
+        if (params.print_confidence)
+            crispasr_print_confidence(all_segs);
 
         // Write output files.
         if (params.output_txt)

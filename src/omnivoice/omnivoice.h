@@ -325,6 +325,10 @@ OV_API enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
                                            int                   ref_n_samples,
                                            struct ov_voice_ref * out);
 
+// Validate the unified codec encoder against a reference GGUF containing
+// `input_wav24k` and `codes` tensors. Returns zero when every code matches.
+OV_API int ov_encode_diff(struct ov_context * ov, const char * ref_gguf_path);
+
 // Release the RVQ code buffer and reset the struct to empty. Safe on a
 // zero initialised struct.
 OV_API void ov_voice_ref_free(struct ov_voice_ref * ref);

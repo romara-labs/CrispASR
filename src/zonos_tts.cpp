@@ -32,6 +32,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -65,7 +66,7 @@ namespace {
 static bool zonos_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("ZONOS_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_ZONOS_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -237,6 +238,9 @@ struct zonos_tts_context {
     std::string dac_codec_path;
     bool dac_loaded = false;
     core_dac::DacWeights dac_w;
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked-F32 decode conv kernels. Gated
+    // CRISPASR_ZONOS_FASTCONV.
+    core_dac::fastconv_cache dac_fc;
     ggml_context* dac_ctx_w = nullptr;
     ggml_backend_buffer_t dac_buf_w = nullptr;
     ggml_context* dac_ctx_perm = nullptr;
@@ -377,11 +381,29 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-    }
     if (!ctx->backend) {
         ctx->backend = ctx->backend_cpu;
+    }
+    // #304: Zonos hangs on the Vulkan backend — the AR transformer + DAC (44 kHz)
+    // vocoder graph never completes (>300 s on a 3 s clip vs ~8 s on CPU on a
+    // Tesla P100), the same ggml-vulkan graph-corruption class already routed to
+    // CPU in cosyvoice3 (#304), tada-codec (#192), moss (#215). SubtitleEdit
+    // ships the Vulkan Windows build to every Windows user. Metal + CUDA render
+    // correctly. Run on CPU when the GPU backend is Vulkan; override with
+    // CRISPASR_ZONOS_VULKAN_NATIVE=1.
+    if (ctx->backend != ctx->backend_cpu && std::strstr(ggml_backend_name(ctx->backend), "Vulkan")) {
+        const char* keep = crispasr_env::get("CRISPASR_ZONOS_VULKAN_NATIVE");
+        if (!(keep && keep[0] == '1')) {
+            if (params.verbosity >= 1) {
+                fprintf(stderr, "zonos_tts: Vulkan backend detected — running on CPU (#304 Vulkan "
+                                "hang; set CRISPASR_ZONOS_VULKAN_NATIVE=1 to override)\n");
+            }
+            ggml_backend_free(ctx->backend);
+            ctx->backend = ctx->backend_cpu;
+        }
+    }
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     // Pass 2: load weights via core_gguf helper
@@ -470,7 +492,7 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     // Try to load speaker embedding from file, else use random Gaussian.
     ctx->cond_state.speaker_emb.resize(128);
     {
-        const char* spk_path = getenv("ZONOS_SPEAKER_EMB_PATH");
+        const char* spk_path = crispasr_env::get("CRISPASR_ZONOS_SPEAKER_EMB_PATH");
         if (!spk_path)
             spk_path = "/mnt/storage/zonos-tts/jfk_speaker_emb.bin";
         FILE* sf = fopen(spk_path, "rb");
@@ -1476,7 +1498,7 @@ static float* run_backbone(zonos_tts_context* ctx, const float* embeds, int T, i
         if (out_hidden) {
             ggml_backend_tensor_get(hs, out_hidden, 0, (size_t)d * sizeof(float));
         } else if (n_past == 0) {
-            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            const char* ddir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
             if (ddir) {
                 std::vector<float> hs_buf(d);
                 ggml_backend_tensor_get(hs, hs_buf.data(), 0, (size_t)d * sizeof(float));
@@ -1953,7 +1975,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     // Python prepare_conditioning() returns cat([cond, uncond]) → (2, T, d_model).
     // We write the same layout: cond rows first, then uncond rows.
     {
-        const char* dump_dir = getenv("ZONOS_CPP_DUMP_DIR");
+        const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
         if (dump_dir) {
             // Write phoneme IDs
             {
@@ -2084,7 +2106,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
                     best_u = i;
             fprintf(stderr, "zonos_tts: DIFF uncond prefill cb0 argmax=%d (%.2f)\n", best_u, logits_uncond[best_u]);
         }
-        const char* dump_dir = getenv("ZONOS_CPP_DUMP_DIR");
+        const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
         if (!dump_dir)
             dump_dir = "/mnt/storage/zonos-tts";
         char df_path[512];
@@ -2149,7 +2171,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
 
         // Dump CFG-blended logits at step 0 for comparison with Python
         if (step == 0) {
-            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            const char* ddir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
             if (ddir) {
                 char dp[512];
                 snprintf(dp, sizeof(dp), "%s/cpp_cfg_step0_logits.npy", ddir);
@@ -2457,6 +2479,25 @@ static bool load_dac_codec(zonos_tts_context* ctx) {
     }
 
     ctx->dac_loaded = true;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): bake F32 copies of the decode conv
+    // kernels via the shared cache so the per-graph F16→F32 cast becomes a no-op
+    // (k=1 → matmul). up_w already has an F32 w_perm (decomp path), so baking it is
+    // a no-op there. Gated CRISPASR_ZONOS_FASTCONV (default on); =0 = legacy.
+    {
+        const char* e = std::getenv("CRISPASR_ZONOS_FASTCONV");
+        const bool on = !(e && e[0] == '0');
+        std::vector<ggml_tensor*> convs = {dw.in_conv_w, dw.out_conv_w};
+        for (int b = 0; b < 4; b++) {
+            convs.push_back(dw.blocks[b].up_w);
+            for (int r = 0; r < 3; r++) {
+                convs.push_back(dw.blocks[b].res[r].conv0_w);
+                convs.push_back(dw.blocks[b].res[r].conv1_w);
+            }
+        }
+        ctx->dac_fc.bake(ctx->backend, convs, on);
+    }
+
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "zonos_tts: DAC codec loaded (%zu tensors)\n", wl.tensors.size());
     }
@@ -2489,7 +2530,7 @@ static float* dac_decode(zonos_tts_context* ctx, const int32_t* codes, int n_cod
     }
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
-    ggml_tensor* pcm_out = core_dac::build_decode_graph(ctx0, dw, codes_in, T, gf);
+    ggml_tensor* pcm_out = core_dac::build_decode_graph(ctx0, dw, codes_in, T, gf, &ctx->dac_fc);
 
     // Allocate + set inputs
     ggml_backend_sched_reset(ctx->sched);
@@ -2671,6 +2712,7 @@ void zonos_tts_free(struct zonos_tts_context* ctx) {
             ggml_free(bk.ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->dac_fc.free(); // FASTCONV baked-kernel buffer
     if (ctx->dac_buf_perm)
         ggml_backend_buffer_free(ctx->dac_buf_perm);
     if (ctx->dac_ctx_perm)

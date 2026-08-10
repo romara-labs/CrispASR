@@ -365,15 +365,17 @@ fn session_omni_ctc_vocab() {
 
     // Accessor contract: a non-empty vocab of raw SentencePiece pieces.
     let vocab = sess.ctc_vocab().expect("CTC backend should expose a vocab");
-    assert!(vocab.len() > 1000, "unexpectedly small vocab: {}", vocab.len());
+    assert!(
+        vocab.len() > 1000,
+        "unexpectedly small vocab: {}",
+        vocab.len()
+    );
     // Real pieces carry a word-boundary marker. The v2 Omni CTC vocab is built
     // verbatim from vocab.json and uses a literal ASCII space; v1 (SentencePiece)
     // uses U+2581 (▁). Accept either so the accessor test isn't tied to one
     // tokenizer flavour.
     assert!(
-        vocab
-            .iter()
-            .any(|p| p.contains('\u{2581}') || p == " "),
+        vocab.iter().any(|p| p.contains('\u{2581}') || p == " "),
         "no word-boundary token (U+2581 piece or literal space) — not a real vocab"
     );
 
@@ -501,7 +503,11 @@ fn assert_ctc_vocab_contract(sess: &crispasr::Session, pcm: &[f32]) {
     let vocab = sess
         .ctc_vocab()
         .expect("CTC backend should expose Some(vocab)");
-    assert!(vocab.len() > 1, "unexpectedly small CTC vocab: {}", vocab.len());
+    assert!(
+        vocab.len() > 1,
+        "unexpectedly small CTC vocab: {}",
+        vocab.len()
+    );
     // token_text must always yield a valid (possibly empty) string, never panic
     // — including an out-of-range id, which the accessor guards to "".
     assert!(
@@ -582,7 +588,10 @@ fn session_ctc_backend_no_speech_sentinel() {
     // Fallback path: never a whisper acoustic code here; a non-empty string
     // (source hint or "unknown"), never a panic.
     let lang = sess.detected_language();
-    assert!(!lang.is_empty(), "detected_language fallback must be non-empty");
+    assert!(
+        !lang.is_empty(),
+        "detected_language fallback must be non-empty"
+    );
 }
 
 // ---- Registry + cache ----
@@ -594,6 +603,25 @@ fn registry_lookup_parakeet() {
         assert!(!e.filename.is_empty());
         assert!(!e.url.is_empty());
     }
+}
+
+#[test]
+fn registry_default_bundle_omnivoice() {
+    let bundle = crispasr::registry_default_bundle("omnivoice")
+        .expect("bundle call")
+        .expect("omnivoice bundle");
+    assert_eq!(bundle.backend, "omnivoice");
+    assert_eq!(bundle.artifacts.len(), 2);
+    assert_eq!(
+        bundle.artifacts[0].kind,
+        crispasr::RegistryArtifactKind::Primary
+    );
+    assert_eq!(bundle.artifacts[0].filename, "omnivoice-f16.gguf");
+    assert_eq!(
+        bundle.artifacts[1].kind,
+        crispasr::RegistryArtifactKind::Companion
+    );
+    assert_eq!(bundle.artifacts[1].filename, "omnivoice-tokenizer-f16.gguf");
 }
 
 #[test]
@@ -692,4 +720,41 @@ fn vad_slices_null_model() {
         1,
     );
     assert!(result.is_err());
+}
+
+// -------------------------------------------------------------------------
+// Diarization (#332) — model-free, so it always runs.
+//
+// Regression: CrispasrDiarizeOptsAbi was 24 bytes short of the C layout
+// after #324 appended the FoxNose fields, so every call made the C side
+// read past the Rust allocation. These calls crossing the ABI at the full
+// 48-byte layout (plus the layout test in crispasr-sys) pin the fix.
+// -------------------------------------------------------------------------
+
+#[test]
+fn diarize_vad_turns_model_free() {
+    let pcm = vec![0.01f32; 16000 * 4]; // 4 s of quiet mono PCM
+    let mut segs = vec![
+        crispasr::DiarizeSegment::new(0.0, 1.0),
+        crispasr::DiarizeSegment::new(2.0, 3.0), // 1 s gap > 600 ms turn gap
+    ];
+    let opts = crispasr::DiarizeOptions::default();
+    crispasr::diarize_segments(&mut segs, &pcm, None, false, &opts)
+        .expect("vad_turns diarize failed");
+    assert_ne!(
+        segs[0].speaker, segs[1].speaker,
+        "VadTurns must alternate speakers across a >600 ms gap"
+    );
+}
+
+#[test]
+fn diarize_foxnose_missing_model_errors() {
+    let pcm = vec![0.01f32; 16000];
+    let mut segs = vec![crispasr::DiarizeSegment::new(0.0, 1.0)];
+    let mut opts = crispasr::DiarizeOptions::default();
+    opts.method = crispasr::DiarizeMethod::FoxNose;
+    opts.foxnose_embedder_path = Some("/nonexistent/wespeaker.gguf".to_string());
+    let err = crispasr::diarize_segments(&mut segs, &pcm, None, false, &opts)
+        .expect_err("foxnose with a missing embedder must fail, not crash");
+    assert!(err.contains("load failed"), "unexpected error: {err}");
 }

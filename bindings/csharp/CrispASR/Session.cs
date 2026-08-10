@@ -19,7 +19,7 @@ namespace CrispASR
     /// </code>
     /// </para>
     /// </summary>
-    public sealed class Session : IDisposable
+    public sealed partial class Session : IDisposable
     {
         private IntPtr _handle;
 
@@ -38,6 +38,22 @@ namespace CrispASR
         /// <summary>
         /// Open a session with automatic backend detection from GGUF metadata.
         /// </summary>
+        /// <remarks>
+        /// The model is loaded once and stays resident for the life of the
+        /// <see cref="Session"/>. To transcribe many clips WITHOUT reloading the
+        /// model (issue #291), open one session and call
+        /// <see cref="Transcribe(float[])"/> repeatedly:
+        /// <code>
+        /// using var asr = Session.Open("parakeet.gguf");
+        /// foreach (var clip in clips)
+        ///     Process(asr.Transcribe(clip));   // model loaded once, reused
+        /// </code>
+        /// A <see cref="Session"/> is not thread-safe; use one per thread, or
+        /// serialize calls. Standalone <see cref="VadSegments"/> is the exception —
+        /// it loads and frees its VAD model on every call, so a hot VAD-only loop
+        /// still reloads. Prefer session-integrated VAD (the vad transcribe path)
+        /// when you also transcribe, so the one session covers both.
+        /// </remarks>
         public static Session Open(string modelPath, int nThreads = 4)
         {
             var p = NativeMethods.crispasr_session_open(modelPath, nThreads);
@@ -139,6 +155,14 @@ namespace CrispASR
             if (rc != 0) throw new InvalidOperationException($"set_instruct failed (rc={rc})");
         }
 
+        /// <summary>#316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2).</summary>
+        public void SetTtsPhonemes(string phonemes)
+        {
+            int rc = NativeMethods.crispasr_session_set_tts_phonemes(Handle, phonemes ?? "");
+            if (rc == -2) throw new InvalidOperationException("Backend has no phonemes-in entry point (kokoro and piper do)");
+            if (rc != 0) throw new InvalidOperationException($"set_tts_phonemes failed (rc={rc})");
+        }
+
         /// <summary>Whether the loaded model is a qwen3-tts CustomVoice variant.</summary>
         public bool IsCustomVoice => NativeMethods.crispasr_session_is_custom_voice(Handle) != 0;
 
@@ -153,6 +177,29 @@ namespace CrispASR
         public void SetHotwords(string hotwords, float boost)
             => Check(NativeMethods.crispasr_session_set_hotwords(Handle, hotwords, boost), "set_hotwords");
 
+        /// <summary>
+        /// Apply a named bundle of the four decoder fallback thresholds:
+        /// "conservative", "balanced" (the shipped defaults, a no-op) or
+        /// "aggressive". "strict"/"default"/"loose" are aliases. Mirrors the
+        /// CLI's --sensitivity.
+        /// </summary>
+        /// <exception cref="ArgumentException">The preset is unrecognised.</exception>
+        public void SetSensitivity(string preset)
+        {
+            // Deliberately NOT routed through Check(): that helper treats
+            // rc == -2 as success, because for most setters -2 means "this
+            // backend does not support the knob". Here -2 means "unknown
+            // preset", and swallowing it would silently decode at the default
+            // thresholds after a typo — exactly what this API exists to prevent.
+            int rc = NativeMethods.crispasr_session_set_sensitivity(Handle, preset);
+            if (rc == -2)
+                throw new ArgumentException(
+                    $"unknown sensitivity preset '{preset}' (expected: conservative, balanced, aggressive)",
+                    nameof(preset));
+            if (rc != 0)
+                throw new InvalidOperationException($"set_sensitivity failed (rc={rc})");
+        }
+
         /// <summary>Select the G2P pronunciation dictionary for TTS.</summary>
         public void SetG2pDict(string source)
             => Check(NativeMethods.crispasr_session_set_g2p_dict(Handle, source), "set_g2p_dict");
@@ -164,6 +211,15 @@ namespace CrispASR
         /// <summary>Sticky target-language. Different from source triggers translation on canary/cohere.</summary>
         public void SetTargetLanguage(string? lang)
             => Check(NativeMethods.crispasr_session_set_target_language(Handle, lang ?? ""), "set_target_language");
+
+        /// <summary>Language a voice-cloning reference clip is spoken in (#329). Cross-lingual TTS
+        /// backends (cosyvoice3) drop the reference transcript when it differs from the requested
+        /// output language, so the clone speaks that language instead of carrying the reference's
+        /// accent. Optional — inferred from the voice bank or reference transcript otherwise, and
+        /// that inference declines rather than guesses on a short transcript.</summary>
+        public void SetTtsReferenceLanguage(string? lang)
+            => Check(NativeMethods.crispasr_session_set_tts_reference_language(Handle, lang ?? ""),
+                     "set_tts_reference_language");
 
         /// <summary>Toggle punctuation + capitalisation. Default true.</summary>
         public void SetPunctuation(bool enable)
@@ -310,6 +366,160 @@ namespace CrispASR
             }
         }
 
+        /// <summary>
+        /// Attest acceptance of AI-content marking/disclosure responsibility (EU
+        /// AI Act Art. 50). REQUIRED before <see cref="SynthesizeRaw"/> will return
+        /// unmarked audio; the default <see cref="Synthesize"/> is watermarked and
+        /// needs no attestation. <paramref name="attestation"/> is recorded for audit.
+        /// </summary>
+        public void AcceptMarkingResponsibility(string attestation = "")
+            => Check(NativeMethods.crispasr_session_accept_marking_responsibility(Handle, attestation ?? ""),
+                     "accept_marking_responsibility");
+
+        /// <summary>
+        /// Declare whose voice a PRESET voice is: <c>real_person</c>,
+        /// <c>synthetic</c> or <c>unknown</c>.
+        /// <para>
+        /// Cloning is not the only way to produce a deep fake: a preset voice
+        /// shipped inside a model can be an identifiable individual — a named
+        /// donor, or a corpus speaker such as VCTK's <c>p225</c> — and EU AI Act
+        /// Art. 3(60) attaches to the audio resembling that person, not to which
+        /// pipeline produced it. Setting <c>real_person</c> makes the Art. 50(4)
+        /// reminder fire for a non-cloned voice.
+        /// </para>
+        /// <para>
+        /// It does <b>not</b> require a consent attestation: whether that donor
+        /// agreed to the model being trained is a licensing matter settled
+        /// upstream that you cannot attest to.
+        /// </para>
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown on an unrecognised value, rather than silently downgrading it
+        /// to <c>unknown</c>.
+        /// </exception>
+        public void SetSpeakerIdentity(string identity)
+        {
+            int rc = NativeMethods.crispasr_session_set_speaker_identity(Handle, identity ?? "");
+            if (rc == -2)
+                throw new ArgumentException(
+                    $"unrecognised speaker_identity '{identity}' " +
+                    "(expected real_person, synthetic or unknown)", nameof(identity));
+            Check(rc, "set_speaker_identity");
+        }
+
+        /// <summary>
+        /// UNMARKED synthesis (no watermark), for callers that post-process before
+        /// embedding the mark themselves. Hard-refused (throws) unless
+        /// <see cref="AcceptMarkingResponsibility"/> was called first. Prefer
+        /// <see cref="Synthesize"/> for the default watermarked output.
+        /// </summary>
+        public float[] SynthesizeRaw(string text)
+        {
+            var ptr = NativeMethods.crispasr_session_synthesize_raw(Handle, text, out int nSamples);
+            if (ptr == IntPtr.Zero || nSamples <= 0)
+                throw new InvalidOperationException(
+                    "SynthesizeRaw returned no audio (attestation required? call AcceptMarkingResponsibility first)");
+            try
+            {
+                var pcm = new float[nSamples];
+                Marshal.Copy(ptr, pcm, 0, nSamples);
+                return pcm;
+            }
+            finally
+            {
+                NativeMethods.crispasr_pcm_free(ptr);
+            }
+        }
+
+        /// <summary>
+        /// Embed the AI-content watermark into mono float32 PCM, in place.
+        /// <para>
+        /// The other half of <see cref="SynthesizeRaw"/>: opting out of automatic
+        /// marking makes marking the result your duty under EU AI Act Art. 50(2),
+        /// and this is what discharges it. Do the post-processing you opted out
+        /// for — resample, mix, concatenate — then mark the finished buffer.
+        /// </para>
+        /// <para>
+        /// Uses the robust, reliably detectable default strength; AudioSeal
+        /// instead when a model has been loaded. Static because marking is a
+        /// property of the samples, not of the session that produced them.
+        /// </para>
+        /// </summary>
+        public static void WatermarkEmbed(float[] pcm)
+        {
+            if (pcm == null || pcm.Length == 0)
+                return;
+            NativeMethods.crispasr_watermark_embed(pcm, pcm.Length, -1.0f);
+        }
+
+        /// <summary>
+        /// Confidence in [0, 1] that <paramref name="pcm"/> carries the watermark.
+        /// A weak diagnostic, not proof: the spread-spectrum detector's null mean
+        /// is 0.5, not 0, and a negative result on a short clip is mostly evidence
+        /// that the clip was short. See <c>docs/eu-ai-act.md</c> §6.7.
+        /// </summary>
+        public static float WatermarkDetect(float[] pcm)
+        {
+            if (pcm == null || pcm.Length == 0)
+                return 0.0f;
+            return NativeMethods.crispasr_watermark_detect(pcm, pcm.Length);
+        }
+
+        /// <summary>
+        /// Speech-to-speech: audio in → audio out through a single model pass,
+        /// on backends with S2S capability (lfm2-audio, mini-omni2, sidon,
+        /// voxcpm2-vae). Input is 16 kHz mono float32 PCM. Returns the output
+        /// PCM plus the intermediate ASR transcript (may be <c>null</c>).
+        /// </summary>
+        public (float[] pcm, string? transcript) SpeechToSpeech(float[] input)
+        {
+            var ptr = NativeMethods.crispasr_session_speech_to_speech(
+                Handle, input, input.Length, out IntPtr textPtr, out int nSamples);
+            if (ptr == IntPtr.Zero || nSamples <= 0)
+                throw new InvalidOperationException(
+                    "SpeechToSpeech returned no audio (backend may not support S2S)");
+            try
+            {
+                var pcm = new float[nSamples];
+                Marshal.Copy(ptr, pcm, 0, nSamples);
+                string? transcript = null;
+                if (textPtr != IntPtr.Zero)
+                {
+                    transcript = Marshal.PtrToStringUTF8(textPtr);
+                    NativeMethods.crispasr_session_translate_text_free(textPtr);
+                }
+                return (pcm, transcript);
+            }
+            finally
+            {
+                NativeMethods.crispasr_pcm_free(ptr);
+            }
+        }
+
+        /// <summary>
+        /// The sample rate the backend expects for input PCM (16000 for
+        /// Whisper-family backends, 0 on error).
+        /// </summary>
+        public int InputSampleRate() => NativeMethods.crispasr_session_input_sample_rate(Handle);
+
+        /// <summary>
+        /// Sample rate of the PCM Synthesize/SpeechToSpeech produce for this
+        /// backend; 0 when the backend has no audio output (ASR-only). (#332)
+        /// </summary>
+        public int OutputSampleRate() => NativeMethods.crispasr_session_output_sample_rate(Handle);
+
+        /// <summary>
+        /// Channel count for audio input: 1 (mono) for every current backend,
+        /// 0 on error. Source separation is the stereo exception. (#332)
+        /// </summary>
+        public int InputChannels() => NativeMethods.crispasr_session_input_channels(Handle);
+
+        /// <summary>
+        /// Channel count for synthesized / s2s output audio: 1 (mono), or 0
+        /// when the backend has no audio output. (#332)
+        /// </summary>
+        public int OutputChannels() => NativeMethods.crispasr_session_output_channels(Handle);
+
         // ----------------------------------------------------------------
         // ASR Transcription
         // ----------------------------------------------------------------
@@ -323,6 +533,24 @@ namespace CrispASR
         {
             var r = NativeMethods.crispasr_session_transcribe_lang(Handle, pcm, pcm.Length, language);
             if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
+            try { return ExtractSegments(r); }
+            finally { NativeMethods.crispasr_session_result_free(r); }
+        }
+
+        /// <summary>
+        /// Chunked-encode transcribe (issue #208): forces the Parakeet backend
+        /// through its bounded overlapping-window long-form path so long audio
+        /// transcribes in bounded time without dropping sections. Inert
+        /// (== <see cref="TranscribeLang"/>) on non-Parakeet backends.
+        /// <paramref name="chunkSeconds"/> &lt;= 0 keeps the per-model default
+        /// window; <paramref name="overlapSeconds"/> &lt; 0 keeps the default overlap.
+        /// </summary>
+        public Segment[] TranscribeChunked(float[] pcm, int chunkSeconds = 0, int overlapSeconds = -1,
+                                           string? language = null)
+        {
+            var r = NativeMethods.crispasr_session_transcribe_chunked_lang(
+                Handle, pcm, pcm.Length, chunkSeconds, overlapSeconds, language);
+            if (r == IntPtr.Zero) throw new InvalidOperationException("Chunked transcription failed");
             try { return ExtractSegments(r); }
             finally { NativeMethods.crispasr_session_result_free(r); }
         }
@@ -416,7 +644,8 @@ namespace CrispASR
                         alts);
                 }
                 float noSpeechProb = NativeMethods.crispasr_session_result_segment_no_speech_prob(r, i);
-                segs[i] = new Segment(text, t0, t1, words, noSpeechProb);
+                string speaker = NativeMethods.PtrToUtf8(NativeMethods.crispasr_session_result_segment_speaker(r, i)) ?? "";
+                segs[i] = new Segment(text, t0, t1, words, noSpeechProb, speaker);
             }
             return segs;
         }
@@ -541,8 +770,14 @@ namespace CrispASR
                 var raw = new float[n * 2];
                 Marshal.Copy(outSpans[0], raw, 0, n * 2);
                 var spans = new VadSpan[n];
+                // The native crispasr_vad_segments ABI returns CENTISECONDS
+                // (start_cs, end_cs — see crispasr.h), the raw whisper.cpp VAD
+                // unit. Every other time value in this binding (Segment/Word T0/T1)
+                // is seconds, and this method's own doc-comment promises seconds,
+                // so convert here. Reported as issue #291: without this the spans
+                // came back as ms/10 and silently disagreed with Session times.
                 for (int i = 0; i < n; i++)
-                    spans[i] = new VadSpan(raw[i * 2], raw[i * 2 + 1]);
+                    spans[i] = new VadSpan(raw[i * 2] / 100.0, raw[i * 2 + 1] / 100.0);
                 return spans;
             }
             finally
@@ -659,10 +894,17 @@ namespace CrispASR
         /// <summary>Whisper's per-segment no-speech probability (the &lt;|nospeech|&gt;
         /// posterior) in [0, 1]. Whisper-only; other backends leave -1.0 ("no data").</summary>
         public float NoSpeechProb { get; }
+        /// <summary>Native per-segment speaker label from a backend that diarizes on
+        /// its own, in the "(Speaker N) " form the CLI prefixes into text/srt/vtt
+        /// output, or "" when the backend produced none. Populated today by vibevoice.
+        /// The ordinals are CHUNK-LOCAL: "Speaker 1" from one transcribe call is not
+        /// necessarily the same voice as "Speaker 1" from the next.</summary>
+        public string Speaker { get; }
 
-        public Segment(string text, long t0, long t1, Word[] words, float noSpeechProb = -1.0f)
+        public Segment(string text, long t0, long t1, Word[] words, float noSpeechProb = -1.0f,
+                       string speaker = "")
         {
-            Text = text; T0 = t0; T1 = t1; Words = words; NoSpeechProb = noSpeechProb;
+            Text = text; T0 = t0; T1 = t1; Words = words; NoSpeechProb = noSpeechProb; Speaker = speaker ?? "";
         }
 
         public override string ToString() => $"[{T0}-{T1}] {Text}";
@@ -866,17 +1108,30 @@ namespace CrispASR
     // Speaker database
     // ====================================================================
 
-    /// <summary>On-disk speaker embedding database.</summary>
+    /// <summary>
+    /// On-disk speaker embedding database (closed-roster, consent-gated —
+    /// issue #266). Matching is a claimed-participant confirmation, never
+    /// an open 1:N search.
+    /// </summary>
     public sealed class SpeakerDb : IDisposable
     {
         private IntPtr _handle;
 
         private SpeakerDb(IntPtr handle) => _handle = handle;
 
-        public static SpeakerDb Load(string dirPath)
+        /// <summary>
+        /// Open a db narrowed to the claimed roster. <paramref name="expectedNames"/>
+        /// is the comma-separated list of enrolled participants asserted present
+        /// (e.g. "Alice,Bob"). <paramref name="consentAttested"/> affirms a lawful
+        /// basis + explicit consent from every enrolled person (GDPR Art. 9);
+        /// the call refuses without both.
+        /// </summary>
+        public static SpeakerDb Open(string dirPath, string expectedNames, bool consentAttested)
         {
-            var p = NativeMethods.crispasr_speaker_db_load(dirPath);
-            if (p == IntPtr.Zero) throw new InvalidOperationException($"Failed to load speaker db from {dirPath}");
+            if (!consentAttested)
+                throw new InvalidOperationException("SpeakerDb requires an explicit consent attestation (GDPR Art. 9)");
+            var p = NativeMethods.crispasr_speaker_db_open(dirPath, expectedNames, 1);
+            if (p == IntPtr.Zero) throw new InvalidOperationException($"Failed to open speaker db from {dirPath}");
             return new SpeakerDb(p);
         }
 
@@ -892,10 +1147,16 @@ namespace CrispASR
             return (NativeMethods.NullTerminated(outName), score);
         }
 
-        /// <summary>Enroll a new speaker embedding.</summary>
-        public static void Enroll(string dirPath, string name, float[] embedding)
+        /// <summary>
+        /// Enroll a new speaker embedding. <paramref name="consentAttested"/> records
+        /// the enrolled person's explicit consent (GDPR Art. 9) in the profile;
+        /// enrollment refuses without it.
+        /// </summary>
+        public static void Enroll(string dirPath, string name, float[] embedding, bool consentAttested)
         {
-            int rc = NativeMethods.crispasr_speaker_db_enroll(dirPath, name, embedding, embedding.Length);
+            if (!consentAttested)
+                throw new InvalidOperationException("Enrollment requires an explicit consent attestation (GDPR Art. 9)");
+            int rc = NativeMethods.crispasr_speaker_db_enroll2(dirPath, name, embedding, embedding.Length, 1);
             if (rc != 0) throw new InvalidOperationException($"speaker_db_enroll failed (rc={rc})");
         }
 

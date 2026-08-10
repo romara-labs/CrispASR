@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class MoonshineStreamingBackend : public CrispasrBackend {
 public:
@@ -15,12 +16,20 @@ public:
 
     const char* name() const override { return "moonshine-streaming"; }
 
+    // English-only (see MoonshineBackend) — skip external LID on -l auto. #227.
+    const char* sole_language() const override { return "en"; }
+
     uint32_t capabilities() const override {
+        // #300/#308 audit: the model emits punctuated, sentence-cased text (verified
+        // on jfk: "And so, my fellow Americans, ... your country."), so the CLI's
+        // automatic FireRedPunc pass must not run over it — it appended a second
+        // full stop ("country.."). Its sibling `moonshine` already opts out via
+        // CAP_PUNCTUATION_TOGGLE; the streaming variant was missed.
         // Verified against src/moonshine_streaming.cpp as of 2026-05-04:
         // uses ggml_flash_attn_ext (×3); produces segments → CAP_DIARIZE
         // works as the framework post-step.
         return CAP_AUTO_DOWNLOAD | CAP_TIMESTAMPS_CTC | CAP_FLASH_ATTN | CAP_DIARIZE | CAP_TEMPERATURE |
-               CAP_TOKEN_CONFIDENCE | CAP_BEAM_SEARCH;
+               CAP_TOKEN_CONFIDENCE | CAP_BEAM_SEARCH | CAP_PUNCTUATION_NATIVE;
     }
 
     bool init(const whisper_params& params) override {
@@ -34,9 +43,9 @@ public:
         // text). Revisit once the offline batch-encoder fast-path lands
         // (PLAN §232 Fix 2). MOONSHINE_STREAMING_GPU=1 opts in for A/B (and to
         // exercise the §232 hybrid decoder-weight placement).
-        if (const char* g = getenv("MOONSHINE_STREAMING_GPU"))
+        if (const char* g = crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_GPU"))
             cp.use_gpu = (g[0] == '1');
-        if (getenv("CRISPASR_VERBOSE") || getenv("MOONSHINE_STREAMING_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_BENCH"))
             cp.verbosity = 2;
         ctx_ = moonshine_streaming_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;

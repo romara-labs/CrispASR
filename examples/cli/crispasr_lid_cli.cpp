@@ -5,8 +5,10 @@
 // auto-download here where the CLI's cache / UX policy lives.
 
 #include "crispasr_lid_cli.h"
+#include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_lid.h" // shared library header (src/)
+#include "crispasr_subprocess.h"
 #include "whisper_params.h"
 
 #include <algorithm>
@@ -14,7 +16,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -27,8 +28,6 @@
 #include <sys/stat.h>
 #define close _close
 #define mkdir(d, m) _mkdir(d)
-#define popen _popen
-#define pclose _pclose
 static int mkstemps(char* t, int s) {
     (void)s;
     return _mktemp_s(t, strlen(t) + 1) == 0 ? _open(t, _O_CREAT | _O_WRONLY, 0600) : -1;
@@ -175,22 +174,36 @@ bool detect_with_sherpa(const float* samples, int n_samples, const whisper_param
     fwrite(pcm.data(), sizeof(int16_t), pcm.size(), f);
     fclose(f);
 
-    std::ostringstream cmd;
-    cmd << bin << " --whisper-model='" << p.lid_model << "' '" << wav_path << "' 2>&1";
+    const std::vector<std::string> args = {
+        bin,
+        "--whisper-model=" + p.lid_model,
+        wav_path,
+    };
     if (!p.no_prints)
-        fprintf(stderr, "crispasr[lid]: %s\n", cmd.str().c_str());
+        fprintf(stderr, "crispasr[lid]: %s\n", crispasr_cli_process::join_cmdline(args).c_str());
 
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd.str().c_str(), "r"), pclose);
-    if (!pipe) {
+    const int timeout_sec =
+        crispasr_cli_process::timeout_from_audio_samples("CRISPASR_SHERPA_LID_TIMEOUT_SEC", n_samples);
+    const auto run = crispasr_cli_process::run_capture_stdout(args, timeout_sec, true);
+    if (run.timed_out) {
+        fprintf(stderr, "crispasr[lid]: sherpa subprocess timed out after %d s\n", timeout_sec);
+        std::remove(wav_path.c_str());
+        return false;
+    }
+    if (run.spawn_failed) {
         fprintf(stderr, "crispasr[lid]: failed to spawn sherpa LID subprocess\n");
         std::remove(wav_path.c_str());
         return false;
     }
+    if (run.exit_code != 0) {
+        fprintf(stderr, "crispasr[lid]: sherpa subprocess exited with code %d\n", run.exit_code);
+        std::remove(wav_path.c_str());
+        return false;
+    }
 
-    char linebuf[512];
     std::string detected;
-    while (fgets(linebuf, sizeof(linebuf), pipe.get())) {
-        std::string line = linebuf;
+    std::istringstream lines(run.output);
+    for (std::string line; std::getline(lines, line);) {
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
             line.pop_back();
         auto pos = line.find("Detected language:");
@@ -220,6 +233,29 @@ bool detect_with_sherpa(const float* samples, int n_samples, const whisper_param
 
 } // namespace
 
+bool crispasr_backend_probe_language(CrispasrBackend& backend, const float* samples, int n_samples,
+                                     const whisper_params& params, crispasr_lid_result& out) {
+    out = {};
+    if (!samples || n_samples <= 0)
+        return false;
+
+    // An explicitly named external backend wins — the probe is only the
+    // default when the user expressed no preference (or asked for it).
+    const std::string& be = params.lid_backend;
+    if (!be.empty() && be != "probe" && be != "self")
+        return false;
+
+    std::string lang;
+    float confidence = 0.0f;
+    if (!backend.detect_language(samples, n_samples, params, lang, confidence) || lang.empty())
+        return false;
+
+    out.lang_code = lang;
+    out.confidence = confidence;
+    out.source = std::string(backend.name()) + "-probe";
+    return true;
+}
+
 bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
                                   crispasr_lid_result& out) {
     out = {};
@@ -229,6 +265,14 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
     std::string be = params.lid_backend;
     if (be.empty())
         be = "whisper";
+    if (be == "probe" || be == "self") {
+        // Reached only when the backend's own probe declined or failed —
+        // crispasr_backend_probe_language() already had its turn. Fall back to
+        // the external default rather than erroring on a valid flag value.
+        fprintf(stderr, "crispasr[lid]: this backend has no self-probe (or it returned nothing) — "
+                        "falling back to whisper-tiny LID\n");
+        be = "whisper";
+    }
 
     if (be == "whisper" || be == "whisper-tiny") {
         CrispasrLidOptions opts;

@@ -38,6 +38,7 @@
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/rnnt_ggml.h"        // §232 GPU transducer decode (shared)
+#include "core/crispasr_env.h"
 
 #if defined(HAVE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -47,7 +48,7 @@
 static bool nemotron_force_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (std::getenv("NEMOTRON_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_NEMOTRON_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 
@@ -70,7 +71,7 @@ static bool nemotron_force_scalar() {
 static bool nemotron_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("NEMOTRON_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_NEMOTRON_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -930,6 +931,7 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
 static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, ggml_tensor* pos_enc, int T,
                                          const nemotron_enc_layer& e, const core_conformer::BlockParams& p,
                                          ggml_tensor* window_mask = nullptr) {
+    // cppcheck-suppress ctuuninitvar
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;
@@ -1090,7 +1092,7 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     // CRISPASR_NEMOTRON_NO_WINDOW_MASK=1 → bidirectional attention (for A/B testing).
     // Default: banded attention with att_context_left/right.
     ggml_tensor* window_mask_t = nullptr;
-    const bool use_window_mask = !getenv("CRISPASR_CRISPASR_NEMOTRON_NO_WINDOW_MASK");
+    const bool use_window_mask = !crispasr_env::get("CRISPASR_NEMOTRON_NO_WINDOW_MASK");
     if (use_window_mask && T > 0) {
         window_mask_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
         ggml_set_name(window_mask_t, "window_mask");
@@ -1098,7 +1100,7 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     }
 
     // ----- Conformer layers -----
-    core_conformer::BlockParams bp;
+    core_conformer::BlockParams bp = {};
     bp.d = (int)hp.d_model;
     bp.n_heads = (int)hp.n_heads;
     bp.head_dim = (int)hp.head_dim;
@@ -1248,7 +1250,7 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     int n_chunks = (T_enc + chunk_size - 1) / chunk_size;
     enc_out.resize((size_t)T_enc * d);
 
-    core_conformer::BlockParams bp;
+    core_conformer::BlockParams bp = {};
     bp.d = d;
     bp.n_heads = (int)hp.n_heads;
     bp.head_dim = (int)hp.head_dim;
@@ -1670,9 +1672,9 @@ static bool nemotron_init_ggml_decoder(nemotron_context* ctx, core_rnnt_ggml::De
     if (ggml_dec && ggml_backend_is_metal(ctx->backend))
         ggml_dec = false;
 #endif
-    if (const char* e = getenv("NEMOTRON_GGML_DECODE"))
+    if (const char* e = crispasr_env::get("CRISPASR_NEMOTRON_GGML_DECODE"))
         ggml_dec = (e[0] == '1');
-    if (ggml_dec && getenv("RNNT_GGML_PERSTEP") == nullptr) {
+    if (ggml_dec && crispasr_env::get("CRISPASR_RNNT_GGML_PERSTEP") == nullptr) {
         const auto& p = ctx->model.predictor;
         const auto& j = ctx->model.joint;
         core_rnnt_ggml::decoder_init(gdec, ctx->backend, p.embed_w, p.lstm0_w_ih, p.lstm0_b_ih, p.lstm0_w_hh,
@@ -1716,7 +1718,7 @@ static std::vector<nemotron_emitted_token> nemotron_rnnt_decode(nemotron_context
     // §232: ggml GPU decode default (see nemotron_init_ggml_decoder / LEARNINGS 33).
     core_rnnt_ggml::Decoder gdec;
     const bool ggml_dec = nemotron_init_ggml_decoder(ctx, gdec);
-    const bool time_dec = getenv("NEMOTRON_DECODE_TIMING") != nullptr;
+    const bool time_dec = crispasr_env::get("CRISPASR_NEMOTRON_DECODE_TIMING") != nullptr;
     auto _dt0 = std::chrono::steady_clock::now();
 
     const auto& W = ctx->pred_w;

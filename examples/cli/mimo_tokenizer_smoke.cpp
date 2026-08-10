@@ -9,13 +9,16 @@
 
 #include "mimo_tokenizer.h"
 #include "common-crispasr.h"
+#include "core/win_compat.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -67,13 +70,12 @@ int main(int argc, char** argv) {
     // CPU-pin until the Metal conv-stem watchdog hang is verified absent on
     // forward conv (cf. qwen3-tts kernel_conv_transpose_1d). Set
     // MIMO_SMOKE_GPU=1 to exercise the GPU path.
-    cp.use_gpu = std::getenv("MIMO_SMOKE_GPU") != nullptr;
+    cp.use_gpu = crispasr_env::get("CRISPASR_MIMO_SMOKE_GPU") != nullptr;
     mimo_tokenizer_context* ctx = mimo_tokenizer_init_from_file(model_path, cp);
     if (!ctx) {
         fprintf(stderr, "smoke: failed to load tokenizer '%s'\n", model_path);
         return 3;
     }
-
     static const char* stages[] = {
         "tok_mel", "tok_conv1_out", "tok_conv2_out", "tok_xfmr_out", "tok_pool_out", "tok_codes",
     };
@@ -93,7 +95,7 @@ int main(int argc, char** argv) {
         else
             n_pass++;
         printf("%s %-22s n=%-8d min=%-12.4f max=%-12.4f mean=%-12.4f\n", tag, stage, n, s.min_v, s.max_v, s.mean);
-        if (std::getenv("MIMO_SMOKE_DUMP")) {
+        if (crispasr_env::get("CRISPASR_MIMO_SMOKE_DUMP")) {
             char path[256];
             std::snprintf(path, sizeof(path), "/tmp/mimo_cpp_%s.bin", stage);
             FILE* f = std::fopen(path, "wb");
@@ -104,6 +106,44 @@ int main(int argc, char** argv) {
             }
         }
         std::free(data);
+    }
+    if (crispasr_env::truthy("CRISPASR_MIMO_TOK_VERIFY_RVQ")) {
+        constexpr const char* kCpuRvqEnv = "CRISPASR_MIMO_TOK_CPU_RVQ";
+        const char* old_value_ptr = std::getenv(kCpuRvqEnv);
+        const bool had_old_value = old_value_ptr != nullptr;
+        const std::string old_value = old_value_ptr ? old_value_ptr : "";
+
+        unsetenv(kCpuRvqEnv);
+        int gpu_frames = 0;
+        int32_t* gpu_codes = mimo_tokenizer_encode_pcm16k(ctx, samples.data(), (int)samples.size(), &gpu_frames);
+
+        setenv(kCpuRvqEnv, "1", /*overwrite=*/1);
+        int cpu_frames = 0;
+        int32_t* cpu_codes = mimo_tokenizer_encode_pcm16k(ctx, samples.data(), (int)samples.size(), &cpu_frames);
+
+        if (had_old_value)
+            setenv(kCpuRvqEnv, old_value.c_str(), /*overwrite=*/1);
+        else
+            unsetenv(kCpuRvqEnv);
+
+        size_t mismatches = 0;
+        if (!gpu_codes || !cpu_codes || gpu_frames != cpu_frames) {
+            mismatches = 1;
+        } else {
+            const size_t n_codes = (size_t)cpu_frames * 8;
+            for (size_t i = 0; i < n_codes; i++)
+                mismatches += gpu_codes[i] != cpu_codes[i];
+        }
+        if (mismatches == 0) {
+            printf("[ ok ] rvq_cpu_gpu_compare    codes=%zu mismatches=0\n", (size_t)cpu_frames * 8);
+            n_pass++;
+        } else {
+            printf("[FAIL] rvq_cpu_gpu_compare    gpu_frames=%d cpu_frames=%d mismatches=%zu\n", gpu_frames, cpu_frames,
+                   mismatches);
+            n_fail++;
+        }
+        std::free(gpu_codes);
+        std::free(cpu_codes);
     }
     mimo_tokenizer_free(ctx);
     printf("smoke: %d ok, %d fail\n", n_pass, n_fail);

@@ -16,7 +16,9 @@
 
 #include "crispasr_diarize.h" // from src/ via whisper target's PUBLIC include dir
 #include "crispasr_backend.h"
+#include "crispasr_vad.h" // crispasr_audio_slice
 
+#include <functional>
 #include <vector>
 
 struct whisper_params;         // fwd decl
@@ -95,6 +97,41 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
                             const CrispasrPyannoteCache* pyannote_cache = nullptr,
                             const CrispasrSherpaCache* sherpa_cache = nullptr);
 
+/// Apply a per-slice diarization pass to an ALREADY-MERGED segment list.
+///
+/// The unified CLI runner diarizes inside its per-slice loop and hands each
+/// slice its own segment vector, so it never needs this. The server
+/// transcribes every slice first and only then diarizes, so it has to re-walk
+/// the merged list and give each slice back its own sub-range.
+///
+/// That re-walk is the subtle part: `crispasr_apply_diarize` GROWS the vector
+/// whenever it splits a segment at a speaker-turn boundary (the pyannote,
+/// foxnose and sherpa paths all do word-range splitting), so the sub-range
+/// cannot be written back in place — see #324. This rebuilds the list instead,
+/// appending whatever each slice returns, so no sub-segment is ever dropped
+/// and a shrinking pass can never index past the end.
+///
+/// A segment belongs to slice `i` when its `t0` is below slice `i+1`'s
+/// `t0_cs`; the final slice takes the remainder. `diarize_slice` receives the
+/// slice and its segments, and may relabel, split or drop them.
+void crispasr_diarize_merged_by_slice(
+    std::vector<crispasr_segment>& segs, const std::vector<crispasr_audio_slice>& slices,
+    const std::function<void(const crispasr_audio_slice&, std::vector<crispasr_segment>&)>& diarize_slice);
+
+/// #324: run the FoxNose diarizer ONCE over the whole audio, using the final
+/// segment list as its speech regions, then relabel and split those segments.
+///
+/// Per-SLICE diarization cannot give consistent speaker identities: each slice
+/// clusters independently and restarts numbering at 0, so `speaker 0` in one
+/// slice is a different person from `speaker 0` in the next. This is the same
+/// problem the pyannote path solves with a pre-computed posterior cache
+/// (#107); FoxNose solves it here instead, after transcription, because it
+/// needs the segments as its speech regions and they do not exist beforehand.
+///
+/// Returns true when it ran (so the caller can skip the per-slice path).
+bool crispasr_apply_foxnose_global(std::vector<crispasr_segment>& all_segs, const std::vector<float>& samples,
+                                   const whisper_params& params);
+
 /// Re-label each segment's speaker by clustering speaker embeddings
 /// extracted from `full_audio`. Operates over the WHOLE finalized
 /// segment list (after per-slice diarize + segment splitting), so it
@@ -111,5 +148,39 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
 /// empty / too short — the pyannote-only labels survive unchanged in
 /// those cases, which is what makes the system "work sufficiently
 /// well without an embedder" (#107 P3).
+///
+/// When `out_clusters` is non-null it receives the per-segment
+/// embeddings and cluster assignment so a later identification stage
+/// (issue #266) can reuse them without re-running the embedder.
+struct CrispasrClusterEmbeddings {
+    std::vector<size_t> seg_idx;   // indices into segs that were embedded
+    std::vector<float> embeddings; // seg_idx.size() * dim, row-major
+    std::vector<int> labels;       // cluster ID per embedded segment
+    int dim = 0;
+    int n_clusters = 0;
+    bool valid() const { return dim > 0 && n_clusters > 0 && !seg_idx.empty() && labels.size() == seg_idx.size(); }
+};
+
 void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
-                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params);
+                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params,
+                                            CrispasrClusterEmbeddings* out_clusters = nullptr);
+
+/// Cluster-level speaker identification (issue #266). For each global
+/// speaker cluster in `ce`, match the L2-normalized centroid of the
+/// cluster's member embeddings against `db` — which the caller MUST
+/// already have narrowed to the claimed roster via speaker_db_retain().
+/// A matched cluster's member segments get "(Name) " labels; unmatched
+/// clusters keep their anonymous "(speaker N) " labels. One identity
+/// per cluster; a mixed slice can never inherit a single name.
+/// Returns the number of clusters identified.
+int crispasr_identify_speaker_clusters(std::vector<crispasr_segment>& segs, const CrispasrClusterEmbeddings& ce,
+                                       const struct speaker_db* db, float threshold, bool no_prints);
+
+/// Standalone identification without diarization (issue #266): the whole
+/// recording is treated as ONE speaker cluster. Embeds all eligible
+/// segments, centroid-matches against the (already claimed-roster-
+/// narrowed) db, and on success labels EVERY segment with the name.
+/// Returns true when a name was assigned.
+bool crispasr_identify_single_speaker(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                      CrispasrSpeakerEmbedder* embedder, const struct speaker_db* db, float threshold,
+                                      bool no_prints);

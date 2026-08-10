@@ -318,6 +318,9 @@ struct irodori_tts_context {
     ggml_tensor* codec_out_proj_b = nullptr;
     // DAC decoder weights (reusing core_dac structure with DACVAE config)
     core_dac::DacWeights dac;
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked-F32 decode conv kernels so the
+    // per-graph F16→F32 cast becomes a no-op. Gated CRISPASR_IRODORI_FASTCONV.
+    core_dac::fastconv_cache dac_fc;
     // DAC-VAE encoder weights (voice cloning: reference audio → latent)
     irodori_dacvae_encoder enc;
 
@@ -1474,6 +1477,7 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
 void irodori_tts_free(struct irodori_tts_context* ctx) {
     if (!ctx)
         return;
+    ctx->dac_fc.free(); // FASTCONV baked-kernel buffer (on codec_backend)
     if (ctx->codec_buf)
         ggml_backend_buffer_free(ctx->codec_buf);
     if (ctx->codec_ctx)
@@ -1661,6 +1665,25 @@ int irodori_tts_set_codec_path(struct irodori_tts_context* ctx, const char* code
     ctx->codec_ctx = wl.ctx;
     ctx->codec_buf = wl.buf;
     ctx->has_codec = true;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): bake F32 copies of the DECODE conv
+    // kernels via the shared core_dac cache so the per-graph F16→F32 cast becomes
+    // a no-op + k=1 convs become matmuls. Gated CRISPASR_IRODORI_FASTCONV (default
+    // on); =0 restores the legacy cast path (clean A/B). Encode/voice-clone convs
+    // stay legacy (rare path).
+    {
+        const char* e = std::getenv("CRISPASR_IRODORI_FASTCONV");
+        const bool on = !(e && e[0] == '0');
+        std::vector<ggml_tensor*> convs = {dac.in_conv_w, dac.out_conv_w, ctx->codec_out_proj_w};
+        for (auto& blk : dac.blocks) {
+            convs.push_back(blk.up_w);
+            for (int r = 0; r < 3; r++) {
+                convs.push_back(blk.res[r].conv0_w);
+                convs.push_back(blk.res[r].conv1_w);
+            }
+        }
+        ctx->dac_fc.bake(ctx->codec_backend, convs, on);
+    }
 
     if (ctx->verbosity >= 1) {
         std::fprintf(stderr, "[irodori] DAC-VAE codec loaded (%d decoder blocks)\n", dac.config.n_decoder_blocks);
@@ -2596,24 +2619,25 @@ static std::vector<float> decode_dac_window(irodori_tts_context* ctx, const floa
     ggml_set_name(lat_in, "latent_in");
     ggml_set_input(lat_in);
 
+    const core_dac::fastconv_cache* fc = &ctx->dac_fc;
     ggml_tensor* h = lat_in;
     if (ctx->codec_out_proj_w) {
-        h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1);
+        h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1, 1, fc);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     if (dac.in_conv_w) {
-        h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7);
+        h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7, 1, fc);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     for (int b = 0; b < cfg.n_decoder_blocks; b++) {
-        h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b]);
+        h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b], fc);
         h = ggml_cont(g, h);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     if (dac.out_snake_alpha)
         h = core_dac::snake(g, h, dac.out_snake_alpha);
     if (dac.out_conv_w) {
-        h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7);
+        h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7, 1, fc);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     h = ggml_tanh(g, h);
@@ -2820,6 +2844,27 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         }
     }
 
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): irodori
+    // runs up to THREE uncond DiT forwards per in-window step (text / speaker /
+    // caption independent guidance). Recompute those uncond forwards only every K
+    // CFG-active steps and reuse the cached uncond velocities in between; the cond
+    // forward stays fresh every step; the first CFG-active step always recomputes.
+    // This uses slightly stale uncond, so it CHANGES the output and stays gated OFF
+    // by default (K=1 = exact). Only active when K>1, so the default recomputes every
+    // step and is byte-for-byte the legacy path. Gated CRISPASR_IRODORI_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_IRODORI_CFG_INTERVAL");
+        const int k = e ? std::atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool cfg_interval_on = cfg_interval > 1;
+    std::vector<float> v_text_cache, v_spk_cache, v_cap_cache; // cached uncond velocities
+    int cfg_active_idx = 0;                                    // counts CFG-active steps (for the every-K test)
+    if (cfg_interval_on && std::getenv("CRISPASR_IRODORI_CFG_INTERVAL_DEBUG"))
+        std::fprintf(stderr,
+                     "[irodori] interval-CFG K=%d (uncond recomputed every %d CFG-active steps; first always)\n",
+                     cfg_interval, cfg_interval);
+
     // ODE integration loop
     for (int step = 0; step < n_ode; step++) {
         float t_val = t_schedule[step];
@@ -2883,27 +2928,52 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
 
         if (do_text_cfg || do_spk_cfg || do_cap_cfg) {
             const float* spk_ptr = spk_state.empty() ? nullptr : spk_state.data();
+            // Interval-CFG: recompute the uncond passes on the first CFG-active step
+            // and every K-th CFG-active step; otherwise reuse the cached velocities.
+            const bool recompute_unc = !cfg_interval_on || (cfg_active_idx % cfg_interval == 0) ||
+                                       (do_text_cfg && v_text_cache.empty()) || (do_spk_cfg && v_spk_cache.empty()) ||
+                                       (do_cap_cfg && v_cap_cache.empty());
             // Text-unconditional pass: zero text state, keep speaker+caption attended.
             std::vector<float> v_text_uncond;
             if (do_text_cfg) {
-                std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
-                v_text_uncond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(),
-                                                T_text, spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, attend_caption);
+                if (recompute_unc) {
+                    std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
+                    v_text_uncond =
+                        run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(), T_text,
+                                        spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, attend_caption);
+                    if (cfg_interval_on)
+                        v_text_cache = v_text_uncond;
+                } else {
+                    v_text_uncond = v_text_cache;
+                }
             }
             // Speaker-unconditional pass: conditioned text+caption, speaker masked out.
             std::vector<float> v_spk_uncond;
             if (do_spk_cfg) {
-                v_spk_uncond =
-                    run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
-                                    spk_ptr, T_ref, /*attend_speaker=*/false, cap_ptr, T_cap, attend_caption);
+                if (recompute_unc) {
+                    v_spk_uncond =
+                        run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
+                                        spk_ptr, T_ref, /*attend_speaker=*/false, cap_ptr, T_cap, attend_caption);
+                    if (cfg_interval_on)
+                        v_spk_cache = v_spk_uncond;
+                } else {
+                    v_spk_uncond = v_spk_cache;
+                }
             }
             // Caption-unconditional pass: conditioned text+speaker, caption masked out.
             std::vector<float> v_cap_uncond;
             if (do_cap_cfg) {
-                v_cap_uncond =
-                    run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
-                                    spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, /*attend_caption=*/false);
+                if (recompute_unc) {
+                    v_cap_uncond =
+                        run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
+                                        spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, /*attend_caption=*/false);
+                    if (cfg_interval_on)
+                        v_cap_cache = v_cap_uncond;
+                } else {
+                    v_cap_uncond = v_cap_cache;
+                }
             }
+            cfg_active_idx++;
             for (size_t i = 0; i < x_t.size(); i++) {
                 float v = v_cond[i];
                 if (!v_text_uncond.empty())

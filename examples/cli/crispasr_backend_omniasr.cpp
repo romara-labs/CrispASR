@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class OmniasrBackend : public CrispasrBackend {
 public:
@@ -39,7 +40,7 @@ public:
         cp.temperature = params.temperature;
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
-        if (getenv("OMNIASR_DEBUG"))
+        if (crispasr_env::get("CRISPASR_OMNIASR_DEBUG"))
             cp.verbosity = 2;
         // Pass language for LLM variant (e.g. "eng_Latn" from -l en)
         // The LLM model uses this for language conditioning
@@ -74,8 +75,8 @@ public:
                 int chunk_n = end - offset;
                 int64_t chunk_offset_cs = t_offset_cs + (int64_t)(offset * 100 / SR);
                 auto chunk_segs = transcribe(samples + offset, chunk_n, chunk_offset_cs, params);
-                if (params.return_logits && last_ctc_logits()) {
-                    const auto* lg = last_ctc_logits();
+                const auto* lg = last_ctc_logits();
+                if (params.return_logits && lg) {
                     if (merged_logits.n_vocab == 0) {
                         merged_logits.n_vocab = lg->n_vocab;
                         merged_logits.normalization = lg->normalization;

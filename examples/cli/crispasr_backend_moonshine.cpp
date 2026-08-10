@@ -16,6 +16,10 @@ public:
 
     const char* name() const override { return "moonshine"; }
 
+    // Moonshine (Useful Sensors) is English-only — skip external LID on -l auto
+    // (no whisper-tiny download just to "detect" a language it can't change). #227.
+    const char* sole_language() const override { return "en"; }
+
     uint32_t capabilities() const override {
         // Best-of-N is implemented in transcribe() as a sequential loop over
         // _transcribe_with_probs with a sticky seed. There's no CAP_BEST_OF_N
@@ -43,6 +47,8 @@ public:
 
         moonshine_set_temperature(ctx_, params.temperature);
         moonshine_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the 194 default.
+        moonshine_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
 
         // Best-of-N: when temperature > 0 and best_of > 1, run N seeded
         // decodes and keep the one with highest mean per-token softmax prob.

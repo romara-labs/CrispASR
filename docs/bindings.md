@@ -5,6 +5,23 @@ All wrappers are thin shells over the same C-ABI surface in
 diarize, LID, align, download — is one function call in every
 language.
 
+## Session audio-format getters (#332)
+
+Four read-only getters describe the PCM a session consumes and produces, so
+callers don't hard-code per-backend rates:
+
+| C-ABI getter | Returns |
+|---|---|
+| `crispasr_session_input_sample_rate(s)` | Rate (Hz) the backend expects for input PCM — 16000 for Whisper-family, the model's native rate otherwise. Pair with `crispasr_audio_load_at_rate` to avoid a double resample. |
+| `crispasr_session_output_sample_rate(s)` | Rate (Hz) of the PCM `synthesize` / `synthesize_streaming` / `get_disclaimer_pcm` / `speech_to_speech` return — the "backend-native rate" those calls document. `0` = the backend produces no audio output (ASR-only). |
+| `crispasr_session_input_channels(s)` | `1` (mono) for every current backend. Source separation is the stereo exception and has its own surface (`separate*`). |
+| `crispasr_session_output_channels(s)` | `1` (mono), or `0` when the backend produces no audio output. |
+
+All return `0` on a NULL/invalid session. Exposed as `output_sample_rate` /
+`input_channels` / `output_channels` (Rust, Ruby), `outputSampleRate()` /
+`inputChannels()` / `outputChannels()` (Java, C# `OutputSampleRate()` etc.),
+and `sessionOutputSampleRate()` etc. in the WASM/JS binding.
+
 ## Session setter reference
 
 All generation-control setters are available in every binding. Each
@@ -35,12 +52,43 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_return_logits(enable)` | `set_return_logits` / `set_return_logits` / `SetReturnLogits` / `setReturnLogits` | Opt-in dense CTC grid capture for backends that expose frame-level CTC scores |
 | `set_grammar_text(gbnf, root, penalty)` | `set_grammar_text` / `set_grammar_text` / `SetGrammarText` / `setGrammarText` | GBNF constrained decoding (whisper); empty string clears |
 | `set_fallback_thresholds(...)` | `set_fallback_thresholds` / `set_fallback_thresholds` / `SetFallbackThresholds` / `setFallbackThresholds` | Whisper entropy/logprob/no-speech thresholds + temp-inc |
+| `set_sensitivity(preset)` | `set_sensitivity` / `set_sensitivity` / `SetSensitivity` / `setSensitivity` | The four thresholds above as one named bundle: `conservative` / `balanced` / `aggressive` (aliases `strict` / `default` / `loose`). `balanced` is the shipped defaults, so it is always a no-op. **rc=-2 means an unknown preset and every wrapper raises** — a typo must never decode silently at the defaults. A later `set_fallback_thresholds` overrides it. HTTP: the `sensitivity` form field, applied before the individual threshold fields so those still win. |
 | `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
 | `set_whisper_decode_extras(...)` | `set_whisper_decode_extras` / `set_whisper_decode_extras` / `SetWhisperDecodeExtras` / `setWhisperDecodeExtras` | suppress_nst, suppress_regex, carry_initial_prompt |
 | `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for instruct-tuned audio-LLM backends (granite, voxtral, qwen3-asr, glm-asr, gemma4-e2b, mimo-asr). Empty string clears. |
 | `set_punc_model(alias\|path)` | `set_punc_model` / `set_punc_model` / `SetPuncModel` / `setPuncModel` | Load FireRedPunc/PCS punctuation restoration on the session (`auto`/`firered`/`fullstop`/`punctuate-all`/`pcs`/path; auto-downloads). Restores punctuation on backends that emit none (parakeet RNNT/CTC, …). `"none"`/`""` unloads. (Also Java/Ruby.) |
 | `set_hotwords(words, boost)` | `set_hotwords` / `set_hotwords` / `SetHotwords` / `setHotwords` | Comma-separated contextual-biasing hotwords, boosted per token match (parakeet CTC/TDT trie; LLM-backend prompt injection). Empty string clears. (All six wrappers.) |
+| `set_tts_phonemes(ipa)` | `set_tts_phonemes` / `set_tts_phonemes` / `SetTTSPhonemes` / `setTtsPhonemes` | #316: synthesize the given phonemes verbatim, skipping the G2P — the seam between text processing and the acoustic model. Use it to reproduce another implementation's pronunciation, or to tell a G2P bug from a model bug. Empty clears; rc=-2 on a backend with no phonemes-in call (kokoro and piper have one). Server: `"phonemes"` on `/v1/audio/speech`. CLI: `--tts-phonemes`. (All wrappers.) |
 | `set_g2p_dict(source)` | `set_g2p_dict` / `set_g2p_dict` / `SetG2PDict` / `setG2pDict` | Select the G2P pronunciation dictionary for TTS phonemization (`olaph`/`open-dict`/path). (All six wrappers.) |
+
+## Result field reference
+
+Everything a transcription result carries is read back through per-index
+accessors on the opaque `crispasr_session_result`, so adding a field is a new
+symbol rather than a layout change — old callers keep working. Every wrapper
+exposes them as struct/class members on its segment type.
+
+| C-ABI accessor | Member (Python/Rust/Go/Dart/Java/C#/Ruby) | Notes |
+|---|---|---|
+| `result_segment_text(r, i)` | `text` / `text` / `Text` / `text` / `text` / `Text` / `:text` | The segment transcript. |
+| `result_segment_t0/t1(r, i)` | `start`,`end` / `start`,`end` / `T0`,`T1` / `start`,`end` / `t0`,`t1` / `T0`,`T1` / `:t0`,`:t1` | Centiseconds on the C ABI; Python/Rust/Dart divide to seconds. |
+| `result_segment_no_speech_prob(r, i)` | `no_speech_prob` / … / `NoSpeechProb` / `noSpeechProb` / … / `:no_speech_prob` | Whisper only; `-1.0` sentinel = no data. |
+| `result_segment_speaker(r, i)` | `speaker` / `speaker` / `Speaker` / `speaker` / `speaker` / `Speaker` / `:speaker` | **New in v0.8.24.** Native per-segment speaker label in the `"(Speaker N) "` form, `""` when the backend does not diarize natively. |
+| `result_n_words` + `result_word_*` | `words` (list of word objects) | Per-word text/timings/confidence, plus `alts` where the backend emits them. |
+
+> **`speaker` ordinals are CHUNK-LOCAL.** They come from the backend's own
+> per-call diarization, so `Speaker 1` in one `transcribe()` is not guaranteed to
+> be the same voice as `Speaker 1` in the next — nothing clusters across calls
+> here. Use `diarize_segments` / `DiarizeSegments` (§ session-scoped clustering
+> in [`diarization-speakers.md`](diarization-speakers.md)) when you need labels
+> stable across a whole recording. Populated today by `vibevoice`, whose model
+> answers with a Start/End/Speaker/Content array; `moss-diarize` and `granite`
+> in `--diarize` mode populate it on the CLI/server surfaces.
+
+> **Older libraries.** Each wrapper probes for `result_segment_speaker` before
+> calling it and falls back to `""`, so a wrapper built after v0.8.24 still runs
+> against a pre-v0.8.24 `libcrispasr`. The reverse (old wrapper, new library) is
+> always fine — it simply ignores the symbol.
 
 > **Tip — chunk-boundary dedup for bindings.** When a binding drives a
 > CAP_UNBOUNDED_INPUT backend (parakeet, canary, …) chunk-by-chunk and
@@ -78,6 +126,14 @@ backend doesn't expose that knob, but the call is safe to make.
 > (`bindings/javascript/emscripten.cpp`) via the `asr*` functions
 > (`asrOpen`/`asrTranscribe`/`asrSet…`).
 >
+> **Long audio auto-chunks.** `transcribe` slices audio longer than
+> ~30 s at energy minima and transcribes each piece (like the CLI/server),
+> collapsing any decode-loop repetition — so short-segment models (e.g.
+> moonshine) don't degrade or hang on a single long pass. Disable with
+> `CRISPASR_SESSION_AUTOCHUNK=0`; window via `CRISPASR_SESSION_CHUNK_SECONDS`.
+> `transcribe_chunked` remains the explicit, tunable long-form control (and
+> parakeet has its own internal long-audio handling either way).
+>
 > **Chunked long-form + progress (issue #208).** `transcribe_chunked` forces
 > the Parakeet backend through its bounded long-form path (inert on other
 > backends) and is exposed in **every** binding:
@@ -113,7 +169,7 @@ backend doesn't expose that knob, but the call is safe to make.
 ```python
 from crispasr import (
     Session, diarize_segments, detect_language_pcm,
-    align_words, cache_ensure_file, registry_lookup,
+    align_words, cache_ensure_file, registry_default_bundle,
     # Diarize pipeline primitives (#107):
     SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
 )
@@ -129,9 +185,13 @@ lang = detect_language_pcm(pcm, model_path="ggml-tiny.bin")
 diarize_segments(my_segs, pcm, method=DiarizeMethod.VAD_TURNS)
 words = align_words("canary-ctc-aligner.gguf", "hello world", pcm)
 
-# Auto-download a canonical model
-entry = registry_lookup("parakeet")
-path  = cache_ensure_file(entry.filename, entry.url)
+# Inspect the canonical bundle used by `-m auto` (no quant suffix).
+# NOTE: this does not apply a preferred quant, so it does NOT reproduce
+# `-m auto:q8_0` — that rewrites both filename and URL. Use registry_lookup()
+# with a preferred quant for those.
+bundle = registry_default_bundle("omnivoice")
+assert not bundle.requires_acceptance  # prompt/attest before restricted downloads
+paths = [cache_ensure_file(a.filename, a.url) for a in bundle.artifacts]
 
 # Custom diarize pipeline: pluggable embedder + cosine clustering.
 # Same building blocks as `--diarize-embedder` in the CLI.
@@ -149,7 +209,7 @@ Install: `pip install crispasr` (or build locally from `python/`).
 use crispasr::{
     Session, DiarizeMethod, DiarizeOptions, DiarizeSegment,
     LidMethod, detect_language_pcm, align_words,
-    cache_ensure_file, registry_lookup,
+    cache_ensure_file, registry_default_bundle,
     // Diarize pipeline primitives (#107):
     SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
 };
@@ -159,8 +219,11 @@ sess.set_max_new_tokens(256)?;
 sess.set_frequency_penalty(0.4)?;
 let segs = sess.transcribe_vad(&pcm, "silero-v6.2.0.bin", None)?;
 
-let entry = registry_lookup("canary")?.unwrap();
-let path  = cache_ensure_file(&entry.filename, &entry.url, false, None)?;
+let bundle = registry_default_bundle("canary")?.unwrap();
+assert!(!bundle.requires_acceptance); // obtain explicit acceptance when true
+for artifact in bundle.artifacts {
+    cache_ensure_file(&artifact.filename, &artifact.url, false, None)?;
+}
 
 // Custom diarize pipeline: pluggable embedder + cosine clustering.
 let emb = SpeakerEmbedder::new("auto", 4, None)?;     // "titanet"/"indextts"/.gguf
@@ -175,7 +238,12 @@ let labels = agglomerative_cluster(&flat, (flat.len() / emb.dim() as usize) as i
 ```
 
 Crates: `crispasr-sys/` (raw FFI) + `crispasr/` (high-level) at the repo
-root; published as `crispasr-sys` / `crispasr` on crates.io.
+root, both published on crates.io. The `-sys` crate's `build.rs` builds
+`libcrispasr` with cmake from the CrispASR sources, or links a pre-built copy
+when `CRISPASR_LIB_DIR` is set. The crates.io package does not vendor the C/C++
+sources, so consume via a **git dependency** to build from source
+(`crispasr = { git = "https://github.com/CrispStrobe/CrispASR" }`), or use
+`crispasr = "0.8"` from crates.io together with a pre-built lib + `CRISPASR_LIB_DIR`.
 
 ## Dart / Flutter
 
@@ -313,6 +381,39 @@ concatenation) before watermarking, use `synthesize_raw()` +
 the C API level (see
 [`tts.md`](tts.md#spoken-disclaimer-voice-clones-only)).
 
+### Whose voice is a preset voice? (`set_speaker_identity`)
+
+`synthesize()` marks every clip (Art. 50(2)), and the voice-clone gate handles
+cloning. Neither covers the third case: a **preset** voice shipped inside a
+model can be an identifiable individual — a named donor, or a corpus speaker
+such as VCTK's `p225` — and Art. 3(60) attaches to the audio resembling that
+person, not to which pipeline produced it. CrispASR resolves this automatically
+where it has researched the model, and warns once per model where it has not.
+
+When you know the answer and CrispASR does not, say so:
+
+| Binding | Call |
+|---|---|
+| Python | `session.set_speaker_identity("real_person")` |
+| Rust | `session.set_speaker_identity("real_person")?` |
+| Go | `session.SetSpeakerIdentity("real_person")` |
+| Java | `session.setSpeakerIdentity("real_person")` |
+| C# | `session.SetSpeakerIdentity("real_person")` |
+| Dart | `session.setSpeakerIdentity('real_person')` |
+| Ruby | `CrispASR::Session.set_speaker_identity(handle, "real_person")` |
+| WASM | `Module.ttsSetSpeakerIdentity("real_person")` |
+
+Values are `real_person`, `synthetic` and `unknown`. An unrecognised value
+**raises** rather than silently becoming `unknown` — a typo must not quietly
+remove a duty you meant to declare.
+
+`real_person` makes the Art. 50(4) reminder fire for a non-cloned voice. It
+does **not** require a consent attestation: whether the donor agreed to the
+model being trained is a licensing matter settled upstream, which you cannot
+attest to. Do not reach for `synthetic` to quiet a warning you have not
+checked — of every model whose provenance this project has resolved, the large
+majority turned out to be real people.
+
 > **The CLI `--no-watermark` flag and the `CRISPASR_NO_WATERMARK` env var do
 > NOT affect the bindings.** They are wired into the `crispasr` CLI and server
 > only; `synthesize()` and `crispasr_watermark_embed()` watermark
@@ -332,19 +433,114 @@ s.set_voice("ref.wav", ref_text="exact transcription of ref.wav")
 pcm = s.synthesize("Clone my voice.")
 ```
 
+## Voice conversion (SVC / RVC)
+
+**The session C ABI is the only surface — there is no CLI verb.** RVC's input is
+ContentVec features, which CrispASR does not produce (the caller owns the
+content encoder), so a command line has nothing to feed it.
+
+```c
+// content: n_frames * content_dim, frame-major. f0_hz: n_frames, 0.0 = unvoiced.
+// The coarse mel-quantised pitch is derived internally — those constants are
+// model-side and replicating them in the caller guarantees drift.
+int crispasr_session_convert(crispasr_session* s, const float* content, int n_frames,
+                             const float* f0_hz, int speaker_id,
+                             const float* noise_zp, const float* noise_sine);
+const float* crispasr_session_convert_audio(crispasr_session* s, int* out_n_samples);
+int crispasr_session_convert_content_dim(crispasr_session* s);   // 256 (v1) or 768 (v2)
+int crispasr_session_convert_n_speakers(crispasr_session* s);
+int crispasr_session_convert_sample_rate(crispasr_session* s);   // 32k/40k/48k
+```
+
+### Check `convert_content_dim()` before you call
+
+256 means v1 (ContentVec layer 9 + `final_proj`); 768 means v2 (final layer).
+Feeding a v2 encoder's features to a v1 checkpoint is **silent** — it produces
+audio that merely sounds poor. This accessor exists so the mismatch can be
+refused loudly, which the caller cannot detect on its own.
+
+### Conversion is STOCHASTIC — that is not a bug
+
+Two independent RNG sites (the latent sample and the sine source's additive
+noise) mean output varies run to run by design. Pass `NULL` for both noise
+buffers in production.
+
+Passing explicit buffers replays a specific draw and makes the call
+**bit-identical**. That is the only way to compare against another
+implementation: correlating waveforms against a reference run is invalid here,
+because the reference disagrees with itself.
+
+| buffer | size |
+|---|---|
+| `noise_zp` | `inter_channels * n_frames` (192 × N for every shipped config) |
+| `noise_sine` | `n_frames * (sample_rate / 100)` |
+
+Feature and F0 rate is **100 Hz** — derived as `sample_rate / prod(upsample_rates)`,
+not configured. See `docs/music-transcription/SVC_RECORD_SHAPES.md` for the full
+wire contract and `RVC_BLUEPRINT.md` for the ~15 implementation details the port
+reproduces.
+
+### Licence
+
+RVC's code is MIT, but **checkpoints are not uniformly so** — community voice
+models have unclear provenance and some forks add non-commercial terms. Each
+GGUF carries its own tag and the registry gate matches on it, exactly as for the
+BTC chord weights.
+
+## Chord recognition
+
+The `btc-chords` backend is a standalone task (CLI `--chords`) — audio in, a
+chord timeline out. It is exposed on the session C-ABI
+(`include/crispasr_session.h`) and, on top of that, in the WASM/JS binding:
+
+- `crispasr_session_chords(s, pcm, n_samples, sample_rate)` — returns the span
+  count, `-1` on error or on a backend with no chord arm. Input is mono
+  float32 at any rate; it is resampled internally to the model's 22050 Hz.
+- `crispasr_session_chords_n_spans(s)`
+- `crispasr_session_chords_spans(s, &n)` — flat, session-owned float view,
+  4 floats per span: `{start_ms, end_ms, label, confidence}`.
+- `crispasr_session_chords_span_name(s, idx)` — resolves `label` to a chord
+  name (`"C"`, `"Am"`, `"G:7"`, `"N"` for no-chord).
+- `crispasr_session_chords_vocab_size(s)` — `25` or `170`, `0` if the session
+  has no chord arm; usable as a capability probe.
+
+`CRISPASR_BTC_MAJ_MIN=1` collapses the 170-class output to the 25-class
+maj/min vocabulary (default off — full 170-class).
+
+```js
+// JavaScript / WASM (bindings/javascript/emscripten.cpp)
+const vocab = Module.sessionChordsVocabSize();   // 25 | 170 | 0 (no chord arm)
+const spans = Module.sessionChords(audio, sampleRate);
+// [{ startMs, endMs, chord, confidence }, ...]
+```
+
+The Go binding links `-lbtc-chords` (cgo LDFLAGS resynced) but adds no
+hand-written wrapper function; Python, Rust, Dart, Java and Ruby have no
+dedicated wrapper yet — the C ABI above is the surface for all of them.
+
+> **Weights are non-commercial.** The upstream BTC code is MIT and CrispASR
+> itself is MIT, but the shipped weights (`cstr/btc-chords-GGUF`) are
+> CC-BY-NC-SA — trained on Isophonics / Robbie Williams / UsPop2002 chord
+> annotations. The registry refuses to download them without
+> `--accept-license cc-by-nc-sa-4.0` (or the `CRISPASR_ACCEPT_LICENSE` env
+> var). A commercial product must supply its own weights.
+
 ## Speech-to-speech
 
-Backends with S2S capability (`lfm2-audio`, `mini-omni2`) support
+Backends with S2S capability (`lfm2-audio`, `mini-omni2`, `sidon`,
+`voxcpm2-vae`) support
 end-to-end audio-in → audio-out transformation through a single model
 pass. Available in Python, Go, Dart/Flutter, and the HTTP server
 (`POST /v1/audio/speech-to-speech`).
 
-- `speech_to_speech(pcm_16khz) -> (float32 PCM @ 24 kHz, transcript)`
+- `speech_to_speech(pcm) -> (float32 PCM, transcript)`
   (`crispasr_session_speech_to_speech`)
 
-Input is 16 kHz mono float32 PCM. Returns output audio at the backend's
-TTS sample rate (24 kHz) plus an optional intermediate ASR transcript.
-Output is automatically watermarked, same as TTS.
+Input defaults to 16 kHz mono float32 PCM. Python callers with another input
+rate call `set_pcm_sample_rate(rate)` before `speech_to_speech()`; Sidon and
+VoxCPM2 AudioVAE then resample internally to 16 kHz. Conversational S2S
+backends return 24 kHz; Sidon and VoxCPM2 AudioVAE return 48 kHz audio and an
+empty transcript.
 
 ```python
 # Python
@@ -354,6 +550,24 @@ audio, sr = sf.read("input.wav", dtype="float32")  # must be 16 kHz mono
 out_pcm, transcript = s.speech_to_speech(audio)
 print(f"Transcript: {transcript}")
 sf.write("output.wav", out_pcm, 24000)
+```
+
+```python
+# Sidon restoration from a 24 kHz source
+s = crispasr.Session("sidon-v0.1-f16.gguf")
+audio, sr = sf.read("input.wav", dtype="float32")
+s.set_pcm_sample_rate(sr)
+restored, _ = s.speech_to_speech(audio)
+sf.write("restored.wav", restored, 48000)
+```
+
+```python
+# VoxCPM2 AudioVAE upscaling
+s = crispasr.Session("voxcpm2-vae-f32.gguf")
+audio, sr = sf.read("input.wav", dtype="float32")
+s.set_pcm_sample_rate(sr)
+upscaled, _ = s.speech_to_speech(audio)
+sf.write("upscaled.wav", upscaled, 48000)
 ```
 
 ```go

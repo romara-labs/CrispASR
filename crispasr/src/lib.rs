@@ -908,6 +908,180 @@ impl Session {
         Ok(out)
     }
 
+    /// Speech-to-speech: input PCM in → output PCM out via a single model
+    /// pass. Requires an S2S-capable backend (`lfm2-audio`, `mini-omni2`,
+    /// `sidon`, `voxcpm2-vae`). Input PCM must be at the backend's native
+    /// input rate (see [`Session::input_sample_rate`]).
+    ///
+    /// Returns the output PCM plus the optional intermediate transcript the
+    /// model produced on the way (`None` if the backend doesn't surface one).
+    /// Errors if the backend has no S2S capability or the pass fails.
+    pub fn speech_to_speech(&self, pcm: &[f32]) -> Result<(Vec<f32>, Option<String>), String> {
+        let mut n: c_int = 0;
+        let mut text_ptr: *mut c_char = std::ptr::null_mut();
+        let ptr = unsafe {
+            crispasr_sys::crispasr_session_speech_to_speech(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as c_int,
+                &mut text_ptr as *mut *mut c_char,
+                &mut n as *mut c_int,
+            )
+        };
+        if ptr.is_null() || n <= 0 {
+            if !text_ptr.is_null() {
+                unsafe { crispasr_sys::crispasr_session_translate_text_free(text_ptr) };
+            }
+            return Err(format!(
+                "speech_to_speech returned no audio for backend {:?} (S2S may be unsupported)",
+                self.backend()
+            ));
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr, n as usize).to_vec() };
+        unsafe { crispasr_sys::crispasr_pcm_free(ptr) };
+        let transcript = if text_ptr.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(text_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { crispasr_sys::crispasr_session_translate_text_free(text_ptr) };
+            Some(s)
+        };
+        Ok((out, transcript))
+    }
+
+    /// The sample rate (Hz) the backend expects for input PCM — `16000` for
+    /// Whisper-family backends, the model's native rate otherwise, `0` on
+    /// error. Feed [`Session::speech_to_speech`] (and TTS voice-clone input)
+    /// at this rate rather than resampling twice.
+    pub fn input_sample_rate(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_input_sample_rate(self.handle) as i32 }
+    }
+
+    /// The sample rate (Hz) of the PCM that [`Session::synthesize`] /
+    /// [`Session::speech_to_speech`] produce for this backend — the
+    /// "backend-native rate" their docs refer to. `0` when the backend
+    /// produces no audio output (ASR-only). (#332)
+    pub fn output_sample_rate(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_output_sample_rate(self.handle) as i32 }
+    }
+
+    /// Channel count for audio input (transcribe / s2s / voice references):
+    /// `1` (mono) for every current backend. Source separation is the stereo
+    /// exception and has its own surface. `0` on error. (#332)
+    pub fn input_channels(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_input_channels(self.handle) as i32 }
+    }
+
+    /// Channel count for synthesized / s2s output audio: `1` (mono) for every
+    /// current backend, `0` when the backend produces no audio output. (#332)
+    pub fn output_channels(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_output_channels(self.handle) as i32 }
+    }
+
+    /// Attest that the integrator accepts AI-content marking/disclosure
+    /// responsibility (EU AI Act Art. 50). **Required** before
+    /// [`Session::synthesize_raw`] will return unmarked audio; the default
+    /// [`Session::synthesize`] is watermarked and needs no attestation.
+    /// `attestation` is a free-text acknowledgement recorded for audit.
+    pub fn accept_marking_responsibility(&self, attestation: &str) -> Result<(), String> {
+        let c = CString::new(attestation).map_err(|e| e.to_string())?;
+        // The C side records the attestation; the return is informational
+        // (mirrors the Python/Dart bindings, which ignore it).
+        unsafe {
+            crispasr_sys::crispasr_session_accept_marking_responsibility(self.handle, c.as_ptr())
+        };
+        Ok(())
+    }
+
+    /// Declare whose voice a PRESET voice is: `"real_person"`,
+    /// `"synthetic"` or `"unknown"`.
+    ///
+    /// Cloning is not the only way to produce a deep fake: a preset voice
+    /// shipped inside a model can be an identifiable individual — a named
+    /// donor, or a corpus speaker such as VCTK's `p225` — and EU AI Act
+    /// Art. 3(60) attaches to the audio resembling that person, not to which
+    /// pipeline produced it. Setting `real_person` makes the Art. 50(4)
+    /// reminder fire for a non-cloned voice.
+    ///
+    /// It does **not** require a consent attestation: whether that donor
+    /// agreed to the model being trained is a licensing matter settled
+    /// upstream, which you cannot attest to.
+    ///
+    /// Returns `Err` on an unrecognised value rather than silently
+    /// downgrading it to `unknown`.
+    pub fn set_speaker_identity(&self, identity: &str) -> Result<(), String> {
+        let c = CString::new(identity).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_speaker_identity(self.handle, c.as_ptr()) };
+        match rc {
+            0 => Ok(()),
+            -2 => Err(format!(
+                "unrecognised speaker_identity {identity:?} (expected real_person, synthetic or unknown)"
+            )),
+            _ => Err(format!("set_speaker_identity failed (rc={rc})")),
+        }
+    }
+
+    /// Embed the AI-content watermark into f32 mono PCM, in place.
+    ///
+    /// The other half of [`Session::synthesize_raw`]: opting out of automatic
+    /// marking makes marking the result *your* duty (EU AI Act Art. 50(2)), and
+    /// this is what discharges it. Do the post-processing you opted out for —
+    /// resample, mix, concatenate — then call this on the finished buffer.
+    ///
+    /// Uses the robust, reliably detectable default strength; AudioSeal instead
+    /// if a model was loaded. Associated function, not a method: marking is a
+    /// property of the samples, not of the session that produced them.
+    pub fn watermark_embed(pcm: &mut [f32]) {
+        if pcm.is_empty() {
+            return;
+        }
+        unsafe {
+            crispasr_sys::crispasr_watermark_embed(pcm.as_mut_ptr(), pcm.len() as c_int, -1.0)
+        };
+    }
+
+    /// Confidence in `[0, 1]` that `pcm` carries the watermark.
+    ///
+    /// A weak diagnostic, not proof: the spread-spectrum detector's null mean is
+    /// 0.5, not 0, and a negative result on a short clip is mostly evidence that
+    /// the clip was short. See `docs/eu-ai-act.md` §6.7 before reading anything
+    /// into a number from here.
+    pub fn watermark_detect(pcm: &[f32]) -> f32 {
+        if pcm.is_empty() {
+            return 0.0;
+        }
+        unsafe { crispasr_sys::crispasr_watermark_detect(pcm.as_ptr(), pcm.len() as c_int) }
+    }
+
+    /// UNMARKED synthesis (no watermark / disclosure), for callers that embed
+    /// the mark themselves after post-processing. Hard-refused (returns `Err`)
+    /// unless [`Session::accept_marking_responsibility`] was called first.
+    /// Prefer [`Session::synthesize`] for the default watermarked output.
+    /// Mark the result with [`Session::watermark_embed`].
+    pub fn synthesize_raw(&self, text: &str) -> Result<Vec<f32>, String> {
+        let ctext = CString::new(text).map_err(|e| e.to_string())?;
+        let mut n: c_int = 0;
+        let ptr = unsafe {
+            crispasr_sys::crispasr_session_synthesize_raw(
+                self.handle,
+                ctext.as_ptr(),
+                &mut n as *mut c_int,
+            )
+        };
+        if ptr.is_null() || n <= 0 {
+            return Err(format!(
+                "synthesize_raw returned no audio for backend {:?} (call accept_marking_responsibility first?)",
+                self.backend()
+            ));
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr, n as usize).to_vec() };
+        unsafe { crispasr_sys::crispasr_pcm_free(ptr) };
+        Ok(out)
+    }
+
     /// Drop the kokoro per-session phoneme cache. No-op for non-kokoro
     /// backends. Useful for long-running daemons that resynthesize across
     /// many speakers and want bounded memory. (PLAN #56 #5)
@@ -945,6 +1119,29 @@ impl Session {
             unsafe { crispasr_sys::crispasr_session_set_target_language(self.handle, c.as_ptr()) };
         if rc != 0 {
             return Err(format!("set_target_language failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Language a voice-cloning reference clip is spoken in (issue #329).
+    ///
+    /// Cross-lingual TTS backends (cosyvoice3) compare it to the requested
+    /// output language — [`set_target_language`](Session::set_target_language),
+    /// falling back to [`set_source_language`](Session::set_source_language) —
+    /// and drop the reference transcript when they differ, so the clone speaks
+    /// the target language instead of carrying the reference's accent.
+    ///
+    /// Optional: the backend otherwise infers the reference language from the
+    /// voice-bank entry or the reference transcript. That inference cannot
+    /// answer for a short transcript, and when it cannot, the requested target
+    /// language has no effect — set this to make it explicit.
+    pub fn set_tts_reference_language(&self, lang: &str) -> Result<(), String> {
+        let c = CString::new(lang).map_err(|e| e.to_string())?;
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_tts_reference_language(self.handle, c.as_ptr())
+        };
+        if rc != 0 {
+            return Err(format!("set_tts_reference_language failed (rc={})", rc));
         }
         Ok(())
     }
@@ -1381,6 +1578,25 @@ impl Session {
         Ok(())
     }
 
+    /// Synthesize `phonemes` verbatim instead of phonemizing the text — the
+    /// seam between text processing and the acoustic model. Use it to reproduce
+    /// another implementation's pronunciation exactly, or to tell a G2P bug from
+    /// a model bug (#316). An empty string clears it.
+    ///
+    /// Honoured by `kokoro` and `piper`; other backends soft no-op (`rc = -2`).
+    pub fn set_tts_phonemes(&self, phonemes: &str) -> Result<(), String> {
+        let c = CString::new(phonemes).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_tts_phonemes(self.handle, c.as_ptr()) };
+        if rc == -2 {
+            return Err("backend has no phonemes-in entry point (kokoro and piper do)".to_string());
+        }
+        if rc != 0 {
+            return Err(format!("set_tts_phonemes failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
     /// Select + load a punctuation-restoration model (`auto`/`firered`/`fullstop`/
     /// `punctuate-all`/`pcs`/path; `"none"`/`""` unloads). Auto-downloads on first use.
     pub fn set_punc_model(&self, punc_model: &str) -> Result<(), String> {
@@ -1400,6 +1616,30 @@ impl Session {
             unsafe { crispasr_sys::crispasr_session_set_hotwords(self.handle, c.as_ptr(), boost) };
         if rc != 0 {
             return Err(format!("set_hotwords failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Apply a named bundle of the four decoder fallback thresholds:
+    /// `"conservative"`, `"balanced"` (the shipped defaults, a no-op) or
+    /// `"aggressive"`. `"strict"`/`"default"`/`"loose"` are aliases. Mirrors the
+    /// CLI's `--sensitivity`.
+    ///
+    /// The four thresholds interact — a decode is only retried when the logprob
+    /// *and* no-speech bars are both crossed — so they move as a set. A later
+    /// [`Session::set_fallback_thresholds`] overrides this. An unrecognised
+    /// preset is rejected rather than silently treated as `"balanced"`.
+    pub fn set_sensitivity(&self, preset: &str) -> Result<(), String> {
+        let c = CString::new(preset).map_err(|e| e.to_string())?;
+        let rc = unsafe { crispasr_sys::crispasr_session_set_sensitivity(self.handle, c.as_ptr()) };
+        if rc == -2 {
+            return Err(format!(
+                "unknown sensitivity preset {:?} (expected: conservative, balanced, aggressive)",
+                preset
+            ));
+        }
+        if rc != 0 {
+            return Err(format!("set_sensitivity failed (rc={})", rc));
         }
         Ok(())
     }
@@ -1797,6 +2037,36 @@ pub struct RegistryEntry {
     pub approx_size: String,
 }
 
+/// Role of one artifact in a canonical model download bundle.
+///
+/// Mirrors the append-only `crispasr_registry_artifact_kind` C enum, so
+/// new kinds may appear in minor releases — match with a `_` arm (#332).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RegistryArtifactKind {
+    Primary,
+    Companion,
+    Extra,
+}
+
+/// One file in a backend's canonical default download bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryArtifact {
+    pub kind: RegistryArtifactKind,
+    pub filename: String,
+    pub url: String,
+    pub approx_size: String,
+}
+
+/// The exact artifact bundle downloaded by `-m auto`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryBundle {
+    pub backend: String,
+    pub license: String,
+    pub requires_acceptance: bool,
+    pub artifacts: Vec<RegistryArtifact>,
+}
+
 /// Look up the canonical GGUF for a backend (whisper, parakeet, canary,
 /// voxtral, voxtral4b, granite, granite-4.1, qwen3, cohere, wav2vec2). Returns `None`
 /// on miss.
@@ -1830,6 +2100,93 @@ pub fn registry_lookup(backend: &str) -> Result<Option<RegistryEntry>, String> {
 /// Look up by filename (exact match, then fuzzy substring).
 pub fn registry_lookup_by_filename(filename: &str) -> Result<Option<RegistryEntry>, String> {
     registry_call_inner(filename, false)
+}
+
+/// Return the backend's exact canonical `-m auto` artifact bundle.
+///
+/// Artifacts are ordered as downloaded: primary model, inline companion,
+/// then any extra companions. No preferred quant is applied. Returns `None`
+/// when the backend has no registry entry.
+pub fn registry_default_bundle(backend: &str) -> Result<Option<RegistryBundle>, String> {
+    if backend.is_empty() {
+        return Ok(None);
+    }
+    let backend_c = CString::new(backend).map_err(|e| format!("backend NUL: {e}"))?;
+    let mut canonical_buf = [0u8; 256];
+    let mut license_buf = [0u8; 1024];
+    let mut requires_acceptance = 0;
+    let count = unsafe {
+        crispasr_sys::crispasr_registry_default_bundle_info_abi(
+            backend_c.as_ptr(),
+            canonical_buf.as_mut_ptr() as *mut c_char,
+            canonical_buf.len() as c_int,
+            license_buf.as_mut_ptr() as *mut c_char,
+            license_buf.len() as c_int,
+            &mut requires_acceptance,
+        )
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    if count < 0 {
+        return Err(format!(
+            "default-bundle registry lookup failed (rc={count})"
+        ));
+    }
+
+    fn slice_to_string(buf: &[u8]) -> String {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    }
+
+    let mut artifacts = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let mut kind = 0;
+        let mut filename_buf = [0u8; 256];
+        let mut url_buf = [0u8; 2048];
+        let mut size_buf = [0u8; 64];
+        let rc = unsafe {
+            crispasr_sys::crispasr_registry_default_bundle_artifact_abi(
+                backend_c.as_ptr(),
+                index,
+                &mut kind,
+                filename_buf.as_mut_ptr() as *mut c_char,
+                filename_buf.len() as c_int,
+                url_buf.as_mut_ptr() as *mut c_char,
+                url_buf.len() as c_int,
+                size_buf.as_mut_ptr() as *mut c_char,
+                size_buf.len() as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "default-bundle artifact {index} lookup failed (rc={rc})"
+            ));
+        }
+        let kind = match kind {
+            0 => RegistryArtifactKind::Primary,
+            1 => RegistryArtifactKind::Companion,
+            2 => RegistryArtifactKind::Extra,
+            value => {
+                return Err(format!(
+                    "default-bundle artifact {index} has unknown kind {value}"
+                ))
+            }
+        };
+        artifacts.push(RegistryArtifact {
+            kind,
+            filename: slice_to_string(&filename_buf),
+            url: slice_to_string(&url_buf),
+            approx_size: slice_to_string(&size_buf),
+        });
+    }
+
+    Ok(Some(RegistryBundle {
+        backend: slice_to_string(&canonical_buf),
+        license: slice_to_string(&license_buf),
+        requires_acceptance: requires_acceptance != 0,
+        artifacts,
+    }))
 }
 
 fn registry_call_inner(key: &str, by_backend: bool) -> Result<Option<RegistryEntry>, String> {
@@ -2007,8 +2364,11 @@ pub fn align_words(
 // Language identification (shared C-ABI, 0.4.6+)
 // =========================================================================
 
+/// Mirrors the append-only C LID-method enum, so new methods may appear
+/// in minor releases — match with a `_` arm (#332).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum LidMethod {
     /// Whisper encoder + language head. Needs a multilingual ggml-*.bin model.
     Whisper = 0,
@@ -2200,8 +2560,11 @@ impl DiarizeSegment {
     }
 }
 
+/// Mirrors the append-only `CrispasrDiarizeMethod` C enum, so new methods
+/// may appear in minor releases — match with a `_` arm (#332).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum DiarizeMethod {
     /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
     Energy = 0,
@@ -2212,9 +2575,18 @@ pub enum DiarizeMethod {
     /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net;
     /// requires a model path.
     Pyannote = 3,
+    /// Mono-friendly, ML-based (#324): WeSpeaker embeddings + spectral
+    /// clustering (the FoxNose recipe). Requires
+    /// [`DiarizeOptions::foxnose_embedder_path`]. Unlike the other methods
+    /// it derives speaker turns from the audio and attributes each caller
+    /// segment to the turn it overlaps most.
+    FoxNose = 4,
 }
 
+/// Construct via [`Default`] and set fields as needed — the struct grows
+/// alongside the append-only C ABI (#332).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DiarizeOptions {
     pub method: DiarizeMethod,
     /// GGUF path. Required for `Pyannote`, ignored otherwise.
@@ -2225,6 +2597,15 @@ pub struct DiarizeOptions {
     /// audio, so the diarizer can map absolute segment timestamps back
     /// to sample indices.
     pub slice_t0: f64,
+    /// GGUF path for the speaker-embedding model (WeSpeaker ResNet34-LM).
+    /// Required for `FoxNose`, ignored otherwise.
+    pub foxnose_embedder_path: Option<String>,
+    /// FoxNose speaker-count lower bound for automatic estimation (0 -> 1).
+    pub min_speakers: i32,
+    /// FoxNose speaker-count upper bound for automatic estimation (0 -> 8).
+    pub max_speakers: i32,
+    /// FoxNose: > 0 pins the speaker count and skips estimation entirely.
+    pub num_speakers: i32,
 }
 
 impl Default for DiarizeOptions {
@@ -2234,6 +2615,10 @@ impl Default for DiarizeOptions {
             pyannote_model_path: None,
             n_threads: 4,
             slice_t0: 0.0,
+            foxnose_embedder_path: None,
+            min_speakers: 0,
+            max_speakers: 0,
+            num_speakers: 0,
         }
     }
 }
@@ -2241,13 +2626,14 @@ impl Default for DiarizeOptions {
 /// Assign a speaker index to each of `segs`, mutating each
 /// [`DiarizeSegment::speaker`] in place.
 ///
-/// Four methods — see [`DiarizeMethod`]. `left` is mono PCM for
+/// Five methods — see [`DiarizeMethod`]. `left` is mono PCM for
 /// mono-only methods, otherwise the left channel of a stereo pair.
 /// When `is_stereo` is true, `right` must be `Some`. All PCM is 16 kHz
 /// float32.
 ///
-/// Returns `Ok(())` on success. Only [`DiarizeMethod::Pyannote`] can
-/// fail (model load failure).
+/// Returns `Ok(())` on success. Only the model-backed methods
+/// ([`DiarizeMethod::Pyannote`], [`DiarizeMethod::FoxNose`]) can fail
+/// (model load failure).
 pub fn diarize_segments(
     segs: &mut [DiarizeSegment],
     left: &[f32],
@@ -2266,6 +2652,13 @@ pub fn diarize_segments(
         ),
         _ => None,
     };
+    let foxnose_c = match (&opts.foxnose_embedder_path, opts.method) {
+        (Some(p), DiarizeMethod::FoxNose) => Some(
+            CString::new(p.as_str())
+                .map_err(|e| format!("foxnose_embedder_path contains NUL: {e}"))?,
+        ),
+        _ => None,
+    };
 
     let abi_opts = crispasr_sys::CrispasrDiarizeOptsAbi {
         method: opts.method as i32,
@@ -2275,6 +2668,14 @@ pub fn diarize_segments(
             .as_ref()
             .map(|c| c.as_ptr())
             .unwrap_or(std::ptr::null()),
+        foxnose_embedder_path: foxnose_c
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null()),
+        min_speakers: opts.min_speakers,
+        max_speakers: opts.max_speakers,
+        num_speakers: opts.num_speakers,
+        _pad2: 0,
     };
 
     let mut abi_segs: Vec<crispasr_sys::CrispasrDiarizeSegAbi> = segs
@@ -2310,7 +2711,7 @@ pub fn diarize_segments(
             }
             Ok(())
         }
-        1 => Err("pyannote model load failed".to_string()),
+        1 => Err("diarize model load failed (pyannote / foxnose embedder)".to_string()),
         -1 => Err("invalid arguments to crispasr_diarize_segments_abi".to_string()),
         other => Err(format!("crispasr_diarize_segments_abi returned {other}")),
     }

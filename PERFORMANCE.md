@@ -4,6 +4,47 @@ Test audio: jfk.wav (11.0s), Q4_K quantization, greedy decode (`-bs 1`).
 
 ---
 
+## Metal im2col: the v0.17 sync silently dropped the batch-1 occupancy win — restored as kernel_im2col_flat, melotts hifigan back to ~1.85x (Apple M1, 2026-08-06)
+
+The v0.17 ggml sync removed `CRISPASR_METAL_IM2COL_OCC` (upstream reworked
+the dispatch; see `tools/upstream-prs/SYNC-v0.17-CONFLICTS.md` "re-derive if
+regressions appear") — which un-fixed the melotts/piper "P0 hifigan" row
+below: every batch-1 Metal conv went back to KH*KW-thread threadgroups. The
+re-derivation now lives in the shared fork as **`kernel_im2col_flat`**
+(`89a2039d`, branch `sync/upstream-v0.17`; authored against CrispEmbed's
+PP-OCR profile, where the same kernel is 2.3x on the recognizer): one thread
+per dst element from a `(ceil(OW*CHW/256), OH, N)` grid, predicate
+`N*KH*KW < 128 || IC == 1` (also covers the `conv_2d_dw` lowering the OCC
+variant missed), `CRISPASR_METAL_IM2COL_FLAT=0` restores the standard
+kernel. A first cut with int64-divmod flat indexing was SLOWER than the
+broken dispatch — Apple GPUs emulate int64 division.
+
+This pin bump (`a0f7289d` → `89a2039d`) re-activates the win. Measured, M1,
+interleaved same-binary pairs:
+
+- **melotts** (en-q8, 3.2 s utterance): hifigan_decode 2026/2019 ms →
+  **1097/1094 ms (1.85x)**, synthesize 2315/2318 → 1364/1365 ms (1.7x) on
+  the two quiet pairs; ASR round-trip reproduces the text. WAV byte-compare
+  is NOT a valid gate for melotts — the VITS flow is stochastic and two
+  legacy-arm runs already differ; the round-trip is the gate.
+- **moonshine-tiny** (jfk.wav): transcript **byte-identical** flat vs
+  legacy, RTF neutral-to-slightly-better (82.0 vs 80.0x / 73.7 vs 70.4x /
+  62.5 vs 62.6x).
+- **paraformer-zh-q4_k**: transcript **byte-identical**. Wall pairs were
+  noise-dominated (0.85–15.1 s spread; other sessions held load at 14–18,
+  and an order-reversal control still disagreed with itself) — the
+  attributable quantity is the per-op GPU time of its 2 im2col nodes:
+  **8.5–9.1 ms/node legacy → 0.4–1.0 ms/node flat (9–20x)**, ~16 ms saved
+  per run, <1.5% of wall either way. No mechanism for a regression.
+- 1473/1473 unit tests on the bumped pin.
+
+The historical OCC numbers in the melotts row below (2–3x hifigan, 1.65x
+moonshine) were measured on the pre-v0.17 variant on a quiet box; today's
+moonshine is closer to neutral because the current decode path spends its
+time elsewhere. CrispEmbed-side evidence (2.3x PP-OCR rec, 1.6x
+layout_detect, 18-fixture byte-identity) is in their `PERFORMANCE.md`.
+`tools/upstream-prs/23` should be re-drafted from this kernel for upstream.
+
 ## Backend × Optimization matrix
 
 At-a-glance view of which performance knobs each backend supports today,
@@ -201,12 +242,48 @@ the §232 campaign. Verified against current code, not carried from this doc.
 - **chatterbox flash "stub"** — false: `chatterbox.cpp:1806,2662`, default ON.
 - **tada "two sequential B=1 FM passes"** — false: opt-in B=2 graph exists
   (`tada_tts.cpp:238`).
-- **Batched TDT/RNNT decode is env-gated, not GPU-gated** — it is a CPU
-  sgemm-batching win (370 sgemv → 26 sgemm), `CRISPASR_TDT_BATCH` /
-  `CRISPASR_RNNT_BATCH`, default OFF (parakeet.cpp:3179; nemotron.cpp:2526).
+- **Batched TDT/RNNT decode (`CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH`,
+  default OFF) is a MEASURED CPU LOSS for parakeet TDT — keep it OFF, do NOT
+  flip.** The "370 sgemv → 26 sgemm" framing predicted a CPU win; the #81 A/B on
+  a clean Kaggle CPU (P100 box, `chr1str/crispasr-issue81-onnx-bench`,
+  2026-07-18) measured the opposite on parakeet-tdt-0.6b, transcript
+  byte-identical in both arms:
+
+  | clip | default decode | `TDT_BATCH=1` | ratio |
+  |------|---------------|---------------|-------|
+  | jfk 11 s   | **4.0×** RT | 3.2× RT | 0.80× (20% slower) |
+  | long 134 s | **3.0×** RT | 2.2× RT | 0.73× (27% slower) |
+
+  Why: batching the joint over ALL T encoder frames does strictly more work than
+  TDT's duration-skipping greedy decode, which visits far fewer frames. One big
+  sgemm does not pay for the extra frames. (parakeet-ctc is unaffected, 0.99× —
+  it never enters the TDT decode.) The batched fn stays available as an opt-in
+  and is still used by the long-form streamed path; the short-form default
+  (parakeet.cpp:3607/3984) must stay per-frame greedy.
 
 ### Verified state
 
+- **Fleet FASTCONV campaign (2026-07-16, `docs/perf-sweep/PLAN.md`)** — shared
+  `core_dac::fastconv_cache` + fc-aware `conv1d`/`res_unit`/`dec_block`/
+  `build_decode_graph`, and a `core_hifigan::forward`/`conv1d` overload, so
+  codec/vocoder backends kill the per-graph F16→F32 conv cast from ONE
+  implementation. Wired + A/B-verified (byte-identical, seed-isolated), all
+  default ON: omnivoice, irodori (`CRISPASR_IRODORI_FASTCONV`), zonos
+  (`CRISPASR_ZONOS_FASTCONV`), **speecht5 (`CRISPASR_SPEECHT5_FASTCONV`, 74 F16
+  kernels)**, **chatterbox_s3gen (`CRISPASR_S3GEN_FASTCONV`, 275 F16 kernels,
+  split-load-aware pointer-swap; ON vs OFF @seed42 = 0/32768)**. Model-free unit
+  test `test-fastconv` (210 assertions).
+  - ⚠ **Coverage triage (GGUF-parsed, don't trust the doc):** FASTCONV only
+    engages on **F16** conv kernels (the cast it kills). The HiFi-GAN overload
+    "sets up 3 backends" was over-optimistic — only **speecht5** ships F16 by
+    default. **fastpitch** default is q8_0 (F32 kernels → no-op; only its
+    non-default `-f16` variant is F16, and that GGUF hits a pre-existing loader
+    bug). **bananamind** ships only q8_0 + f32 (no F16 variant at all → can never
+    engage; not wired). Grep audit found only 2/26 codec backends had FASTCONV
+    before this campaign — the earlier "landed for 5 backends" was an overclaim.
+  - **Not-yet:** chatterbox's 175 K=1 kernels could also take the im2col→matmul
+    trick (a further win beyond cast-kill), but it changes reduction order so it
+    needs its own A/B on the drift-prone GPU path — deferred.
 - **§232 TTS campaign** (persistent sched-free graph + batched CFG cond+uncond +
   device KV + FASTCONV codec) has landed for qwen3-tts, voxtral-tts, omnivoice,
   tada, chatterbox. Un-migrated: f5, dots, kugelaudio, pocket (natural next
@@ -220,6 +297,25 @@ the §232 campaign. Verified against current code, not carried from this doc.
   Metal decode is the same f32-no-cast path). GPU codec decode measured slower on M1
   Metal (dispatch-bound) → gated `OMNIVOICE_CODEC_GPU`, default OFF, pending Kaggle CUDA.
   `--tts-steps` now drives omnivoice's stage0 step count (default 32).
+- **omnivoice single-shot synthesis (2026-07-16):** omnivoice was sentence-chunked by
+  the generic TTS path; a reporter (#254, CUDA) showed that cost 15–20% vs omnivoice.cpp
+  (3 chunks → 3 graph builds + 3 CUDA-graph warmups + 3×num_steps). Added omnivoice to
+  the single-shot whitelist (masked-iterative → whole span in one pass, like the
+  reference). M1 A/B: net faster even here (decode 9.1 s vs 23.7 s from 1 vs 3 decode
+  graph builds outweighs +6% gen O(T²)); on CUDA the gen graph-reuse is a bigger win.
+  Escape hatch `CRISPASR_OMNIVOICE_CHUNK=1` restores chunking. Interval-CFG
+  (`OMNIVOICE_CFG_INTERVAL=K`) recomputes uncond every K steps — K=2 ≈ −30% stage0,
+  opt-in/approximate.
+- **omnivoice fused stage0 step graph (2026-07-16, default ON):** the residual #254
+  gap vs omnivoice.cpp was per-step HOST overhead (≈18 MB embed readback + CPU
+  codebook sum + 5 MB re-upload, full-seq 39 MB logits readback, single-threaded
+  ~13M-exp CFG scoring). Fused graph: ids-only upload (~140 KB), in-graph embeds
+  (get_rows + cb-order adds, bitwise == host), target-slice-only logits, threaded
+  scoring (rng-order preserved). Codes byte-identical to legacy on M1 Metal (5 config
+  classes) and CUDA (reporter cmp). **Reporter's RTX 5070 Ti: gen 3.55 s → 1.53 s
+  (2.3×), RTF 0.17 → 0.07 for the 21.8 s paragraph — ~2× faster than omnivoice.cpp
+  (0.144), single CUDA-graph warmup.** Per-step: fwd 27.4 ms + score 11.6 + read 5.2
+  + sample 1.5 = 45.9 ms. `OMNIVOICE_FUSED_STEP=0` restores the legacy path.
 - **Codec decoders are already ggml-graph** (snac/dac/seanet/hifigan/adaln/
   qformer). Scalar survivors: `core/rvq.cpp` encode-search and `core/istft.h`
   O(N²) IRFFT (both run once/synthesis).
@@ -248,13 +344,44 @@ the §232 campaign. Verified against current code, not carried from this doc.
 | **P1** | f5/dots/kugelaudio/pocket | CFG serial / no persistent graph — un-migrated §232 targets | ~halves DiT time |
 | **P1** | granite/moss Metal decode | Per-op dispatch ~100ms/step; ggml-metal has no ICB replay | Dominant Metal decode cost |
 | **P2** | Scalar CPU hotpaths | RNN-T LSTM pred+joint; granite cpu_linear+depthwise; paraformer CIF; rvq encode; istft IRFFT; titanet mel front-end; diarize `apply_xcorr` | Per-token/frame scalar loops |
-| **P2** | parakeet/nemotron | Batched sgemm decode opt-in default-OFF — validate + flip on | Unshipped CPU win |
+| ~~P2~~ **CLOSED** | parakeet | Batched TDT decode validated on Kaggle CPU (#81, 2026-07-18): **0.73–0.80× = SLOWER**, byte-identical → keep default OFF, do NOT flip | Predicted win, measured a loss |
+| **OPEN** | parakeet CPU vs onnx-asr | crispasr parakeet-tdt CPU 4.0×/3.0× vs onnx-asr int8 8.6×/5.8× ⇒ **~2.1× slower on CPU** (the real #81 residual). Needs a CPU BLAS/kernel lever — batched decode is ruled out | GPU is fine (P100 36.9×/50.9×) |
 | **P2** | align_wav2vec2_ctc | **Reloads the 300MB–1GB model every call** (`crispasr_aligner.cpp:315`) — missing the §176e ctx-cache | Concrete single-file win |
 | **P2** | paraformer / voxcpm2 | CPU-only, no GPU backend (paraformer leaks 256MB buffer) | GPU offload available |
 | **P3** | Threading | Hardcoded default 4 threads in ~90 sites; only whisper-core caps to `min(4, hw)` | Idle cores on big hosts |
 | **P3** | Misc | pyannote per-slice not once-over-audio (#107); RNNoise recreates state+resamplers/call; glm mel padded to 3000 always | Localized |
 
 ### Highest-ceiling paths forward
+
+### dots.tts baseline and optimization queue (#319, 2026-07-28)
+
+The first local low-memory benchmark used an Apple M1, Metal, a mixed `Q4_K`
+core (about 2.2 GiB; DiT tensors intentionally left in F16) and a `Q8_0`
+vocoder (about 330 MiB). With an eight-patch cap, synthesis produced valid,
+recognizable audio and measured:
+
+| ODE steps | Total | Flow matching | Vocoder decode |
+|---:|---:|---:|---:|
+| 16 | 24.2 s | 13.7 s | 10.4 s |
+| 8 | 16.2 s | 5.8 s | 10.5 s |
+
+Model loading is excluded. The patch cap makes this a bounded smoke benchmark,
+not a real-time claim for full utterances. Eight steps is about 1.49x faster in
+this run, but the vocoder becomes the floor once DiT steps are reduced. The
+current Metal path already uses the persistent fused DiT graph by default;
+remaining high-value work is:
+
+1. Make vocoder decode reuse a fixed-shape graph and benchmark the batch-1
+   convolution occupancy fix against the existing HiFi-GAN measurements.
+2. Batch CFG conditional/unconditional work with a device-resident dequantized
+   weight copy, preserving the quantization safety rule established by
+   chatterbox.
+3. Add length-bucketed graph reuse for autoregressive patch counts, then measure
+   the existing approximate CFG-interval mode separately from exact decoding.
+
+Every dots.tts speed change must retain the audio roundtrip gate (TTS WAV → ASR)
+and compare decoded output, not only process exit status. Do not quantize the
+DiT tensors to F16 or increase the memory footprint as an optimization.
 
 1. **Lk-bucketed decode-step graph caching** generalized to the 30+ decoders
    that rebuild per step — templates: qwen3-tts (5 buckets), granite §210

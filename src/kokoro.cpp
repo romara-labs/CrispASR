@@ -34,9 +34,12 @@
 #include "core/align.h"
 #include "core/attention.h"
 #include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
+#include "core/phoneme_dialect.h" // #316: one G2P, several phoneme conventions
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -68,7 +71,7 @@
 namespace {
 
 bool env_bool(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
 }
 
@@ -79,7 +82,7 @@ bool env_bool(const char* k) {
 bool kokoro_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("KOKORO_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_KOKORO_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -242,6 +245,10 @@ struct kokoro_context {
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
     std::vector<uint8_t> compute_meta;
+
+    // FASTCONV: baked F32 copies of the F16 conv kernels (cast-kill). Owns its own
+    // ctx+buffer; freed in kokoro_free before the backend.
+    core_dac::fastconv_cache fc;
 
     // Voice pack (secondary GGUF).
     kokoro_voice_pack vp;
@@ -1784,7 +1791,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     // production builds pay zero cost. Used to bisect the ggml_norm
     // Metal regression — keep available for the next per-op-level bug.
     static const bool s_dbg = []() {
-        const char* v = std::getenv("KOKORO_DEBUG_INTERMEDIATES");
+        const char* v = crispasr_env::get("CRISPASR_KOKORO_DEBUG_INTERMEDIATES");
         return v && *v && *v != '0';
     }();
     auto run_stack = [&](const char* prefix, const char* stage_branch, ggml_tensor* in) -> ggml_tensor* {
@@ -2914,8 +2921,8 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
         return nullptr;
     }
 
-    // 2. Build `har` (22, T_har) on CPU.
-    const char* seed_env = std::getenv("KOKORO_SEED");
+    // 3. Build `har` (22, T_har) on CPU.
+    const char* seed_env = crispasr_env::get("CRISPASR_KOKORO_SEED");
     uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
     std::mt19937 rng(seed);
     int T_har = 0;
@@ -3235,7 +3242,7 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     //                              the M1 hang doesn't apply and CPU path
     //                              is dramatically slower than the GPU.
     // Mirrors the QWEN3_TTS_CODEC_GPU pattern from the qwen3-tts codec.
-    p.gen_force_metal = env_bool("KOKORO_GEN_FORCE_METAL") || env_bool("KOKORO_GEN_GPU");
+    p.gen_force_metal = env_bool("CRISPASR_KOKORO_GEN_FORCE_METAL") || env_bool("CRISPASR_KOKORO_GEN_GPU");
     p.flash_attn = true;
     p.length_scale = 1.0f;
     std::strncpy(p.espeak_lang, "en-us", sizeof(p.espeak_lang) - 1);
@@ -3423,6 +3430,39 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         }
     }
 
+    // ---- FASTCONV: bake one F32 copy of each F16 conv kernel and re-point the
+    // c->tensors map entry to it. kokoro feeds these kernels straight to
+    // ggml_conv_1d, which casts an F16 kernel → F32 inside EVERY graph when the
+    // activations are F32; baking that cast once makes it a no-op, bitwise-equal.
+    // The ConvTranspose1d upsamples (dec.gen.ups.{0,1}) use the SEPARATE F32
+    // `ups_w_perm` buffers built just above (from the original F16 src), so swapping
+    // their c->tensors entry is harmless (that entry is unused afterwards). The
+    // depthwise-convt path (core_convt::convt1d_depthwise_2x_k3) casts F16→F32
+    // internally too, so an already-F32 base just skips that cast. Gated
+    // CRISPASR_KOKORO_FASTCONV (default on — numerically equivalent).
+    {
+        const char* env = getenv("CRISPASR_KOKORO_FASTCONV");
+        const bool fc_on = !env || env[0] != '0';
+        std::vector<ggml_tensor*> kernels;
+        for (auto& kv : c->tensors) {
+            ggml_tensor* w = kv.second;
+            if (w && w->type == GGML_TYPE_F16 && ggml_n_dims(w) == 3)
+                kernels.push_back(w);
+        }
+        c->fc.bake(c->backend, kernels, fc_on);
+        int swapped = 0;
+        for (auto& kv : c->tensors) {
+            ggml_tensor* baked = c->fc.get(kv.second);
+            if (baked != kv.second) {
+                kv.second = baked;
+                swapped++;
+            }
+        }
+        if (getenv("CRISPASR_KOKORO_FASTCONV_DEBUG"))
+            fprintf(stderr, "kokoro: FASTCONV %s: %zu F16 3D conv kernels, %d baked+swapped\n", fc_on ? "ON" : "OFF",
+                    kernels.size(), swapped);
+    }
+
     // ---- Schedulers ----
     {
         ggml_backend_t backends[2];
@@ -3470,9 +3510,9 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         if (c->gen_backend != c->backend_cpu) {
             // Disambiguate which env var was set so the log line tells the
             // operator which knob is in effect.
-            if (env_bool("KOKORO_GEN_GPU"))
+            if (env_bool("CRISPASR_KOKORO_GEN_GPU"))
                 gpu_label = "GPU (KOKORO_GEN_GPU)";
-            else if (env_bool("KOKORO_GEN_FORCE_METAL"))
+            else if (env_bool("CRISPASR_KOKORO_GEN_FORCE_METAL"))
                 gpu_label = "GPU (KOKORO_GEN_FORCE_METAL)";
         }
         fprintf(stderr, "kokoro: loaded %zu tensors from '%s'  gen=%s\n", c->tensors.size(), path_model,
@@ -3941,19 +3981,37 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     static const bool skip_builtin = g2p_strategy && strcmp(g2p_strategy, "espeak-only") == 0;
     static const bool skip_espeak = g2p_strategy && strcmp(g2p_strategy, "builtin-only") == 0;
 
+    // #316 round 2: keep punctuation in the phoneme string for the non-English
+    // built-in G2Ps. English is settled — misaki emits the marks and the ASR
+    // round-trip proves the difference. de/fr/es have no equivalent reference,
+    // so this is A/B'd by round-trip on kokoro-de-hui-base and gated:
+    // CRISPASR_KOKORO_PUNCT=0 restores the old drop-everything behaviour.
+    // Never remove the gate — it is the bisection mechanism.
+    static const bool kokoro_punct = [] {
+        const char* v = crispasr_env::get("CRISPASR_KOKORO_PUNCT");
+        return !(v && *v && strcmp(v, "0") == 0);
+    }();
+    auto kokoro_punctuation = [] { return kokoro_punct; };
+
     // Lambda: try builtin phonemizers for the given language.
     auto try_builtin = [&]() -> bool {
         if (skip_builtin)
             return false;
         bool ok = false;
-        if (lang == "en" || lang == "en-us" || lang == "en-gb")
-            ok = crispasr::phonemize_builtin_en(lang, text, out);
-        else if (lang == "de")
-            ok = crispasr::phonemize_builtin_de(lang, text, out);
+        if (lang == "en" || lang == "en-us" || lang == "en-gb") {
+            // #316: prefer misaki's own lexicon — Kokoro was trained on its
+            // output, and CMUdict disagrees with it on ~42% of words (stress
+            // and unstressed vowels, not spelling). Falls back automatically
+            // when the lexicon is not installed.
+            ok = crispasr::phonemize_misaki_en(lang, text, out);
+            if (!ok)
+                ok = crispasr::phonemize_builtin_en(lang, text, out, /*misaki_style=*/true);
+        } else if (lang == "de")
+            ok = crispasr::phonemize_builtin_de(lang, text, out, kokoro_punctuation());
         else if (lang == "fr" || lang == "fr-fr")
-            ok = crispasr::phonemize_builtin_fr(lang, text, out);
+            ok = crispasr::phonemize_builtin_fr(lang, text, out, kokoro_punctuation());
         else if (lang == "es" || lang == "es-es")
-            ok = crispasr::phonemize_builtin_es(lang, text, out);
+            ok = crispasr::phonemize_builtin_es(lang, text, out, kokoro_punctuation());
         return ok && !out.empty();
     };
 
@@ -3985,6 +4043,44 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     if (ok && !out.empty()) {
         if (is_cmn_lang(lang))
             strip_cmn_tone_numbers(out);
+        // #316: our G2P (and espeak) speak textbook IPA — `tʃ`, `oʊ`, `ː`.
+        // Kokoro was trained on misaki's alphabet, which uses `ʧ`, `O` and no
+        // length marks. Every symbol is in the vocab either way, so nothing is
+        // dropped and nothing errors; the model just gets a token sequence it
+        // never saw in training and drifts ("sounds British"). Rewrite it.
+        // Kokoro-scoped on purpose: piper wants the espeak spelling.
+        // Default ON; CRISPASR_KOKORO_MISAKI_IPA=0 restores the raw G2P
+        // spelling for A/B (never delete the old path).
+        static const bool misaki_ipa = [] {
+            const char* v = crispasr_env::get("CRISPASR_KOKORO_MISAKI_IPA");
+            return !(v && *v && strcmp(v, "0") == 0);
+        }();
+        const bool is_en = lang.empty() || lang.rfind("en", 0) == 0;
+        if (is_en && misaki_ipa)
+            out = core_phoneme::convert(out, core_phoneme::Dialect::Misaki);
+        // #316 German. Two separate things, and only the first is on:
+        //
+        // (a) VOCABULARY FIXUPS — always. `ʏ` is not in the German model's
+        //     178-token vocabulary, and a missing symbol is DROPPED, not
+        //     approximated, so we were deleting the vowel out of every
+        //     München, Frühstück, fünf, Glück and zurück. dida-80b's own
+        //     dataset script makes the same `ʏ`→`y` substitution.
+        //
+        // (b) misaki's TIED-SEQUENCE COLLAPSE (`ʦvˈI` for `tsvˈaɪ`) — opt-in,
+        //     CRISPASR_KOKORO_DE_MISAKI_ALPHABET=1. It is what the published
+        //     training recipe does and it moves our phonemes measurably closer
+        //     to it, but on the hui base we ship it made the ASR round-trip
+        //     WORSE, so it does not get the default on evidence we have.
+        //     See PLAN.md — this needs a listening test, and it is likely to
+        //     be right for the newer kikiri-tts models.
+        if (lang.rfind("de", 0) == 0) {
+            static const bool de_alphabet = [] {
+                const char* v = crispasr_env::get("CRISPASR_KOKORO_DE_MISAKI_ALPHABET");
+                return v && *v && strcmp(v, "0") != 0;
+            }();
+            out = core_phoneme::convert(out,
+                                        de_alphabet ? core_phoneme::Dialect::MisakiDe : core_phoneme::Dialect::DeVocab);
+        }
         ctx->phon_cache.insert(key, out);
         return true;
     }
@@ -4253,6 +4349,7 @@ extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale)
 extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (!ctx)
         return;
+    ctx->fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->gen_sched)
         ggml_backend_sched_free(ctx->gen_sched);
     if (ctx->sched)

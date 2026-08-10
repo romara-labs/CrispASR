@@ -10,9 +10,11 @@
 #include "whisper_params.h"
 
 #include "core/audio_resample.h"
+#include "core/crispasr_env.h"
 #include "core/wav_reader.h"
 #include "omnivoice/omnivoice.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <sys/stat.h>
@@ -97,6 +99,13 @@ public:
                     p.model.c_str(), codec_path.c_str(), ov_last_error());
             return false;
         }
+
+        // Diff-harness: OMNIVOICE_ENCODE_DIFF=<ref.gguf> runs the encode-path
+        // stage diff and exits (#254 voice-clone port validation).
+        if (const char* rp = crispasr_env::get("CRISPASR_OMNIVOICE_ENCODE_DIFF")) {
+            const int rc = ov_encode_diff(ctx_, rp);
+            std::exit(rc == 0 ? 0 : 1);
+        }
         return true;
     }
 
@@ -104,6 +113,7 @@ public:
         if (!ctx_ || text.empty()) {
             return {};
         }
+
         ov_tts_params tp;
         ov_tts_default_params(&tp);
         fill_tts_params(text, params, &tp);
@@ -146,12 +156,15 @@ public:
 private:
     void fill_tts_params(const std::string & text, const whisper_params & params, ov_tts_params * tp) {
         tp->text = text.c_str();
-        tp->lang = (!params.language.empty() && params.language != "auto") ? params.language.c_str() : "";
+        const std::string & target_lang = !params.target_lang.empty() ? params.target_lang : params.language;
+        tp->lang = target_lang == "auto" ? "" : target_lang.c_str();
         tp->instruct = params.tts_instruct.empty() ? "" : params.tts_instruct.c_str();
         tp->denoise = true;
         tp->preprocess_prompt = true;
         tp->speed = params.tts_speed > 0.0f ? params.tts_speed : 1.0f;
-        tp->mg_seed = (uint64_t) params.seed;
+        if (params.seed != 0) {
+            tp->mg_seed = (uint64_t) params.seed;
+        }
         tp->ref_text = params.tts_ref_text.empty() ? "" : params.tts_ref_text.c_str();
         if (params.tts_num_steps > 0) {
             tp->mg_num_step = params.tts_num_steps;

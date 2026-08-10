@@ -142,6 +142,11 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const char *          dump_dir,
                                            uint32_t *            ctr_lo_inout = nullptr);
 
+// Resolve a requested target language to an OmniVoice ISO-639-3 id. Empty or
+// invalid values are language-agnostic; when no language was requested, the
+// optional CRISPASR_OMNIVOICE_AUTO_LANG fallback may infer one from text.
+bool pipeline_tts_resolve_language(const std::string & text, const std::string & raw, std::string * out);
+
 // Validate and normalise the raw instruct string against the voice-design
 // vocabulary. The target language is selected from the synthesis text: any
 // CJK ideograph in text -> Chinese, otherwise English. On error, prints a

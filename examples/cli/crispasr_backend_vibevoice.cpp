@@ -9,6 +9,7 @@
 #include "whisper_params.h"
 
 #include "vibevoice.h"
+#include "core/vibevoice_transcript.h" // #300: Start/End/Speaker/Content → segments
 
 #include <cctype>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <utility>
 #include <sys/stat.h>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -76,17 +78,30 @@ public:
 
     uint32_t capabilities() const override {
         // ASR mode produces segments → framework -am + --diarize work.
-        uint32_t caps =
-            CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_TTS | CAP_DIARIZE;
+        // CAP_PUNCTUATION_NATIVE: VibeVoice-ASR is an LLM decoder — its Content
+        // is already punctuated AND sentence-cased. Without the flag the CLI
+        // auto-ran FireRedPunc over it (#308's audit item, found while fixing
+        // #300): the capitaliser turned "And" into "ANd" and a second full stop
+        // landed on text that already ended in one ("country..").
+        uint32_t caps = CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_TTS |
+                        CAP_DIARIZE | CAP_PUNCTUATION_NATIVE;
         if (allow_generic_no_voice_)
             caps |= CAP_VOICE_CLONING;
         return caps;
     }
 
+    // VibeVoice operates at 24 kHz internally.
+    int input_sample_rate() const override { return 24000; }
+
     bool init(const whisper_params& p) override {
         vibevoice_context_params cp = vibevoice_context_default_params();
         cp.n_threads = p.n_threads;
-        cp.max_new_tokens = p.max_new_tokens > 0 ? p.max_new_tokens : cp.max_new_tokens;
+        // #315: only force a cap when the user explicitly set --max-new-tokens;
+        // otherwise pass 0 so vibevoice_resolve_max_new_tokens() scales the ASR
+        // budget by audio duration (whisper_params.max_new_tokens defaults to
+        // 512, so the old `> 0` test always forced 512 and truncated long-form).
+        // Mirrors every other AR backend adapter (canary/funasr/mimo/moonshine…).
+        cp.max_new_tokens = p.max_new_tokens_explicit ? p.max_new_tokens : 0;
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         cp.tts_steps = p.tts_steps;
@@ -119,18 +134,85 @@ public:
         if (!ctx_ || !samples || n_samples <= 0)
             return out;
 
-        const std::vector<float> pcm24 = resample_16k_to_24k(samples, n_samples);
+        // When the CLI already loaded at 24 kHz (via input_sample_rate()),
+        // pass through directly — no lossy resample needed.
+        const int sr = input_sample_rate();
+        const float* vv_pcm = samples;
+        int vv_n = n_samples;
+        std::vector<float> pcm24_buf;
+        if (sr != 24000) {
+            pcm24_buf = resample_16k_to_24k(samples, n_samples);
+            vv_pcm = pcm24_buf.data();
+            vv_n = (int)pcm24_buf.size();
+        }
         const char* context = params.context.empty() ? nullptr : params.context.c_str();
-        char* text = vibevoice_transcribe_with_context(ctx_, pcm24.data(), (int)pcm24.size(), context);
+        char* text = vibevoice_transcribe_with_context(ctx_, vv_pcm, vv_n, context);
         if (!text)
             return out;
+        const std::string raw = text;
+        std::free(text);
+
+        const int64_t dur_cs = (int64_t)((double)n_samples * 100.0 / (double)sr);
+
+        // #300: VibeVoice-ASR answers with a JSON array of utterances carrying
+        // Start / End / Speaker / Content (that is what its prompt asks for).
+        // Read it: one segment per utterance, native timings, and the speaker in
+        // the structured `speaker` field — the "(Speaker N) " form moss-diarize
+        // uses, which is what file-mode prefixing and the #300 streaming emit
+        // both consume. Before this the whole blob came back as ONE segment's
+        // text, so the labels were literal JSON in the transcript and
+        // `seg.speaker` was never set (the streaming "speaker" field could not
+        // fire for this backend at all).
+        //
+        // CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1 restores the pre-#300 behaviour
+        // (one segment, raw model output) for anyone parsing the blob themselves.
+        if (!crispasr_env::truthy("CRISPASR_VIBEVOICE_RAW_TRANSCRIPT")) {
+            for (const auto& u : core_vibevoice::parse(raw)) {
+                std::string t = u.text;
+                while (!t.empty() && (unsigned char)t.front() <= ' ')
+                    t.erase(t.begin());
+                while (!t.empty() && (unsigned char)t.back() <= ' ')
+                    t.pop_back();
+                if (t.empty())
+                    continue;
+                crispasr_segment seg;
+                seg.text = std::move(t);
+                // The model times each utterance within THIS chunk, so the
+                // chunk offset still has to be added; clamp into the chunk in
+                // case a decode overshoots its own window.
+                auto clamp_cs = [&](double sec, int64_t fallback) {
+                    if (sec < 0.0)
+                        return t_offset_cs + fallback;
+                    int64_t cs = (int64_t)(sec * 100.0 + (sec < 0 ? -0.5 : 0.5));
+                    if (cs < 0)
+                        cs = 0;
+                    if (cs > dur_cs)
+                        cs = dur_cs;
+                    return t_offset_cs + cs;
+                };
+                seg.t0 = clamp_cs(u.start_s, 0);
+                seg.t1 = clamp_cs(u.end_s, dur_cs);
+                if (seg.t1 < seg.t0)
+                    seg.t1 = seg.t0;
+                if (u.speaker >= 0) {
+                    char spk[32];
+                    snprintf(spk, sizeof(spk), "(Speaker %d) ", u.speaker);
+                    seg.speaker = spk;
+                }
+                out.push_back(std::move(seg));
+            }
+            if (!out.empty())
+                return out;
+            // Nothing parsed — the model answered in prose, or the decode was
+            // cut before the first complete object. Fall through and hand back
+            // the raw string rather than dropping the transcript.
+        }
 
         crispasr_segment seg;
-        seg.text = text;
+        seg.text = raw;
         seg.t0 = t_offset_cs;
-        seg.t1 = t_offset_cs + (int64_t)((double)n_samples * 100.0 / 16000.0);
+        seg.t1 = t_offset_cs + dur_cs;
         out.push_back(std::move(seg));
-        std::free(text);
         return out;
     }
 
@@ -224,7 +306,7 @@ public:
         // Gate: the realtime model requires a prompt voice. The 1.5B base
         // model can run without one and generate its generic prior voice.
         if (!allow_generic_no_voice_ && last_voice_key_.empty() && wav_ref_path_.empty()) {
-            const char* voice_wav_env = getenv("VIBEVOICE_VOICE_AUDIO");
+            const char* voice_wav_env = crispasr_env::get("CRISPASR_VIBEVOICE_VOICE_AUDIO");
             if (!voice_wav_env || !voice_wav_env[0]) {
                 fprintf(stderr,
                         "crispasr[%s]: no voice prompt resolved (pass --voice <path.gguf>, --voice <path.wav>, "
