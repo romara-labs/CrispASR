@@ -14,7 +14,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 m2m100 GPU path)
 #if defined(GGML_USE_METAL)
-#include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
+#include "ggml-metal.h" // core_cpu_backend::is_metal(§232 CUDA/Vulkan-default gate)
 #endif
 
 #include "ggml-backend.h"
@@ -37,6 +37,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `M2M100_BENCH=1` for per-stage timings.
@@ -79,6 +80,10 @@ struct m2m100_hparams {
     bool scale_embedding = true;
     int bos_token_id = 0;
     int eos_token_id = 2;
+    // generation_config.json early_stopping (HF beam semantics only): m2m100
+    // 418M/1.2B and wmt21 x-en declare true, wmt21 en-x does not (false).
+    // GGUFs predating the key: the 2048-wide wmt21 we ship is en-x -> false.
+    bool early_stopping = true;
     int pad_token_id = 1;
     int dec_start_token = 2;
     int head_dim() const { return d_model / enc_n_heads; }
@@ -214,7 +219,7 @@ struct m2m100_context {
     ggml_context* cross_kv_ctx = nullptr;
     ggml_backend_buffer_t cross_kv_buf = nullptr;
     int cross_T_enc = 0;
-    int beam_size = 1;
+    int beam_size = m2m100_default_beam_size();
 };
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -242,6 +247,7 @@ static void load_metadata(m2m100_context* c, gguf_context* g) {
     };
     hp.vocab_size = get_u32("m2m100.vocab_size", 128112);
     hp.d_model = get_u32("m2m100.d_model", 1024);
+    hp.early_stopping = get_u32("m2m100.gen.early_stopping", hp.d_model == 2048 ? 0 : 1) != 0;
     hp.enc_n_layers = get_u32("m2m100.encoder.n_layers", 12);
     hp.enc_n_heads = get_u32("m2m100.encoder.n_heads", 16);
     hp.enc_ffn_dim = get_u32("m2m100.encoder.ffn_dim", 4096);
@@ -941,6 +947,12 @@ extern "C" struct m2m100_context_params m2m100_context_default_params(void) {
     return p;
 }
 
+extern "C" int m2m100_default_beam_size(void) {
+    // facebook/m2m100_418M and both WMT21 dense directions declare
+    // num_beams=5. Greedy is an explicit opt-in for this model family (#439).
+    return 5;
+}
+
 extern "C" struct m2m100_context* m2m100_init_from_file(const char* path_model, struct m2m100_context_params params) {
     auto* c = new m2m100_context();
     c->params = params;
@@ -970,7 +982,7 @@ extern "C" struct m2m100_context* m2m100_init_from_file(const char* path_model, 
     //     en->de output, 1.24x wall (slow OpenBLAS baseline). On M1 (Accelerate)
     //     neutral — small encoder-decoder AR, launch-bound (LEARNING 34) — so
     //     Metal stays CPU unless forced. Mirrors LEARNING 34's is_metal gate.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     const char* gpu_env = std::getenv("CRISPASR_M2M100_GPU");
     const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
     const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
@@ -980,7 +992,7 @@ extern "C" struct m2m100_context* m2m100_init_from_file(const char* path_model, 
         if (gpu) {
             bool is_metal = false;
 #if defined(GGML_USE_METAL)
-            is_metal = ggml_backend_is_metal(gpu);
+            is_metal = core_cpu_backend::is_metal(gpu);
 #endif
             if (!is_metal || force_gpu) {
                 c->backend = gpu;
@@ -1038,7 +1050,7 @@ extern "C" void m2m100_free(struct m2m100_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1127,12 +1139,35 @@ extern "C" char* m2m100_translate(struct m2m100_context* ctx, const char* text, 
             std::memcpy(out, lg.data(), lg.size() * sizeof(float));
             return out;
         };
+        // core_beam_decode replays each beam's whole suffix every step, so the
+        // decoder work is O(beam × T²/2), not O(T). Its header assumes an audio
+        // encoder dominates wall time — true for the ASR callers, false here:
+        // this is text-to-text, and the cost IS the decode. Typical sentences
+        // are cheap (measured 1.53× at T=17 on the 418M), but a generation that
+        // runs to max_new_tokens is not, and a runaway is exactly what #439
+        // reported. Print the worst case rather than let it be discovered as a
+        // hang — a silent 100,000-forward decode looks identical to a crash.
+        if (ctx->beam_size > 1) {
+            const long long worst =
+                (long long)ctx->beam_size * (long long)max_new_tokens * (long long)max_new_tokens / 2;
+            if (worst > 20000) {
+                std::fprintf(stderr,
+                             "m2m100: beam %d with up to %d tokens is worst-case ~%lld decoder forwards "
+                             "(beam search replays each beam's suffix per step). Cap with "
+                             "--translate-max-tokens, or use --beam-size 1 for greedy.\n",
+                             ctx->beam_size, max_new_tokens, worst);
+            }
+        }
         core_beam_decode::Config bcfg;
         bcfg.max_new_tokens = max_new_tokens;
         bcfg.eos_id = hp.eos_token_id;
         bcfg.vocab_size = hp.vocab_size;
         bcfg.beam_size = ctx->beam_size;
         bcfg.prompt_len = prompt_len;
+        // generation_config.json: length_penalty 1.0 (default), early_stopping per checkpoint
+        bcfg.early_stopping =
+            hp.early_stopping ? core_beam_decode::EarlyStopping::True : core_beam_decode::EarlyStopping::False;
+        bcfg.length_offset = 1; // the forced target-language BOS: HF generates it, we prompt with it
         auto br = core_beam_decode::run_with_probs(ctx, logits.data(), replay, bcfg);
         for (int32_t t : br.tokens) {
             if (t == hp.eos_token_id)

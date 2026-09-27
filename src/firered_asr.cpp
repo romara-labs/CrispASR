@@ -39,6 +39,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 // ===========================================================================
 // Bench instrumentation — `FIRERED_BENCH=1` for per-stage timings.
@@ -362,16 +364,24 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     // Load weights to CPU so the decoder can use native Q4_K SIMD kernels
     // (70ms/step vs 587ms with F32 dequant or 2600ms with per-call CUDA graphs).
     // The encoder uses ggml_backend_sched which auto-copies CPU weights to GPU.
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
-    if (!ctx->backend || ggml_backend_is_cpu(ctx->backend))
-        ctx->backend = ctx->backend_cpu;
+    ctx->backend_cpu = core_cpu_backend::init();
+    // crispasr_init_gpu_backend() falls back to ggml_backend_init_best(), which
+    // on a GPU-less host hands back a CPU backend — a SEPARATE instance from
+    // backend_cpu above. Overwriting the pointer without freeing it leaked one
+    // ggml backend per init (152 bytes; ASan caught it once the sanitizer job
+    // stopped being a no-op). Free it before choosing, so nothing dangles.
+    ggml_backend_t gpu = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
+    if (gpu && core_cpu_backend::is_cpu(gpu)) {
+        ggml_backend_free(gpu);
+        gpu = nullptr;
+    }
+    ctx->backend = gpu ? gpu : ctx->backend_cpu;
     if (params.verbosity >= 1)
         fprintf(stderr, "firered_asr: backend ready (compute=%s, weights=CPU)\n",
-                ggml_backend_is_cpu(ctx->backend) ? "CPU" : "GPU");
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+                core_cpu_backend::is_cpu(ctx->backend) ? "CPU" : "GPU");
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // §176k: persistent decoder matvec graph cache (default ON; opt out with
     // CRISPASR_FIRERED_MATVEC_CACHE=0). Bit-identical to the per-call sched path,
@@ -392,7 +402,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "firered_asr: failed to open '%s'\n", path_model);
-            delete ctx;
+            firered_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         hp.d_model = core_gguf::kv_u32(gctx, "firered.d_model", hp.d_model);
@@ -456,7 +466,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
                 : core_gguf::load_weights(path_model, ctx->backend_cpu, "firered_asr", wl);
     if (!loaded) {
         fprintf(stderr, "firered_asr: failed to load weights from '%s'\n", path_model);
-        delete ctx;
+        firered_asr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;
@@ -640,9 +650,9 @@ extern "C" void firered_asr_free(struct firered_asr_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -687,17 +697,18 @@ static void compute_fbank(const float* pcm, int n_samples, std::vector<float>& f
         auto mel2hz = [](float m) { return 700.0f * (expf(m / 1127.0f) - 1.0f); };
         float mel_lo = hz2mel(low_freq);
         float mel_hi = hz2mel(high_freq);
-        std::vector<float> center(n_mels + 2);
-        for (int i = 0; i < n_mels + 2; i++)
-            center[i] = mel2hz(mel_lo + i * (mel_hi - mel_lo) / (n_mels + 1));
-
+        (void)mel2hz;
+        // Triangles linear in MEL over the n_fft/2 bins below Nyquist, as
+        // kaldi-native-fbank (FireRedASR's reference front-end) builds them; the
+        // Hz-linear form used before drifted from it (log-mel mean |d| ~2.6e-3).
+        const float delta = (mel_hi - mel_lo) / (float)(n_mels + 1);
         for (int m = 0; m < n_mels; m++) {
-            for (int k = 0; k < n_fft_bins; k++) {
-                float freq = (float)k * sample_rate / n_fft;
-                if (freq > center[m] && freq <= center[m + 1] && center[m + 1] > center[m])
-                    mel_fb[m * n_fft_bins + k] = (freq - center[m]) / (center[m + 1] - center[m]);
-                else if (freq > center[m + 1] && freq < center[m + 2] && center[m + 2] > center[m + 1])
-                    mel_fb[m * n_fft_bins + k] = (center[m + 2] - freq) / (center[m + 2] - center[m + 1]);
+            const float left = mel_lo + (float)m * delta, center = left + delta, right = center + delta;
+            for (int k = 0; k < n_fft / 2; k++) {
+                const float mel = hz2mel((float)k * sample_rate / n_fft);
+                if (mel > left && mel < right)
+                    mel_fb[m * n_fft_bins + k] =
+                        mel <= center ? (mel - left) / (center - left) : (right - mel) / (right - center);
             }
         }
     }
@@ -869,7 +880,7 @@ static void ggml_matmat(ggml_backend_t be, ggml_backend_sched_t sc, ggml_tensor*
         ggml_backend_sched_set_tensor_backend(sc, bias_b, be);
     if (ggml_backend_sched_alloc_graph(sc, gf)) {
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vi"), input, 0, (size_t)M * K * sizeof(float));
-        if (ggml_backend_sched_graph_compute(sc, gf) == GGML_STATUS_SUCCESS)
+        if (core_sched_prof::compute(sc, gf, "firered-asr") == GGML_STATUS_SUCCESS)
             ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "vo"), output, 0, (size_t)M * N * sizeof(float));
     }
     ggml_free(c0);
@@ -1377,7 +1388,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             return;
         }
         ggml_backend_tensor_set(inp, subsampled, 0, flat_dim * T * sizeof(float));
-        ggml_backend_sched_graph_compute(sctx->sched, gf);
+        core_sched_prof::compute(sctx->sched, gf, "firered-asr");
         ggml_backend_tensor_get(out, x_buf.data(), 0, d * T * sizeof(float));
         ggml_free(ctx0);
     }
@@ -1492,7 +1503,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             }
             ggml_backend_tensor_set(x_in, x_buf.data(), 0, d * T * sizeof(float));
             ggml_backend_tensor_set(pe_in, pe_center.data(), 0, d * T_pe * sizeof(float));
-            ggml_backend_sched_graph_compute(sctx->sched, gf);
+            core_sched_prof::compute(sctx->sched, gf, "firered-asr");
 
             // Read outputs
             ggml_tensor* ffn1_t = ggml_graph_get_tensor(gf, "ffn1_out");
@@ -1623,7 +1634,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
                 }
                 ggml_backend_tensor_set(x_in, x_buf.data(), 0, d * T * sizeof(float));
                 ggml_backend_tensor_set(attn_in, attn_out.data(), 0, d * T * sizeof(float));
-                ggml_backend_sched_graph_compute(sctx->sched, gf);
+                core_sched_prof::compute(sctx->sched, gf, "firered-asr");
 
                 ggml_tensor* out_t = ggml_graph_get_tensor(gf, "layer_out");
                 ggml_backend_tensor_get(out_t, x_buf.data(), 0, d * T * sizeof(float));
@@ -2066,7 +2077,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
         int beam_size_effective = is_lid ? 1 : std::max(1, ctx->params.beam_size);
         int d = hp.d_model;
         int odim = hp.odim;
-        const bool use_gpu_decoder_proj = !ggml_backend_is_cpu(ctx->backend);
+        const bool use_gpu_decoder_proj = !core_cpu_backend::is_cpu(ctx->backend);
         // Debug: set FIRERED_DEBUG_DECODER_STEP=N FIRERED_DEBUG_DECODER_LAYER=M
         // to dump intermediate values at decode step N, layer M (beam path only).
 
@@ -2111,7 +2122,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
             V_enc[li].resize(T_sub * d);
             bool kv_done = false;
 
-            if (!ggml_backend_is_cpu(ctx->backend)) {
+            if (!core_cpu_backend::is_cpu(ctx->backend)) {
                 size_t mem = ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(256, false);
                 struct ggml_init_params gp = {mem, nullptr, true};
                 ggml_context* ctx0 = ggml_init(gp);
@@ -2135,7 +2146,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     ggml_backend_sched_reset(ctx->sched);
                     if (ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
                         ggml_backend_tensor_set(enc_inp, enc_output.data(), 0, T_sub * d * sizeof(float));
-                        if (ggml_backend_sched_graph_compute(ctx->sched, gf) == GGML_STATUS_SUCCESS) {
+                        if (core_sched_prof::compute(ctx->sched, gf, "firered-asr") == GGML_STATUS_SUCCESS) {
                             ggml_backend_tensor_get(k_proj, K_enc[li].data(), 0, T_sub * d * sizeof(float));
                             ggml_backend_tensor_get(v_proj, V_enc[li].data(), 0, T_sub * d * sizeof(float));
                             kv_done = true;
@@ -2173,7 +2184,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     if (ggml_backend_sched_alloc_graph(ctx->sched, gf2)) {
                         ggml_backend_tensor_set(ggml_graph_get_tensor(gf2, "ei"), enc_output.data(), 0,
                                                 T_sub * d * sizeof(float));
-                        if (ggml_backend_sched_graph_compute(ctx->sched, gf2) == GGML_STATUS_SUCCESS) {
+                        if (core_sched_prof::compute(ctx->sched, gf2, "firered-asr") == GGML_STATUS_SUCCESS) {
                             ggml_backend_tensor_get(ggml_graph_get_tensor(gf2, "kp"), K_enc[li].data(), 0,
                                                     T_sub * d * sizeof(float));
                             ggml_backend_tensor_get(ggml_graph_get_tensor(gf2, "vp"), V_enc[li].data(), 0,
@@ -2218,7 +2229,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
             ggml_backend_sched_reset(ctx->sched);
             if (ggml_backend_sched_alloc_graph(ctx->sched, dec_proj_gf)) {
                 ggml_backend_tensor_set(dec_proj_inp, xn, 0, d * sizeof(float));
-                if (ggml_backend_sched_graph_compute(ctx->sched, dec_proj_gf) == GGML_STATUS_SUCCESS) {
+                if (core_sched_prof::compute(ctx->sched, dec_proj_gf, "firered-asr") == GGML_STATUS_SUCCESS) {
                     logits_out.resize(odim);
                     ggml_backend_tensor_get(dec_proj_logits, logits_out.data(), 0, odim * sizeof(float));
                     ok = true;
@@ -2817,7 +2828,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
     // So we can feed it directly!
     ggml_backend_tensor_set(enc_inp, enc_output.data(), 0, T_sub * hp.d_model * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "firered-asr") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "firered_asr: CTC compute failed\n");
         ggml_free(ctx0);
         return nullptr;

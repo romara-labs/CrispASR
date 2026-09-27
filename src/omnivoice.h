@@ -45,6 +45,10 @@ int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_
 int omnivoice_set_language(struct omnivoice_context * ctx, const char * lang);
 int omnivoice_set_instruct(struct omnivoice_context * ctx, const char * instruct);
 int omnivoice_set_speed(struct omnivoice_context * ctx, float speed);
+// Exact target duration in seconds. Values <= 0 restore the environment
+// default (CRISPASR_OMNIVOICE_TARGET_DURATION) or the text-based estimate.
+// Clamped to 600 seconds; applied to subsequent synthesis calls.
+int omnivoice_set_target_duration(struct omnivoice_context * ctx, float seconds);
 int omnivoice_set_num_steps(struct omnivoice_context * ctx, int num_steps);
 int omnivoice_set_seed(struct omnivoice_context * ctx, uint64_t seed);
 

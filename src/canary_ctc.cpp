@@ -25,6 +25,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/fastconformer.h"
+#include "core/sched_prof.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -70,89 +71,6 @@ struct canary_ctc_bench_stage {
         std::fprintf(stderr, "  canary_ctc_bench: %-22s %.2f ms\n", name, ms);
     }
 };
-
-// ===========================================================================
-// Per-node profiler — `CRISPASR_FC_PROFILE=1` aggregates graph-compute time
-// by op (mul_mat keyed by src0 type+shape). Forces per-node sched splits, so
-// absolute times carry dispatch overhead; use the relative shares.
-// ===========================================================================
-
-static bool canary_ctc_profile_enabled() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = std::getenv("CRISPASR_FC_PROFILE");
-        v = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return v != 0;
-}
-
-struct cc_prof_state {
-    std::map<std::string, std::pair<double, int64_t>> agg; // key → (ms, count)
-    std::chrono::steady_clock::time_point last;
-
-    void dump() const {
-        std::vector<std::pair<std::string, std::pair<double, int64_t>>> rows(agg.begin(), agg.end());
-        std::sort(rows.begin(), rows.end(),
-                  [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
-        double total = 0;
-        for (const auto& r : rows)
-            total += r.second.first;
-        std::fprintf(stderr, "  cc_profile: %-52s %9s %6s %6s\n", "op", "ms", "%", "n");
-        for (const auto& r : rows)
-            std::fprintf(stderr, "  cc_profile: %-52s %9.2f %5.1f%% %6lld\n", r.first.c_str(), r.second.first,
-                         100.0 * r.second.first / total, (long long)r.second.second);
-        std::fprintf(stderr, "  cc_profile: total %.2f ms\n", total);
-    }
-};
-
-static bool cc_prof_cb(ggml_tensor* t, bool ask, void* ud) {
-    auto* st = (cc_prof_state*)ud;
-    if (ask)
-        return true; // observe every node → per-node splits
-    // CRISPASR_FC_PROF_FP=1: per-node fingerprint of one valid column
-    // (debug tool for localizing bucketed-vs-plain divergences).
-    static int fp_en = -1;
-    if (fp_en < 0) {
-        const char* e = std::getenv("CRISPASR_FC_PROF_FP");
-        fp_en = (e && *e && *e != '0') ? 1 : 0;
-    }
-    static int fp_cols = -1;
-    if (fp_cols < 0) {
-        const char* e = std::getenv("CRISPASR_FC_PROF_FP_COLS");
-        fp_cols = (e && *e) ? atoi(e) : 5;
-    }
-    // Only (features, T)-shaped nodes: checksum the first fp_cols columns so
-    // padded and unpadded runs sample the same logical frames.
-    if (fp_en && t->type == GGML_TYPE_F32 && t->ne[0] >= 512 && t->ne[1] >= fp_cols && t->ne[2] == 1 && t->nb[0] == 4) {
-        std::vector<float> col(t->ne[0]);
-        double s = 0;
-        for (int c = 0; c < fp_cols; c++) {
-            ggml_backend_tensor_get(t, col.data(), (size_t)c * t->nb[1], t->ne[0] * sizeof(float));
-            for (float v : col)
-                s += (double)(v < 0 ? -v : v);
-        }
-        fprintf(stderr, "FP %-14s [%lldx%lldx%lld] %.10e\n", ggml_op_name(t->op), (long long)t->ne[0],
-                (long long)t->ne[1], (long long)t->ne[2], s);
-    }
-    auto now = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(now - st->last).count();
-    st->last = now;
-    char key[192];
-    if (t->op == GGML_OP_MUL_MAT) {
-        snprintf(key, sizeof(key), "MUL_MAT %s [%lldx%lld]@[%lldx%lld]", ggml_type_name(t->src[0]->type),
-                 (long long)t->src[0]->ne[0], (long long)t->src[0]->ne[1], (long long)t->src[1]->ne[0],
-                 (long long)t->src[1]->ne[1]);
-    } else if (t->op == GGML_OP_CPY || t->op == GGML_OP_CONT || t->op == GGML_OP_DUP) {
-        snprintf(key, sizeof(key), "%s %s→%s [%lldx%lldx%lld]", ggml_op_name(t->op), ggml_type_name(t->src[0]->type),
-                 ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2]);
-    } else {
-        snprintf(key, sizeof(key), "%s", ggml_op_name(t->op));
-    }
-    auto& e = st->agg[key];
-    e.first += ms;
-    e.second += 1;
-    return true;
-}
 
 // ===========================================================================
 // Hyperparameters (mirror canary_ctc.* keys in the GGUF)
@@ -321,6 +239,7 @@ static void cc_fft_r2c(const float* in, int N, float* out) {
 
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -723,7 +642,7 @@ static bool cc_load_model(cc_model& model, canary_ctc_vocab& vocab, const char* 
 
 static ggml_backend_t cc_pick_backend() {
     ggml_backend_t b = crispasr_init_gpu_backend();
-    return b ? b : ggml_backend_cpu_init();
+    return b ? b : core_cpu_backend::init();
 }
 
 // ===========================================================================
@@ -745,12 +664,12 @@ extern "C" struct canary_ctc_context* canary_ctc_init_from_file(const char* path
 
     ctx->backend = cc_pick_backend();
     // Always have a CPU fallback backend for ops the primary doesn't support.
-    if (ggml_backend_is_cpu(ctx->backend)) {
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
         ctx->backend_cpu = ctx->backend;
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     } else {
-        ctx->backend_cpu = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        ctx->backend_cpu = core_cpu_backend::init();
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
 
     if (!cc_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {
@@ -789,7 +708,7 @@ extern "C" void canary_ctc_free(struct canary_ctc_context* ctx) {
     if (ctx->model.ctx_f32)
         ggml_free(ctx->model.ctx_f32);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -880,7 +799,7 @@ extern "C" int canary_ctc_compute_logits_from_mel_debug(struct canary_ctc_contex
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "canary-ctc") != GGML_STATUS_SUCCESS)
         return -3;
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "ctc_logits");
@@ -947,10 +866,6 @@ extern "C" int canary_ctc_compute_logits(struct canary_ctc_context* ctx, const f
         ctx->cached_T_mel = T_mel_g;
     }
 
-    cc_prof_state prof;
-    if (canary_ctc_profile_enabled())
-        ggml_backend_sched_set_eval_callback(ctx->sched, cc_prof_cb, &prof);
-
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return -2;
@@ -999,16 +914,8 @@ extern "C" int canary_ctc_compute_logits(struct canary_ctc_context* ctx, const f
         ggml_backend_tensor_set(tm, tmv.data(), 0, tmv.size() * sizeof(float));
     }
 
-    if (canary_ctc_profile_enabled())
-        prof.last = std::chrono::steady_clock::now();
-
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "canary-ctc", "CRISPASR_FC_PROFILE") != GGML_STATUS_SUCCESS)
         return -3;
-
-    if (canary_ctc_profile_enabled()) {
-        ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
-        prof.dump();
-    }
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "ctc_logits");
     if (!out)

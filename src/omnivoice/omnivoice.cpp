@@ -13,7 +13,6 @@
 #include "audio-postproc.h"
 #include "backend.h"
 #include "bpe.h"
-#include "duration-estimator.h"
 #include "ov-error.h"
 #include "pipeline-codec.h"
 #include "pipeline-tts.h"
@@ -24,6 +23,7 @@
 
 #include "core/audio_resample.h"
 #include "core/crispasr_env.h"
+#include "core/omnivoice_duration.h"
 #include "core/omnivoice_instruct.h"
 #include "core/omnivoice_lang.h"
 #include "core/wav_reader.h"
@@ -473,11 +473,10 @@ enum ov_status ov_synthesize_codes(struct ov_context * ov,
             return OV_STATUS_INVALID_PARAMS;
         }
 
-        int T = params->T_override > 0 ? params->T_override : duration_estimate_tokens(text, ref_text, ref_T);
         const float speed = (params->abi_version >= 4 && params->speed > 0.0f) ? params->speed : 1.0f;
-        if (params->T_override <= 0 && speed != 1.0f) {
-            T = std::max(1, (int) std::lround((double) T / speed));
-        }
+        const int T = params->T_override > 0 ? params->T_override
+                                              : core_omnivoice_duration::estimate_target_tokens(text, ref_text, ref_T,
+                                                                                                  speed);
 
         std::vector<int32_t> codes = pipeline_tts_generate(&ov->pt, &ov->tok, text, lang, instruct, T,
                                                             params->denoise, mg_cfg, ref_text, ref_ptr, ref_T,
@@ -683,6 +682,8 @@ struct omnivoice_context {
     std::string ref_text;
     std::vector<float> ref_audio_24k;
     float speed = 1.0f;
+    float target_duration_s = 0.0f;
+    float env_target_duration_s = 0.0f;
     int num_steps = 32;
     float guidance_scale = 2.0f;
     float class_temperature = 0.0f;
@@ -733,6 +734,12 @@ struct omnivoice_context * omnivoice_init_from_file(const char * path_model,
     ctx->layer_penalty_factor = params.layer_penalty_factor > 0.0f ? params.layer_penalty_factor : 5.0f;
     ctx->t_shift = params.t_shift > 0.0f ? params.t_shift : 0.1f;
     ctx->seed = params.seed ? params.seed : 42;
+    if (const char * e = crispasr_env::get("CRISPASR_OMNIVOICE_TARGET_DURATION")) {
+        const float duration = std::strtof(e, nullptr);
+        if (std::isfinite(duration) && duration > 0.0f) {
+            ctx->target_duration_s = ctx->env_target_duration_s = std::min(duration, 600.0f);
+        }
+    }
     ctx->ov = ov_init(&ip);
     if (!ctx->ov) {
         delete ctx;
@@ -753,8 +760,10 @@ int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_
     if (!ctx || !ctx->ov) {
         return -1;
     }
+    // Never retain the previous speaker or transcript when a replacement
+    // reference cannot be read.
     ctx->ref_audio_24k.clear();
-    ctx->ref_text = ref_text ? ref_text : "";
+    ctx->ref_text.clear();
     if (!wav_path || !*wav_path) {
         return 0;
     }
@@ -767,7 +776,12 @@ int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_
     if (sr != 24000 && sr > 0) {
         wav = core_audio::resample_polyphase(wav.data(), (int) wav.size(), sr, 24000);
     }
+    if (wav.empty()) {
+        ov_set_error("omnivoice_set_voice_prompt: empty reference '%s'", wav_path);
+        return -1;
+    }
     ctx->ref_audio_24k = std::move(wav);
+    ctx->ref_text = ref_text ? ref_text : "";
     return 0;
 }
 
@@ -814,6 +828,16 @@ int omnivoice_set_speed(struct omnivoice_context * ctx, float speed) {
     return 0;
 }
 
+int omnivoice_set_target_duration(struct omnivoice_context * ctx, float seconds) {
+    if (!ctx) {
+        return -1;
+    }
+    ctx->target_duration_s = std::isfinite(seconds) && seconds > 0.0f
+                                 ? std::min(seconds, 600.0f)
+                                 : ctx->env_target_duration_s;
+    return 0;
+}
+
 int omnivoice_set_num_steps(struct omnivoice_context * ctx, int num_steps) {
     if (!ctx) {
         return -1;
@@ -849,6 +873,10 @@ int32_t * omnivoice_synthesize_codes(struct omnivoice_context * ctx, const char 
     tp.mg_t_shift = ctx->t_shift;
     tp.mg_seed = ctx->seed;
     tp.speed = ctx->speed;
+    if (ctx->target_duration_s > 0.0f) {
+        // Legacy OmniVoice uses 25 frames per second (24 kHz / 960 hop).
+        tp.T_override = std::max(1, (int) std::lround(ctx->target_duration_s * 25.0f));
+    }
     tp.ref_text = ctx->ref_text.c_str();
     if (!ctx->ref_audio_24k.empty()) {
         tp.ref_audio_24k = ctx->ref_audio_24k.data();

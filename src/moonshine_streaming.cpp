@@ -33,6 +33,8 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 // ===========================================================================
 // Bench instrumentation — `MOONSHINE_STREAM_BENCH=1` for per-stage timings.
@@ -292,13 +294,13 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     }
 
     // ── Allocate weight buffer ─────────────────────────────────��────────
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "moonshine_streaming: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -722,7 +724,7 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
             ggml_backend_tensor_set(mt, mask_data.data(), 0, mask_sz * sizeof(ggml_fp16_t));
     }
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "moonshine-streaming") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "moonshine_streaming: encoder compute failed\n");
         ggml_free(ctx0);
         return -1;
@@ -842,7 +844,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
         kv[i].cross_k = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F32, dec_head_dim, T_enc, dec_kv_heads);
         kv[i].cross_v = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F32, dec_head_dim, T_enc, dec_kv_heads);
     }
-    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, core_cpu_backend::buffer_type());
     if (!kv_buf) {
         ggml_free(kv_ctx);
         return nullptr;
@@ -927,7 +929,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
                 ggml_backend_tensor_set(pt, pos_data.data(), 0, T_enc * sizeof(int32_t));
         }
 
-        ggml_backend_sched_graph_compute(ctx->sched, xgf);
+        core_sched_prof::compute(ctx->sched, xgf, "moonshine-streaming");
 
         size_t kv_bytes = (size_t)dec_head_dim * T_enc * dec_kv_heads * sizeof(float);
         for (int i = 0; i < dec_layers; i++) {
@@ -1033,7 +1035,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
         int32_t pos_val = pos;
         ggml_backend_tensor_set(ggml_graph_get_tensor(dgf, "pos"), &pos_val, 0, sizeof(int32_t));
 
-        if (ggml_backend_sched_graph_compute(ctx->sched, dgf) != GGML_STATUS_SUCCESS) {
+        if (core_sched_prof::compute(ctx->sched, dgf, "moonshine-streaming") != GGML_STATUS_SUCCESS) {
             ggml_free(dctx);
             return {};
         }
@@ -1169,9 +1171,9 @@ extern "C" void moonshine_streaming_free(struct moonshine_streaming_context* ctx
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
-        ggml_backend_buffer_free(ctx->model.buf_w);
+        core_gguf::release_weight_buffer(ctx->model.buf_w);
     if (ctx->model.buf_w_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1185,7 +1187,7 @@ extern "C" void moonshine_streaming_set_n_threads(struct moonshine_streaming_con
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
         if (ctx->backend_cpu)
-            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+            core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

@@ -14,6 +14,8 @@
 #include "core/wav_reader.h"
 #include "omnivoice/omnivoice.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
@@ -116,7 +118,9 @@ public:
 
         ov_tts_params tp;
         ov_tts_default_params(&tp);
-        fill_tts_params(text, params, &tp);
+        if (!fill_tts_params(text, params, &tp)) {
+            return {};
+        }
         ov_audio audio = {};
         if (ov_synthesize(ctx_, &tp, &audio) != OV_STATUS_OK) {
             fprintf(stderr, "crispasr[omnivoice]: synthesis failed: %s\n", ov_last_error());
@@ -135,7 +139,10 @@ public:
         }
         ov_tts_params tp;
         ov_tts_default_params(&tp);
-        fill_tts_params(text, params, &tp);
+        if (!fill_tts_params(text, params, &tp)) {
+            cb(nullptr, 0, true);
+            return;
+        }
         tp.on_chunk = omnivoice_stream_chunk;
         tp.on_chunk_user_data = &cb;
         if (ov_synthesize(ctx_, &tp, nullptr) != OV_STATUS_OK) {
@@ -154,7 +161,7 @@ public:
     }
 
 private:
-    void fill_tts_params(const std::string & text, const whisper_params & params, ov_tts_params * tp) {
+    bool fill_tts_params(const std::string & text, const whisper_params & params, ov_tts_params * tp) {
         tp->text = text.c_str();
         const std::string & target_lang = !params.target_lang.empty() ? params.target_lang : params.language;
         tp->lang = target_lang == "auto" ? "" : target_lang.c_str();
@@ -177,22 +184,48 @@ private:
             tp->mg_guidance_scale = params.tts_cfg_scale;
         }
 
-        ref_audio_24k_.clear();
-        if (!params.tts_voice.empty() && is_wav_path(params.tts_voice)) {
-            std::vector<float> wav;
-            int sr = 0;
-            if (crispasr::core::read_wav_mono_pcm16(params.tts_voice, wav, sr)) {
-                if (sr != 24000 && sr > 0) {
-                    ref_audio_24k_ = core_audio::resample_polyphase(wav.data(), (int) wav.size(), sr, 24000);
-                } else {
-                    ref_audio_24k_ = std::move(wav);
-                }
-                tp->ref_audio_24k = ref_audio_24k_.data();
-                tp->ref_n_samples = (int) ref_audio_24k_.size();
-            } else {
-                fprintf(stderr, "crispasr[omnivoice]: failed to load reference WAV '%s'\n", params.tts_voice.c_str());
+        // A fresh params struct is filled for every CLI/server request, so a
+        // previous request's exact duration cannot leak into this one. With
+        // zero, restore the environment default before using the estimator.
+        float duration = params.tts_duration;
+        if (!std::isfinite(duration) || duration <= 0.0f) {
+            duration = 0.0f;
+            if (const char * env = crispasr_env::get("CRISPASR_OMNIVOICE_TARGET_DURATION")) {
+                duration = std::strtof(env, nullptr);
             }
         }
+        if (std::isfinite(duration) && duration > 0.0f) {
+            tp->T_override = ov_duration_sec_to_tokens(ctx_, std::min(duration, 600.0f));
+        }
+
+        ref_audio_24k_.clear();
+        if (!params.tts_voice.empty()) {
+            if (!is_wav_path(params.tts_voice)) {
+                fprintf(stderr, "crispasr[omnivoice]: reference voice must be a WAV: '%s'\n",
+                        params.tts_voice.c_str());
+                return false;
+            }
+            std::vector<float> wav;
+            int sr = 0;
+            if (!crispasr::core::read_wav_mono_pcm16(params.tts_voice, wav, sr) || wav.empty() || sr <= 0) {
+                fprintf(stderr, "crispasr[omnivoice]: failed to load reference WAV '%s'\n",
+                        params.tts_voice.c_str());
+                return false;
+            }
+            if (sr != 24000) {
+                ref_audio_24k_ = core_audio::resample_polyphase(wav.data(), (int) wav.size(), sr, 24000);
+            } else {
+                ref_audio_24k_ = std::move(wav);
+            }
+            if (ref_audio_24k_.empty()) {
+                fprintf(stderr, "crispasr[omnivoice]: reference WAV '%s' contains no audio\n",
+                        params.tts_voice.c_str());
+                return false;
+            }
+            tp->ref_audio_24k = ref_audio_24k_.data();
+            tp->ref_n_samples = (int) ref_audio_24k_.size();
+        }
+        return true;
     }
 
     ov_context * ctx_ = nullptr;

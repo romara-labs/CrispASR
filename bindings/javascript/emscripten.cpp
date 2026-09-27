@@ -45,6 +45,7 @@ const char* crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
 // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2).
 int crispasr_session_set_tts_phonemes(struct crispasr_session* s, const char* phonemes);
+void crispasr_session_set_tts_pad_silence_ms(struct crispasr_session* s, int ms);
 int crispasr_session_is_custom_voice(CrispasrSession* s);
 int crispasr_session_is_voice_design(CrispasrSession* s);
 float* crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
@@ -127,6 +128,7 @@ int crispasr_session_set_cfg_weight(CrispasrSession* s, float cfg_weight);
 int crispasr_session_set_tts_noise_temp(CrispasrSession* s, float noise_temp);
 int crispasr_session_set_exaggeration(CrispasrSession* s, float exaggeration);
 int crispasr_session_set_max_speech_tokens(CrispasrSession* s, int n);
+int crispasr_session_set_min_speech_tokens(CrispasrSession* s, int n);
 int crispasr_session_set_length_scale(CrispasrSession* s, float scale);
 int crispasr_session_set_best_of(CrispasrSession* s, int n);
 int crispasr_session_set_beam_size(CrispasrSession* s, int n);
@@ -641,6 +643,13 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              return crispasr_session_set_tts_phonemes(g_tts_session, phonemes.c_str());
                          }));
 
+    // Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs.
+    emscripten::function("ttsSetPadSilenceMs", emscripten::optional_override([](int ms) {
+                             if (!g_tts_session)
+                                 return;
+                             crispasr_session_set_tts_pad_silence_ms(g_tts_session, ms);
+                         }));
+
     // qwen3-tts variant detection (returns false also when the active
     // backend isn't qwen3-tts).
     emscripten::function("ttsIsCustomVoice", emscripten::optional_override([]() -> bool {
@@ -910,6 +919,9 @@ EMSCRIPTEN_BINDINGS(whisper) {
                          }));
     emscripten::function("sessionSetMaxSpeechTokens", emscripten::optional_override([](int n) {
                              return g_tts_session ? crispasr_session_set_max_speech_tokens(g_tts_session, n) : -1;
+                         }));
+    emscripten::function("sessionSetMinSpeechTokens", emscripten::optional_override([](int n) {
+                             return g_tts_session ? crispasr_session_set_min_speech_tokens(g_tts_session, n) : -1;
                          }));
     emscripten::function("sessionSetLengthScale", emscripten::optional_override([](float s) {
                              return g_tts_session ? crispasr_session_set_length_scale(g_tts_session, s) : -1;

@@ -46,6 +46,7 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_instruct(Pointer session, String instruct);
         // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise).
         int          crispasr_session_set_tts_phonemes(Pointer session, String phonemes);
+        void         crispasr_session_set_tts_pad_silence_ms(Pointer session, int ms);
         int     crispasr_session_is_custom_voice(Pointer session);
         int     crispasr_session_is_voice_design(Pointer session);
         Pointer crispasr_session_synthesize(Pointer session, String text, IntByReference outNSamples);
@@ -87,6 +88,7 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_tts_noise_temp(Pointer session, float noiseTemp);
         int     crispasr_session_set_exaggeration(Pointer session, float exaggeration);
         int     crispasr_session_set_max_speech_tokens(Pointer session, int n);
+        int     crispasr_session_set_min_speech_tokens(Pointer session, int n);
         int     crispasr_session_set_length_scale(Pointer session, float scale);
         int     crispasr_session_set_best_of(Pointer session, int n);
         int     crispasr_session_set_beam_size(Pointer session, int n);
@@ -313,6 +315,9 @@ public final class CrispasrSession implements AutoCloseable {
         // Diarization
         int crispasr_diarize_segments_abi(float[] leftPcm, float[] rightPcm, int nSamples,
                                           int isStereo, Pointer segs, int nSegs, Pointer opts);
+        int crispasr_diarize_segments_turns_abi(float[] leftPcm, float[] rightPcm, int nSamples,
+                                                int isStereo, Pointer segs, int nSegs, Pointer opts,
+                                                Pointer outTurns, int turnsCap, IntByReference outNTurns);
 
         // Text-LID
         int crispasr_text_detect_language(String text, String modelPath, int nThreads,
@@ -519,6 +524,12 @@ public final class CrispasrSession implements AutoCloseable {
     public void setMaxSpeechTokens(int n) {
         int rc = Lib.INSTANCE.crispasr_session_set_max_speech_tokens(handle, n);
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_max_speech_tokens failed (rc=" + rc + ")");
+    }
+
+    /** Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2). */
+    public void setMinSpeechTokens(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_min_speech_tokens(handle, n);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_min_speech_tokens failed (rc=" + rc + ")");
     }
 
     /** Per-phoneme length-scale / speaking-rate scalar. Honoured by kokoro today; other backends no-op. */
@@ -728,6 +739,11 @@ public final class CrispasrSession implements AutoCloseable {
         int rc = Lib.INSTANCE.crispasr_session_set_tts_phonemes(handle, phonemes == null ? "" : phonemes);
         if (rc == -2) throw new RuntimeException("backend has no phonemes-in entry point (kokoro and piper do)");
         if (rc != 0) throw new RuntimeException("set_tts_phonemes failed (rc=" + rc + ")");
+    }
+
+    /** Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk. */
+    public void setTtsPadSilenceMs(int ms) {
+        Lib.INSTANCE.crispasr_session_set_tts_pad_silence_ms(handle, ms);
     }
 
     /**

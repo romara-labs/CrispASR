@@ -16,6 +16,11 @@ FetchContent_MakeAvailable(Catch2)
 list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
 include(Catch)
 
+add_executable(test-realtime-turn-buffer test-realtime-turn-buffer.cpp)
+target_include_directories(test-realtime-turn-buffer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-realtime-turn-buffer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-realtime-turn-buffer PROPERTIES LABELS "unit;realtime")
+
 if (EMSCRIPTEN)
 #
 #test - crispasr - js
@@ -29,6 +34,72 @@ if (EMSCRIPTEN)
 
     return()
 endif()
+
+# ─── basic-pitch-conv-ab — hermetic conv A/B (no GGUF, no audio) ──────────────
+# Unlike the other *-ab harnesses this one needs no models, so CI can run it.
+# That matters: the VPS this was developed on gives a single-threaded process
+# 36-54%% of one core, so the threaded arm is unmeasurable there.
+# See docs/music-transcription/BASIC_PITCH_CONV_PERF.md.
+add_executable(basic-pitch-conv-ab basic-pitch-conv-ab.cpp)
+target_include_directories(basic-pitch-conv-ab PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(basic-pitch-conv-ab PRIVATE Threads::Threads)
+
+# ─── test-basic-pitch-conv — SIMD/threaded conv must match the scalar loop
+# byte for byte (hermetic: no GGUF, no audio).
+add_executable(test-basic-pitch-conv test-basic-pitch-conv.cpp)
+target_include_directories(test-basic-pitch-conv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-basic-pitch-conv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-basic-pitch-conv PROPERTIES LABELS "unit;basic-pitch")
+
+add_executable(test-chatterbox-f0-simd test-chatterbox-f0-simd.cpp)
+target_include_directories(test-chatterbox-f0-simd PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-f0-simd PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-chatterbox-f0-simd
+    TEST_SPEC "[unit][tts][chatterbox][simd]"
+    PROPERTIES LABELS "unit;tts;chatterbox")
+
+# #421: these two suites memcmp three arms (hand reference, scalar kernel,
+# SIMD kernel) for BIT-exactness. On aarch64 GCC defaults to
+# -ffp-contract=fast and contracts the reference loop and the kernel loop
+# DIFFERENTLY (different mul/fmadd pairings), so the memcmp fails by
+# 2-6e-6 — a too-strict test, not a kernel bug (proven by cross-compiled
+# repro: 6/6 fail at default, 0/6 with contraction off; x86 agrees only
+# by accident because baseline x86-64 has no FMA). Pinning contraction
+# off for the TEST TUs keeps bit-exactness meaningful — all compared arms
+# live in this one TU — while shipped kernels keep fmadd (faster and more
+# accurate). MSVC does not contract by default, hence the guard.
+if (NOT MSVC)
+    set_source_files_properties(test-chatterbox-hift-simdconv.cpp test-cosyvoice3-hift-simdconv.cpp
+                                PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
+add_executable(test-chatterbox-hift-simdconv test-chatterbox-hift-simdconv.cpp)
+target_include_directories(test-chatterbox-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-chatterbox-hift-simdconv
+    TEST_SPEC "[unit][tts][chatterbox][hift][simdconv]"
+    PROPERTIES LABELS "unit;tts;chatterbox")
+
+add_executable(test-campplus-segpool test-campplus-segpool.cpp)
+target_include_directories(test-campplus-segpool PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-campplus-segpool PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-campplus-segpool
+    TEST_SPEC "[unit][tts][campplus][segpool]"
+    PROPERTIES LABELS "unit;tts;campplus")
+
+add_executable(test-step-graph-cache test-step-graph-cache.cpp)
+target_include_directories(test-step-graph-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-step-graph-cache PRIVATE Catch2::Catch2WithMain ggml ggml-base)
+catch_discover_tests(test-step-graph-cache
+    TEST_SPEC "[unit][core][stepcache]"
+    PROPERTIES LABELS "unit;core;stepcache")
+
+add_executable(test-cosyvoice3-hift-simdconv test-cosyvoice3-hift-simdconv.cpp)
+target_include_directories(test-cosyvoice3-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-cosyvoice3-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-cosyvoice3-hift-simdconv
+    TEST_SPEC "[unit][tts][cosyvoice3][simdconv]"
+    PROPERTIES LABELS "unit;tts;cosyvoice3")
 
 set(TEST_TARGET test-crispasr-cli-tiny)
 add_test(NAME ${TEST_TARGET}
@@ -352,6 +423,27 @@ catch_discover_tests(test-audio-resample
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-voxtral-pretokenize — the tekken regex split (#338 follow-up) ───────
+# Header-only, no weights, no network: expectations are generated from the
+# published `config.pattern` via Python's `regex`, so this pins the SPLIT
+# without carrying the 15 MB vocabulary. Live id-level parity against
+# mistral-common is tools/check-voxtral-tokenizer-parity.py.
+add_executable(test-voxtral-pretokenize
+    test-voxtral-pretokenize.cpp
+)
+target_include_directories(test-voxtral-pretokenize PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-voxtral-pretokenize PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-voxtral-pretokenize
+    TEST_SPEC "[pretokenize]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-voxtral-tekken-vocab — #338 active-vocabulary bound ─────────────────
 # Header-only, no weights: a Tekken blob may serialize more pieces than the
 # checkpoint's embedding table has rows, and an id past the table becomes an
@@ -446,6 +538,68 @@ catch_discover_tests(test-gguf-bounds
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-gguf-release — contract of core_gguf::release_weight_buffer ──────────
+# The entry point that frees a weight buffer AND unmaps the host region behind
+# it. These cases need no GPU: the CPU mmap path, the legacy alloc+copy path
+# (which registers no mapping and must still be released cleanly), repeat calls
+# and the null handle.
+add_executable(test-gguf-release test-gguf-release.cpp)
+target_include_directories(test-gguf-release PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-release PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-gguf-release
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-gguf-mapping-released — the weight mmap must not outlive the model ───
+# Asks the kernel which regions still name the weight file after the weights
+# are freed. Exact rather than a footprint threshold, so there is nothing to
+# settle and nothing to poll. The zero-copy leg self-skips where no device
+# advertises buffer_from_host_ptr.
+add_executable(test-gguf-mapping-released test-gguf-mapping-released.cpp)
+target_include_directories(test-gguf-mapping-released PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-mapping-released PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-gguf-mapping-released
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-crisp-audio-mapping-released — the same oracle, one step out ─────────
+# crisp_audio takes its weight buffer from core_gguf::load_weights and owns it
+# from there, so the release has to happen in crisp_audio_free(). Drives the
+# public C API on a synthetic one-layer tower and asks the kernel which regions
+# still name the GGUF. The GPU legs self-skip where no device advertises
+# buffer_from_host_ptr; the CPU leg runs everywhere.
+add_executable(test-crisp-audio-mapping-released test-crisp-audio-mapping-released.cpp)
+target_include_directories(test-crisp-audio-mapping-released PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-crisp-audio-mapping-released PRIVATE
+    Catch2::Catch2WithMain
+    crisp_audio
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-crisp-audio-mapping-released
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-gguf-split-alloc — regression guard for issue #276 ───────────────────
 # Verifies load_weights_split() correctly partitions tensors across GPU/CPU
 # backend buffers, respects the is_gpu predicate, and that free_weights cleans
@@ -486,6 +640,19 @@ if(CRISPASR_BUILD_EXAMPLES)
         TIMEOUT 120)
 endif()
 
+# Chatterbox Multilingual V3: Q4 must retain enough precision in the native
+# voice tokenizer and AR sampling head. The script creates its own tiny GGUF,
+# so this exercises the real quantizer without downloading model weights.
+if(CRISPASR_BUILD_EXAMPLES)
+    add_test(NAME test-chatterbox-quant-carveout
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-chatterbox-quant-carveout.sh
+            $<TARGET_FILE:crispasr-quantize>
+            ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-chatterbox-quant-carveout PROPERTIES
+        LABELS "unit;gh;chatterbox;regression-348"
+        TIMEOUT 120)
+endif()
+
 # ─── test - stream - finalize — Catch2 unit tests for the streaming
 # `final.text` stitcher used by `--stream-json` finalize_utterance.
 # Header-only target (no crispasr lib needed): the helper is a pure
@@ -495,6 +662,7 @@ add_executable(test-stream-finalize
 )
 target_include_directories(test-stream-finalize PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test-stream-finalize PRIVATE
     Catch2::Catch2WithMain
@@ -616,6 +784,29 @@ target_link_libraries(test-diarize-pyannote-live PRIVATE
     crispasr-lib
 )
 catch_discover_tests(test-diarize-pyannote-live
+    TEST_SPEC "[live]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-diarize-foxnose-turns-live — the #395 turn-forwarding ABI ───────────
+#
+# Everything about crispasr_diarize_segments_turns_abi that needs REAL turns,
+# and therefore a real speaker embedder: well-formedness, the truncation
+# protocol, the absolute-timeline conversion, and "asking for turns does not
+# change the labels". The model-free half of the contract is in
+# test-session-abi-nulls.cpp. Opt-in via CRISPASR_TEST_FOXNOSE_WAV +
+# CRISPASR_TEST_FOXNOSE_EMBEDDER; skips cleanly without them.
+add_executable(test-diarize-foxnose-turns-live
+    test-diarize-foxnose-turns-live.cpp
+)
+target_link_libraries(test-diarize-foxnose-turns-live PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-diarize-foxnose-turns-live
     TEST_SPEC "[live]"
     PROPERTIES
         LABELS live
@@ -825,7 +1016,7 @@ endif()
 # cross-speaker low cosine; GEMM vs TITANET_FORCE_SCALAR equivalence).
 add_executable(test-titanet test-titanet.cpp)
 target_include_directories(test-titanet PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(test-titanet PRIVATE titanet crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries(test-titanet PRIVATE titanet crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 
 # test-crepe-parity — runs the CREPE ggml graph on a deterministic tone sweep
 # and dumps the 360-bin activations for tools/crepe_numpy_parity.py to score.
@@ -833,7 +1024,7 @@ target_link_libraries(test-titanet PRIVATE titanet crispasr-core ggml ggml-base 
 # it needs a model — but it is the acceptance gate for src/crepe.cpp.
 add_executable(test-crepe-parity test_crepe_parity.cpp)
 target_include_directories(test-crepe-parity PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(test-crepe-parity PRIVATE crepe crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries(test-crepe-parity PRIVATE crepe crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 
 # ─── test-crepe-live — ctest-registered CREPE pitch/F0 integration test.
 # Gated on CRISPASR_MODEL_CREPE; SKIPs cleanly when unset. Complements (does
@@ -985,6 +1176,25 @@ catch_discover_tests(test-diarize-slice-rewalk
     TEST_SPEC "[issue324]"
     PROPERTIES LABELS "unit;diarize;issue324"
 )
+
+# ─── test-confucius4-tts-live — live integration tests for Confucius4-TTS
+if (TARGET confucius4-tts)
+add_executable(test-confucius4-tts-live
+    test_confucius4_tts_live.cpp
+)
+target_include_directories(test-confucius4-tts-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-confucius4-tts-live PRIVATE
+    Catch2::Catch2WithMain
+    confucius4-tts
+    indextts
+)
+catch_discover_tests(test-confucius4-tts-live
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live;confucius4-tts"
+)
+endif()
 
 # ─── test-miotts-live — live integration tests for MioTTS backend
 add_executable(test-miotts-live
@@ -1269,6 +1479,9 @@ target_include_directories(test-moss-audio PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/examples
 )
+target_compile_definitions(test-moss-audio PRIVATE
+    SAMPLES_DIR="${PROJECT_SOURCE_DIR}/samples"
+)
 target_link_libraries(test-moss-audio PRIVATE
     Catch2::Catch2WithMain
     moss_audio
@@ -1278,6 +1491,23 @@ catch_discover_tests(test-moss-audio
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-moss-audio-valid-meta — hermetic (no model) valid-frame metadata (issue #344)
+add_executable(test-moss-audio-valid-meta
+    test-moss-audio-valid-meta.cpp
+)
+target_include_directories(test-moss-audio-valid-meta PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-moss-audio-valid-meta PRIVATE
+    Catch2::Catch2WithMain
+    moss_audio
+)
+catch_discover_tests(test-moss-audio-valid-meta
+    TEST_SPEC "[moss-audio-valid-meta]"
+    PROPERTIES
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
@@ -1315,6 +1545,26 @@ target_link_libraries(test-parakeet-ja-longform PRIVATE
 )
 catch_discover_tests(test-parakeet-ja-longform
     TEST_SPEC "[parakeet-ja-longform]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - parakeet-longform — issue #350 regression guard (non-JA 30-300 s)
+add_executable(test-parakeet-longform
+    test_parakeet_longform_live.cpp
+)
+target_include_directories(test-parakeet-longform PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parakeet-longform PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-parakeet-longform
+    TEST_SPEC "[parakeet-longform]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
@@ -1416,6 +1666,24 @@ catch_discover_tests(test-cosyvoice3-params
     PROPERTIES LABELS "unit;cosyvoice3"
 )
 
+# ─── test-fireredtts3-params — Catch2 unit tests for fireredtts3 params defaults
+# and null-guards (#377). No model required.
+add_executable(test-fireredtts3-params
+    test-fireredtts3-params.cpp
+)
+target_include_directories(test-fireredtts3-params PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(test-fireredtts3-params PRIVATE
+    Catch2::Catch2WithMain
+    fireredtts3
+    chatterbox
+)
+catch_discover_tests(test-fireredtts3-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;fireredtts3"
+)
+
 # ─── test-dots-tts-params — Catch2 unit tests for dots_tts_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 if (TARGET dots-tts)
@@ -1433,6 +1701,63 @@ target_link_libraries(test-dots-tts-params PRIVATE
 catch_discover_tests(test-dots-tts-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;dots-tts"
+)
+endif()
+
+# ─── test-supertonic-params — Catch2 unit tests for supertonic_context_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+if (TARGET supertonic-tts)
+add_executable(test-supertonic-params
+    test-supertonic-params.cpp
+)
+target_include_directories(test-supertonic-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-supertonic-params PRIVATE
+    Catch2::Catch2WithMain
+    supertonic-tts
+)
+catch_discover_tests(test-supertonic-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;supertonic"
+)
+endif()
+
+# ─── test-supertonic-live — live integration tests for Supertonic-3 TTS
+if (TARGET supertonic-tts)
+add_executable(test-supertonic-live
+    test_supertonic_live.cpp
+)
+target_include_directories(test-supertonic-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-supertonic-live PRIVATE
+    Catch2::Catch2WithMain
+    supertonic-tts
+)
+catch_discover_tests(test-supertonic-live
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live;supertonic"
+)
+endif()
+
+# ─── test-confucius4-tts-params — Catch2 unit tests for confucius4_tts_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+if (TARGET confucius4-tts)
+add_executable(test-confucius4-tts-params
+    test-confucius4-tts-params.cpp
+)
+target_include_directories(test-confucius4-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-confucius4-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    confucius4-tts
+    indextts
+)
+catch_discover_tests(test-confucius4-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;confucius4-tts"
 )
 endif()
 
@@ -1635,13 +1960,12 @@ target_link_libraries(test-kokoro-params PRIVATE
     Catch2::Catch2WithMain
     kokoro
 )
-# #316: kokoro now compiles phonemizer.cpp with CRISPASR_BUILD, which enables the
-# G2P dictionary auto-download (previously dead code — the macro was defined
-# nowhere). That pulls in crispasr_cache::ensure_cached_file, which lives in
-# crispasr-lib. crispasr-lib links kokoro, so kokoro cannot link it back; every
-# real binary resolves the symbol because it links crispasr-lib. This test links
-# kokoro ALONE, so it compiles the one translation unit it needs directly.
-target_sources(test-kokoro-params PRIVATE ${PROJECT_SOURCE_DIR}/src/crispasr_cache.cpp)
+# #316/#435: phonemizer.cpp and crispasr_cache.cpp both live in crispasr-core
+# now, which kokoro links PUBLIC — so linking kokoro ALONE (as this test does)
+# resolves the G2P auto-download path from that one archive. The explicit
+# `target_sources(... crispasr_cache.cpp)` this line used to carry is no longer
+# needed; it existed only because the caller and the callee sat in two different
+# libraries with an unfavourable link order.
 catch_discover_tests(test-kokoro-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;kokoro"
@@ -1842,6 +2166,23 @@ target_link_libraries(test-diarize-smooth PRIVATE
 catch_discover_tests(test-diarize-smooth
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;diarize_smooth"
+)
+
+# ─── test-parallel-for — hermetic unit tests for the shared fan-out helpers
+# in core/parallel_for.h. No model, no audio, no threads-of-convenience. ──────
+add_executable(test-parallel-for
+    test-parallel-for.cpp
+)
+target_include_directories(test-parallel-for PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parallel-for PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-parallel-for
+    TEST_SPEC "[parallel]"
+    PROPERTIES LABELS "unit;parallel"
 )
 
 # ─── test-spectral-diarize — hermetic unit tests for the speaker-clustering
@@ -2534,6 +2875,107 @@ catch_discover_tests(test-issue-114-chunk-context-gate
     PROPERTIES LABELS "unit;chunk-context;issue-114"
 )
 
+# ─── test-issue-356-gap-fill-overlap — issue #356 regression guard
+#
+# Pins crispasr_gap_fill_resolve_overlaps: the #89 gap-fill second pass used to
+# append recoveries inside the span of the segment they were recovered from and
+# sort by t0 only, so SRT/VTT cues jumped backwards by up to the hole length.
+# Covering segments must be split at each recovery so the list is monotone with
+# no text lost. Scripted fake backend; pure CPU, no model load.
+add_executable(test-issue-356-gap-fill-overlap
+    test-issue-356-gap-fill-overlap.cpp
+)
+target_include_directories(test-issue-356-gap-fill-overlap PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-356-gap-fill-overlap PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-issue-356-gap-fill-overlap
+    TEST_SPEC "[issue-356]"
+    PROPERTIES LABELS "unit;gap-fill;issue-356"
+)
+
+# ─── test-issue-356-order-guard — issue #356 time-order guard
+#
+# Pins crispasr_first_backward_segment, the check merge_segments and the server
+# run over every finished transcript. #356 shipped because nothing between the
+# gap-fill producer and the SRT/VTT writers verified time order. The guard has
+# to read WORD timestamps (what crispasr_make_disp_segments uses) rather than
+# segment spans, or it passes the very list that caused the bug.
+add_executable(test-issue-356-order-guard
+    test-issue-356-order-guard.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_output.cpp
+)
+target_include_directories(test-issue-356-order-guard PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-356-order-guard PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-issue-356-order-guard
+    TEST_SPEC "[issue-356]"
+    PROPERTIES LABELS "unit;order-guard;issue-356"
+)
+
+# ─── test-issue-353-split-pipeline — #353 encode/decode pipeline gating
+#
+# Pins every condition under which the dispatcher may overlap a backend's
+# encode_slice with decode_slice. Two were missing when the pipeline landed: the
+# env override re-derived the decision without return_logits / worker-pool, and
+# nothing covered the per-slice #89 gap-fill that re-enters be.transcribe() on
+# the consumer thread — which aborted the process on a ggml assert.
+add_executable(test-issue-353-split-pipeline
+    test-issue-353-split-pipeline.cpp
+)
+target_include_directories(test-issue-353-split-pipeline PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-353-split-pipeline PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-353-split-pipeline
+    TEST_SPEC "[issue-353]"
+    PROPERTIES LABELS "unit;split-pipeline;issue-353"
+)
+
+# ─── test-cpu-backend-shim — #355 CPU-backend access shim
+#
+# Pins src/core/ggml_cpu_backend.h. Compiles unchanged with or without
+# GGML_BACKEND_DL, so `cmake -DGGML_BACKEND_DL=ON` runs these same cases
+# against the registry path — the only way the two branches can be held
+# equivalent.
+add_executable(test-cpu-backend-shim
+    test-cpu-backend-shim.cpp
+)
+target_include_directories(test-cpu-backend-shim PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-cpu-backend-shim PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-cpu-backend-shim
+    TEST_SPEC "[cpu-shim]"
+    PROPERTIES LABELS "unit;cpu-shim;issue-355"
+)
+
 # ─── test-parakeet-ja-detect — issue #257 regression guard
 #
 # Pins crispasr_parakeet::vocab_looks_japanese so the JA-model detection keys on
@@ -2597,6 +3039,40 @@ target_link_libraries(test-issue-150-cjk-fallback PRIVATE
 catch_discover_tests(test-issue-150-cjk-fallback
     TEST_SPEC "[issue-150]"
     PROPERTIES LABELS "unit;output;issue-150"
+)
+
+# ─── test-issue-465-hangul-spaces — Korean keeps word spaces in display segments (hermetic, unit)
+add_executable(test-issue-465-hangul-spaces
+    test-issue-465-hangul-spaces.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_output.cpp
+)
+target_include_directories(test-issue-465-hangul-spaces PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-issue-465-hangul-spaces PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-465-hangul-spaces
+    TEST_SPEC "[issue-465]"
+    PROPERTIES LABELS "unit;output;issue-465"
+)
+
+# ─── test-issue-475-json-utf8 — -ojf stays valid UTF-8 with split BPE tokens (hermetic, unit)
+add_executable(test-issue-475-json-utf8
+    test-issue-475-json-utf8.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_output.cpp
+)
+target_include_directories(test-issue-475-json-utf8 PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-issue-475-json-utf8 PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-475-json-utf8
+    TEST_SPEC "[issue-475]"
+    PROPERTIES LABELS "unit;output;issue-475"
 )
 
 # ─── test-internal-chunking-gate — CAP_INTERNAL_CHUNKING regression guard
@@ -2888,6 +3364,21 @@ catch_discover_tests(test-session-setter-parity
     PROPERTIES LABELS "unit;setter-parity"
 )
 
+# ─── test-session-output-rate-parity — every synthesize arm in the session ABI
+# must have a crispasr_session_output_sample_rate arm (bt2-tts shipped without
+# one and reported 0 Hz). Structural: reads src/crispasr_c_api.cpp, no weights.
+add_executable(test-session-output-rate-parity
+    test-session-output-rate-parity.cpp
+)
+target_compile_definitions(test-session-output-rate-parity PRIVATE
+    CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+target_link_libraries(test-session-output-rate-parity PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-session-output-rate-parity
+    TEST_SPEC "[output-rate-parity]"
+    PROPERTIES LABELS "unit;output-rate-parity"
+)
+
 # ─── test-segment-hygiene — §W2 length cap, §W5 repeat merge, §W6 filters.
 # All three live downstream of the logits, where crispasr-diff reads
 # cos 1.000000 whether they work or not. This is the only check they get.
@@ -2943,6 +3434,76 @@ target_link_libraries(test-loopfix-wiring PRIVATE
 catch_discover_tests(test-loopfix-wiring
     TEST_SPEC "[loopfix-wiring]"
     PROPERTIES LABELS "unit;ngram-loop"
+)
+
+# ─── test-htdemucs-gates — unit tests for the #413/#414 path-selection
+# table (AUTO fused-GPU on real-GPU hosts, BLAS otherwise, env overrides).
+add_executable(test-htdemucs-gates
+    test-htdemucs-gates.cpp
+)
+target_include_directories(test-htdemucs-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-htdemucs-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-htdemucs-gates
+    TEST_SPEC "[htdemucs]"
+    PROPERTIES LABELS "unit;htdemucs"
+)
+
+# ─── test-sidon-rpe-gates — unit tests for the #416 follow-up length-aware
+# relative-position-bias selection (AUTO expand on GPU while its extra
+# transient footprint fits the budget, bucket-direct otherwise; an explicit
+# CRISPASR_SIDON_RPE is never auto-overridden).
+add_executable(test-sidon-rpe-gates
+    test-sidon-rpe-gates.cpp
+)
+target_include_directories(test-sidon-rpe-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-sidon-rpe-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-sidon-rpe-gates
+    TEST_SPEC "[sidon]"
+    PROPERTIES LABELS "unit;sidon"
+)
+
+# ─── test-mel-band-gates — unit tests for the Change-176 path-selection
+# table (mirrors test-htdemucs-gates; AUTO fused-graph-GPU on real-GPU hosts,
+# CPU path otherwise, env overrides, #414 review semantics).
+add_executable(test-mel-band-gates
+    test-mel-band-gates.cpp
+)
+target_include_directories(test-mel-band-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mel-band-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-mel-band-gates
+    TEST_SPEC "[mel-band]"
+    PROPERTIES LABELS "unit;mel-band"
+)
+
+# ─── test-mel-blas-parity — guards core_mel's cblas_sgemm projection against a
+# BLAS that returns the wrong answer (found on a host where find_package(BLAS)
+# picked threaded MKL alongside libgomp). Links crispasr-core so it exercises
+# whatever BLAS this build actually chose.
+add_executable(test-mel-blas-parity
+    test-mel-blas-parity.cpp
+)
+target_include_directories(test-mel-blas-parity PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mel-blas-parity PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-mel-blas-parity
+    TEST_SPEC "[mel]"
+    PROPERTIES LABELS "unit;mel"
 )
 
 # ─── test-uroman — Catch2 unit tests for core/uroman.h romanization.
@@ -3524,6 +4085,129 @@ catch_discover_tests(test_tts_provenance
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-asr-overlap-trim — #365 canary seam duplication ───────────────────
+# Pure header, no model: the seam decision is what duplicated phrases and ran
+# SRT timestamps backwards, and it is decidable from timings alone.
+add_executable(test-asr-overlap-trim test-asr-overlap-trim.cpp)
+target_include_directories(test-asr-overlap-trim PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-asr-overlap-trim PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-asr-overlap-trim
+    TEST_SPEC "[issue-365]"
+    PROPERTIES LABELS "unit;asr"
+)
+
+# ─── test-canary-chunk-merge — #375 canary long-form blueprint port ─────────
+# Pure header, no model: pins nemo_lcs_merge and optimal_chunk_samples against
+# vectors generated from the actual NeMo 2.7.3 Python functions, so the port
+# cannot drift from the blueprint unnoticed.
+add_executable(test-canary-chunk-merge test-canary-chunk-merge.cpp)
+target_include_directories(test-canary-chunk-merge PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-canary-chunk-merge PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-canary-chunk-merge
+    TEST_SPEC "[chunk-merge]"
+    PROPERTIES LABELS "unit;asr"
+)
+
+# ─── test-tts-ref-cache — #334 CLI-writes / session-reads contract ──────────
+# The reference-transcript cache couples two layers that never compile
+# together: the CLI writes it, crispasr_c_api.cpp reads it, and the suffix and
+# tag agree only by convention. Header-only, no model needed.
+add_executable(test-tts-ref-cache test-tts-ref-cache.cpp)
+target_include_directories(test-tts-ref-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-tts-ref-cache PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-tts-ref-cache
+    TEST_SPEC "[issue-334]"
+    PROPERTIES LABELS "unit;tts"
+)
+
+# ─── test-align-stdin — #317 `--align-only --text-file -` ───────────────────
+# Live: needs a CTC aligner GGUF and a speech clip, so it SKIPs (77) without
+# them. Asserts stdin is a transport and not a separate feature — piping a
+# transcript must give byte-identical output to passing the same bytes as a
+# file, including SRT re-timing where the file path reads the .srt extension and
+# stdin has to sniff the content instead.
+add_test(NAME test-align-stdin
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-align-stdin.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-align-stdin PROPERTIES
+    ENVIRONMENT "CRISPASR_BIN=$<TARGET_FILE:crispasr-cli>"
+    LABELS "live;align;issue-317"
+    TIMEOUT 600
+    SKIP_RETURN_CODE 77)
+
+# ─── test-embed-parallel — #326 cross-segment embedding ─────────────────────
+# The embedder now runs segments across workers. The risk is ORDER, not speed:
+# embeddings feed a clusterer positionally, so a worker appending out of order
+# would shuffle speaker labels. Deterministic fake embedder, no model needed.
+add_executable(test-embed-parallel
+    test-embed-parallel.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_diarize_cli.cpp
+)
+target_include_directories(test-embed-parallel PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-embed-parallel PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-embed-parallel
+    TEST_SPEC "[issue-326]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
+# ─── test-subprocess-quoting — #328 Windows sherpa hang ─────────────────────
+# Both quoters compile everywhere now, so the Windows rules can be round-tripped
+# against a reference CommandLineToArgvW on any host. That is the point: the
+# #ifdef used to make the Windows path unverifiable on the machines it was
+# written on. Pure strings, no subprocess spawned.
+add_executable(test-subprocess-quoting test-subprocess-quoting.cpp)
+target_include_directories(test-subprocess-quoting PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-subprocess-quoting PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-subprocess-quoting
+    TEST_SPEC "[quoting]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-omnivoice-duration — #363 reference-rate guard ────────────────────
+# Pure header, no model: the target-length estimator decides whether a phrase
+# fits before any generation happens, which is what made #363 a truncation
+# rather than a mistiming.
+add_executable(test-omnivoice-duration test-omnivoice-duration.cpp)
+target_include_directories(test-omnivoice-duration PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-omnivoice-duration PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-omnivoice-duration
+    TEST_SPEC "[duration]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-glint-simd-detect — regression guard for #327 ─────────────────────
+# glint/src/simd.hpp is included first in that TU on purpose, so it must be
+# self-sufficient; on MSVC that reproduces #327 (missing <intrin.h> for
+# __cpuidex) as a compile error rather than as luck. Needs glint/src on the
+# include path because simd.hpp is an internal header, not a public one.
+add_executable(test-glint-simd-detect test-glint-simd-detect.cpp)
+target_include_directories(test-glint-simd-detect PRIVATE
+    ${PROJECT_SOURCE_DIR}/glint/src
+    ${PROJECT_SOURCE_DIR}/glint/include
+)
+target_link_libraries(test-glint-simd-detect PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-glint-simd-detect
+    TEST_SPEC "[simd]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test_audioseal — Catch2 unit tests for AudioSeal ggml watermark.
 #API surface tests run unconditionally. Live model tests require
 #AUDIOSEAL_GGUF env var pointing at an audioseal.gguf.
@@ -3670,28 +4354,28 @@ catch_discover_tests(test-core-wordpiece
 # ─── test-beat-this-stages — per-stage graph parity vs the torch reference ────
 add_executable(test-beat-this-stages test_beat_this_stages.cpp)
 target_include_directories(test-beat-this-stages PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(test-beat-this-stages PRIVATE beat-this crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries(test-beat-this-stages PRIVATE beat-this crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 
 # ─── test-beat-this-track — windowing + postprocessing vs the reference ──────
 # Needs a model + the long fixture from tools/gen_beat_this_track_ref.py; the
 # 101-frame front-end fixture is a single chunk and exercises no seams.
 add_executable(test-beat-this-track test_beat_this_track.cpp)
 target_include_directories(test-beat-this-track PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(test-beat-this-track PRIVATE beat-this crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries(test-beat-this-track PRIVATE beat-this crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 
 # ─── test-beat-this-frontend — log-mel vs torchaudio ──────────────────────────
 # Needs a model + fixtures, so not a ctest case; it is the acceptance gate for
 # the front end. Generate fixtures with tools/gen_beat_this_frontend_ref.py.
 add_executable(test-beat-this-frontend test_beat_this_frontend.cpp)
 target_include_directories(test-beat-this-frontend PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(test-beat-this-frontend PRIVATE beat-this crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries(test-beat-this-frontend PRIVATE beat-this crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 
 # ─── test-core-gru — core/gru.h vs a real PyTorch nn.GRU fixture ──────────────
 # Parity case skips unless CRISPASR_GRU_REF points at a fixture from
 # tools/gen_gru_reference.py, so CI needs neither torch nor network.
 add_executable(test-core-gru test-core-gru.cpp)
 target_include_directories(test-core-gru PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(test-core-gru PRIVATE Catch2::Catch2WithMain ggml ggml-base ggml-cpu)
+target_link_libraries(test-core-gru PRIVATE Catch2::Catch2WithMain ggml ggml-base crispasr_link_ggml_cpu)
 catch_discover_tests(test-core-gru
     TEST_PREFIX "core-gru: "
     PROPERTIES LABELS "unit;core"
@@ -3713,6 +4397,19 @@ target_include_directories(test-core-cqt PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-core-cqt PRIVATE Catch2::Catch2)
 catch_discover_tests(test-core-cqt
     TEST_PREFIX "core-cqt: "
+    PROPERTIES LABELS "unit;core"
+)
+
+# ─── test-core-midi-writer — core/midi_writer.h Standard MIDI File output ─────
+# Parses the produced bytes back with an independent reader rather than
+# diffing a golden blob: the failures that matter (stuck notes, a note-off
+# ordered after the next note-on at the same tick, zero-length notes) are
+# structural. Header-only, so no backend link.
+add_executable(test-core-midi-writer test-core-midi-writer.cpp)
+target_include_directories(test-core-midi-writer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-core-midi-writer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-midi-writer
+    TEST_PREFIX "core-midi-writer: "
     PROPERTIES LABELS "unit;core"
 )
 
@@ -3758,11 +4455,93 @@ target_include_directories(test-core-cross-attn PRIVATE
 )
 target_link_libraries(test-core-cross-attn PRIVATE
     Catch2::Catch2WithMain
-    ggml ggml-base ggml-cpu
+    ggml ggml-base crispasr_link_ggml_cpu
 )
 catch_discover_tests(test-core-cross-attn
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-tts-voice-policy — per-request voice decisions (#371) ─────────
+# The server reuses one backend per session and passes voice= per request; a
+# backend that reads tts_voice only at init() serves the startup voice forever.
+# Pins apply/dedupe/builtin, and that a FAILED load must not dedupe its retry.
+add_executable(test-core-tts-voice-policy test-core-tts-voice-policy.cpp)
+target_include_directories(test-core-tts-voice-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-tts-voice-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-tts-voice-policy
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-diarize-tracks — speaker floor from pyannote local tracks ─────
+# #368: GMM/BIC collapses to k=1 on short inputs and merges speakers. The floor
+# comes from distinct local-track ids — distinct, NOT max+1, which would force a
+# split on sparse ids. Those two agree on dense input, so the sparse case is the
+# only one that can tell them apart.
+add_executable(test-core-diarize-tracks test-core-diarize-tracks.cpp)
+target_include_directories(test-core-diarize-tracks PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-diarize-tracks PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-diarize-tracks
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-utf8 — core/utf8.h codepoint counting ─────────────────────────
+# A byte count is not a character count outside ASCII, and the two were being
+# mixed: f5-tts multiplied a chars/sec rate by strlen() of the target, so
+# Devanagari came out ~3x too long. ASCII fixtures cannot catch that, which is
+# why these cases are deliberately non-ASCII.
+add_executable(test-core-utf8 test-core-utf8.cpp)
+target_include_directories(test-core-utf8 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-utf8 PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-utf8
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-kv-quant-roundtrip — CRISPASR_KV_QUANT cross-graph round-trip ──────
+# Writes a quantised KV cache with set_rows in one graph and reads it back with
+# view+cast in a LATER graph, for every supported KV dtype. Nothing covered the
+# quantised cache before; q8_0 on ark-asr silently produced an empty transcript.
+add_executable(test-kv-quant-roundtrip test-kv-quant-roundtrip.cpp)
+target_include_directories(test-kv-quant-roundtrip PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-kv-quant-roundtrip PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base crispasr_link_ggml_cpu
+)
+catch_discover_tests(test-kv-quant-roundtrip
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# PR #410: Chatterbox passes a per-layer KV-cache view directly to
+# flash_attn_ext. Pin both the non-zero layer offset and output equivalence to
+# the former materialized-contiguous path without requiring a model download.
+add_executable(test-flash-attn-kv-view test-flash-attn-kv-view.cpp)
+target_include_directories(test-flash-attn-kv-view PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-flash-attn-kv-view PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base crispasr_link_ggml_cpu
+)
+catch_discover_tests(test-flash-attn-kv-view
+    TEST_SPEC "[unit][chatterbox][attention]"
+    PROPERTIES LABELS "unit;chatterbox"
 )
 
 # ─── test-core-adaln — core/adaln.h AdaLN-Zero modulation (ggml graph) ────────
@@ -3774,7 +4553,7 @@ target_include_directories(test-core-adaln PRIVATE
 )
 target_link_libraries(test-core-adaln PRIVATE
     Catch2::Catch2WithMain
-    ggml ggml-base ggml-cpu
+    ggml ggml-base crispasr_link_ggml_cpu
 )
 catch_discover_tests(test-core-adaln
     TEST_SPEC "[unit]"
@@ -3790,7 +4569,7 @@ target_include_directories(test-core-seanet PRIVATE
 )
 target_link_libraries(test-core-seanet PRIVATE
     Catch2::Catch2WithMain
-    ggml ggml-base ggml-cpu
+    ggml ggml-base crispasr_link_ggml_cpu
 )
 catch_discover_tests(test-core-seanet
     TEST_SPEC "[unit]"
@@ -3808,7 +4587,7 @@ target_include_directories(test-fastconv PRIVATE
 )
 target_link_libraries(test-fastconv PRIVATE
     Catch2::Catch2WithMain
-    ggml ggml-base ggml-cpu
+    ggml ggml-base crispasr_link_ggml_cpu
 )
 catch_discover_tests(test-fastconv
     TEST_SPEC "[unit]"
@@ -3883,6 +4662,26 @@ catch_discover_tests(test-audio-chunking
     PROPERTIES LABELS "unit;chunking"
 )
 
+# ─── test-issue-471-energy-silent-slice — issue #471 regression guard
+#
+# Without VAD, the energy chunker could leave a slice holding only the silence
+# (or room noise) after the last word; LLM backends then returned the hotword
+# list or invented text for it. Pins audio_chunking::drop_speechless_ranges on
+# synthesized audio (speech + digital silence / room noise), with positive
+# controls that the ungated split reproduces the bug and negative controls that
+# ordinary speech is split unchanged. Header-only, pure CPU, no model load.
+add_executable(test-issue-471-energy-silent-slice test-issue-471-energy-silent-slice.cpp)
+target_include_directories(test-issue-471-energy-silent-slice PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-issue-471-energy-silent-slice PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-471-energy-silent-slice
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;chunking"
+)
+
 # ─── test_slice_timestamps — Catch2 unit tests for crispasr_fixed_chunk_slices
 # t0_cs / t1_cs timestamp math.  Pins the invariant that PR #96 depends on:
 # each slice's t0_cs = start_sample / SR * 100, with no gaps between adjacent
@@ -3926,7 +4725,10 @@ target_link_libraries(test_qwen3_tts_talker PRIVATE qwen3_tts)
 # ─── test-chat-ggml — end-to-end smoke for the crispasr_chat_* C ABI
 #
 # Loads a small GGUF chat model (env CRISPASR_CHAT_TEST_MODEL → path) and
-# verifies open / generate (one-shot) / generate_stream / reset / close.
+# verifies open / generate (one-shot) / generate_stream / reset / close,
+# prefill of a prompt longer than the prompt batch, token counting
+# against the prompt a prefill really decodes, and reuse of the KV cache
+# across prompts that share a prefix with the session's history.
 # Skipped when the env var is unset so unrelated builds stay green.
 add_executable(test-chat-ggml test-chat-ggml.cpp)
 target_link_libraries(test-chat-ggml PRIVATE
@@ -3934,6 +4736,50 @@ target_link_libraries(test-chat-ggml PRIVATE
     crispasr-lib
 )
 catch_discover_tests(test-chat-ggml
+    TEST_SPEC "[chat]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-chat-abort — cancellation over the crispasr_chat_* C ABI
+#
+# Loads the same GGUF chat model (env CRISPASR_CHAT_TEST_MODEL → path) and
+# verifies crispasr_chat_set_abort_callback: the abort code and partial
+# output on both generate paths, clearing with NULL, reuse after an abort,
+# a NULL session, and an abort between prompt batches.
+# Skipped when the env var is unset so unrelated builds stay green.
+add_executable(test-chat-abort test-chat-abort.cpp)
+target_link_libraries(test-chat-abort PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-chat-abort
+    TEST_SPEC "[chat]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-chat-close — session teardown under load
+#
+# Loads the same GGUF chat model (env CRISPASR_CHAT_TEST_MODEL → path) and
+# verifies crispasr_chat_close against a generation in flight: that it waits
+# for the running call rather than freeing under it, that a call arriving
+# after the retirement is declined rather than run, and that the accessors
+# answer a retiring session the way they answer a NULL one. Threads, because
+# the whole contract is about one.
+# Skipped when the env var is unset so unrelated builds stay green.
+find_package(Threads REQUIRED)
+add_executable(test-chat-close test-chat-close.cpp)
+target_link_libraries(test-chat-close PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    Threads::Threads
+)
+catch_discover_tests(test-chat-close
     TEST_SPEC "[chat]"
     PROPERTIES
         LABELS live
@@ -3952,8 +4798,8 @@ if(APPLE AND TARGET ggml-metal)
     target_link_libraries(test_metal_norm_repro PRIVATE
         ggml
         ggml-base
-        ggml-cpu
-        ggml-metal
+        crispasr_link_ggml_cpu
+        crispasr_link_ggml_metal
     )
     # T values that triggered the original bug; each must return rc=0.
     foreach(T 33 65 66 67 97 129 130 131 132 257)
@@ -3980,6 +4826,15 @@ endif()
 # These run conv_transpose_1d and col2im_1d directly on a single GPU backend
 # without a CPU fallback scheduler. They catch ggml bumps that drop CrispASR's
 # backend kernels or dtype support for audio codec/vocoder paths.
+#
+# Not built under GGML_BACKEND_DL. Unlike the rest of the tree these call
+# ggml_backend_metal_init() / ggml_backend_cpu_init() by symbol on purpose —
+# naming one exact backend with no scheduler fallback IS the test. Under DL
+# those symbols live inside dlopen'd modules, and routing them through the
+# registry would pick "best available", which is precisely the ambiguity these
+# tests exist to remove. The DL build is a packaging mode, not a backend, so
+# nothing is lost: the default build still runs them on every backend present.
+if(NOT GGML_BACKEND_DL)
 function(add_ggml_audio_ops_backend_test TEST_TARGET BACKEND_DEF BACKEND_TARGET)
     add_executable(${TEST_TARGET} test_ggml_audio_ops_backend.cpp)
     target_include_directories(${TEST_TARGET} PRIVATE
@@ -3989,7 +4844,7 @@ function(add_ggml_audio_ops_backend_test TEST_TARGET BACKEND_DEF BACKEND_TARGET)
     target_link_libraries(${TEST_TARGET} PRIVATE
         ggml
         ggml-base
-        ggml-cpu
+        crispasr_link_ggml_cpu
         ${BACKEND_TARGET}
     )
     add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
@@ -3998,6 +4853,10 @@ function(add_ggml_audio_ops_backend_test TEST_TARGET BACKEND_DEF BACKEND_TARGET)
         TIMEOUT 45
         SKIP_RETURN_CODE 4)
 endfunction()
+
+add_ggml_audio_ops_backend_test(test_ggml_audio_ops_cpu
+    CRISPASR_TEST_BACKEND_CPU
+    crispasr_link_ggml_cpu)
 
 if(APPLE AND TARGET ggml-metal)
     add_ggml_audio_ops_backend_test(test_ggml_audio_ops_metal
@@ -4019,6 +4878,7 @@ if(TARGET ggml-cuda)
         ggml-cuda)
     set_tests_properties(test_ggml_audio_ops_cuda PROPERTIES LABELS "unit;ggml;backend;cuda")
 endif()
+endif() # NOT GGML_BACKEND_DL
 
 # ─── test - backends — integration tests for all CrispASR backends ────────────
 #Requires network(downloads models).Not run in CI by default.
@@ -4146,6 +5006,20 @@ catch_discover_tests(test-g2p-es
     PROPERTIES TIMEOUT 30
 )
 
+# ─── test-g2p-ru — Catch2 tests for Russian G2P + Russian number words ──────
+add_executable(test-g2p-ru test-g2p-ru.cpp)
+target_include_directories(test-g2p-ru PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-ru PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-g2p-ru
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;russian"
+    PROPERTIES TIMEOUT 30
+)
+
 # ─── test-espeak-phonemize — Catch2 tests for espeak-ng phonemization ───────
 # Tests espeak availability, piper text/IPA synthesis, input validation.
 # Requires PIPER_TEST_MODEL env var or -DPIPER_TEST_MODEL=... for live tests.
@@ -4221,15 +5095,95 @@ set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
     TIMEOUT 300)
 
+# ─── test-arg-validation — offline regression: argument validation must run
+# BEFORE backend dispatch. The --diarize/--tinydiarize conflict and the
+# --language check used to sit after every crispasr_run_backend() early
+# return, so any dispatched run (-m auto, any --backend, a non-whisper GGUF)
+# skipped them and accepted the bad argument with exit 0. Also guards the
+# opposite hazard: whisper's 100-entry language table must NOT be applied to
+# backends it does not govern. No models, no network.
+add_test(NAME test-arg-validation
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-arg-validation.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-arg-validation PROPERTIES
+    LABELS "unit;cli"
+    TIMEOUT 60)
+
+# ─── test-help-stdout — offline regression (#420): an explicitly requested
+# --help is program OUTPUT, so it must go to stdout with exit 0 and be
+# pipeable (`crispasr --help | less`). Usage printed for a usage ERROR must go
+# to stderr with a non-zero status instead. Parses args only — no models, no
+# network; SKIPs if the binary is absent.
+add_test(NAME test-help-stdout
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-help-stdout.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-help-stdout PROPERTIES
+    LABELS "unit;cli"
+    TIMEOUT 60)
+
+# ─── test-asr-env-parity — offline regression for the generic environment
+# parity harness. A fake CLI verifies mismatch/error classification, environment
+# scrubbing, aggregate variants, collision-free artifacts, and output-dir safety.
+add_test(NAME test-asr-env-parity
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-asr-env-parity.sh
+            ${PROJECT_SOURCE_DIR}/tools/asr-env-parity.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-asr-env-parity PROPERTIES
+    LABELS "unit;cli;parity"
+    TIMEOUT 60)
+
+# ─── test-input-exit-code — an undecodable input must reach the EXIT CODE.
+# cli.cpp's LEGACY whisper path (no --backend, a .bin model) printed to stderr
+# and `continue`d, so a run where every file failed still exited 0, against
+# docs/cli.md's published "rc 0 <=> every required stage succeeded". The unified
+# dispatcher already returned 20; only this path was affected. Labelled
+# unit;gh — NOT live — and pointed at the committed models/for-tests-ggml-tiny.bin
+# so it genuinely executes in CI (`ctest -L "gh|unit" -E live`) rather than
+# skipping, which is how the cli-labelled tests stayed dead (70112d10).
+add_test(NAME test-input-exit-code
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-input-exit-code.sh $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-input-exit-code PROPERTIES
+    LABELS "unit;gh;cli"
+    TIMEOUT 300)
+
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
 # the same model a real `-m <alias>` would load (sub-variant keys, §166).
 # Needs only the built binary (no models / network); SKIPs if absent.
 add_test(NAME test-dry-run-resolve
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+            $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-dry-run-resolve PROPERTIES
-    LABELS "cli"
+    LABELS "unit;cli"
     TIMEOUT 60)
+
+# ─── test-bundle-linux-runtime — the Linux packaging bundler. Registered as a
+# unit test on purpose: these scripts previously ran only inside a release job,
+# so a defect in them could not be observed without publishing a release, and
+# two shipped that way. Needs no models and no GPU — cc + patchelf + ldd, which
+# is why it can run on every push. SKIPs (77) off Linux.
+add_test(NAME test-bundle-linux-runtime
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-bundle-linux-runtime.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-bundle-linux-runtime PROPERTIES
+    LABELS "unit"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120)
+
+# ─── test-package-lib-bundle — the libcrispasr bundle packager (#341). Its own
+# verifier gates INTRA-bundle resolvability only, and its dlopen tolerance
+# exits 0 on the first externally-provided soname, so a dependency missing from
+# the bundle entirely was never a question anyone posed. This asks it.
+add_test(NAME test-package-lib-bundle
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-package-lib-bundle.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-package-lib-bundle PROPERTIES
+    LABELS "unit"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120)
 
 # ─── test-server-ws-stream — live: --ws-port real-time WebSocket ASR streaming.
 # Raw-socket client (stdlib only) verifies the RFC 6455 handshake + a streaming
@@ -4293,6 +5247,17 @@ add_test(NAME test-server-tts
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-server-tts PROPERTIES
     LABELS "live;server;tts"
+    TIMEOUT 600)
+
+# ─── test-server-progress — live: GET /progress contract (#408): idle -1,
+# busy with 0..100 during a running job, reset after, and auth-gated like the
+# other introspection routes. Auto-discovers a small whisper/moonshine model;
+# SKIPs (exit 0) otherwise.
+add_test(NAME test-server-progress
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-progress.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-progress PROPERTIES
+    LABELS "live;server"
     TIMEOUT 600)
 
 # ─── test-server-stream-resilience — live: the detached streaming-TTS worker
@@ -4373,6 +5338,35 @@ set_tests_properties(test-omnivoice-seed PROPERTIES
     LABELS "live;tts;omnivoice;determinism"
     TIMEOUT 600)
 
+# ─── test-htdemucs-separate-live — #413/#414 htdemucs live test: BLAS
+# default on CPU hosts, forced fused-graph arm, per-stem parity between
+# them. SKIPs cleanly without the model.
+add_test(NAME test-htdemucs-separate-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-htdemucs-separate-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-htdemucs-separate-live PROPERTIES
+    LABELS "live;htdemucs"
+    TIMEOUT 900)
+
+# ─── test-quds-fa-live — #387 Quds v4 Persian ASR: exact-transcript check
+# on the bundled CC0 Common Voice clip. SKIPs without the model.
+add_test(NAME test-quds-fa-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-quds-fa-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-quds-fa-live PROPERTIES
+    LABELS "live;quds"
+    TIMEOUT 300)
+
+# ─── test-f5-session-voice-rate-live — the session ABI must load an f5-tts
+# reference at the model's rate (Raon is 16 kHz): session and CLI output
+# lengths must agree. SKIPs without a Raon model (CRISPASR_RAON_MODEL).
+add_test(NAME test-f5-session-voice-rate-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-f5-session-voice-rate-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-f5-session-voice-rate-live PROPERTIES
+    LABELS "live;f5-tts"
+    TIMEOUT 900)
+
 # ─── test-separate-live — §248 source separation smoke test. SKIPs cleanly
 # without a mel-band-roformer model (CRISPASR_MBR_MODEL / CRISPASR_MODELS_DIR).
 add_test(NAME test-separate-live
@@ -4390,6 +5384,20 @@ add_test(NAME test-release-workflow
 set_tests_properties(test-release-workflow PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 30)
+
+# Configure-level guard for the #261/#302 portable CPU contract. The cache is
+# the only authoritative proof that every optional ggml x86 ISA stayed OFF;
+# source-text checks cannot catch a newly-defaulted ggml option. Bash is not a
+# baseline dependency on Windows, where test-release-workflow still guards all
+# release-job call sites.
+if(UNIX)
+    add_test(NAME test-portable-cpu-config
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-portable-cpu-config.sh
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-portable-cpu-config PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 60)
+endif()
 
 # ─── test_diarized_json — Catch2 unit tests for the diarized_json formatter
 # (issue #206) and max_len display segment splitting (issue #205).
@@ -4484,6 +5492,103 @@ catch_discover_tests(test-btc-vocab
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-beam-hf — core_beam_decode HF semantics vs real transformers generate() (hermetic, unit)
+add_executable(test-beam-hf test-beam-hf.cpp)
+target_include_directories(test-beam-hf PRIVATE ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test-beam-hf PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-beam-hf
+    TEST_SPEC "[beam]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-hojo-asr-frames — #438 Hojo-ASR frame schedule (hermetic, unit)
+add_executable(test-hojo-asr-frames test-hojo-asr-frames.cpp)
+target_include_directories(test-hojo-asr-frames PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-hojo-asr-frames PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-hojo-asr-frames
+    TEST_SPEC "[hojo]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-htdemucs-binbcast — issue #398 CUDA binbcast F16-src1 guard (hermetic, unit)
+add_executable(test-htdemucs-binbcast test-htdemucs-binbcast.cpp)
+target_include_directories(test-htdemucs-binbcast PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-htdemucs-binbcast PRIVATE Catch2::Catch2WithMain ggml)
+catch_discover_tests(test-htdemucs-binbcast
+    TEST_SPEC "[htdemucs]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-chatterbox-attn-policy — issue #402 T3 attention decision table (hermetic, unit)
+add_executable(test-chatterbox-attn-policy test-chatterbox-attn-policy.cpp)
+target_include_directories(test-chatterbox-attn-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-attn-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-chatterbox-attn-policy
+    TEST_SPEC "[attn-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-gguf-null-backend — issue #405 null-backend load guard (hermetic, unit)
+add_executable(test-gguf-null-backend test-gguf-null-backend.cpp)
+target_include_directories(test-gguf-null-backend PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-null-backend PRIVATE Catch2::Catch2WithMain crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+catch_discover_tests(test-gguf-null-backend
+    TEST_SPEC "[null-backend]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-vibevoice-enc-policy — issue #418 encoder-backend decision table (hermetic, unit)
+add_executable(test-vibevoice-enc-policy test-vibevoice-enc-policy.cpp)
+target_include_directories(test-vibevoice-enc-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-vibevoice-enc-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-vibevoice-enc-policy
+    TEST_SPEC "[enc-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-silero-lid-quant-refusal — #409 tail: quantized silero weights refused (hermetic, unit)
+add_executable(test-silero-lid-quant-refusal test-silero-lid-quant-refusal.cpp)
+target_include_directories(test-silero-lid-quant-refusal PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-silero-lid-quant-refusal PRIVATE Catch2::Catch2WithMain silero-lid)
+catch_discover_tests(test-silero-lid-quant-refusal
+    TEST_SPEC "[silero-quant]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-script-mismatch — issue #419 wrong-script warning decision table (hermetic, unit)
+add_executable(test-script-mismatch test-script-mismatch.cpp)
+target_include_directories(test-script-mismatch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-script-mismatch PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-script-mismatch
+    TEST_SPEC "[script-mismatch]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
 add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
 target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -4552,6 +5657,15 @@ catch_discover_tests(test-omnivoice-instruct
         LABELS unit
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
+
+# ─── test-vibevoice-asr-prompt — decode the hardcoded ASR prompt ids back into
+# text (#369). The old table's comment said "seconds audio, please transcribe it
+# with" while the ids said " configuration audio,thonPEND itiz"; nothing turned
+# them back into words, so it shipped. Hermetic: carries its own vocab slice.
+add_executable(test-vibevoice-asr-prompt test-vibevoice-asr-prompt.cpp)
+target_include_directories(test-vibevoice-asr-prompt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-vibevoice-asr-prompt PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-vibevoice-asr-prompt)
 
 # ─── test-omnivoice-prompt — the assembled style prefix, i.e. the last thing the
 # model sees before tokenization. The resolvers had unit tests; the string they
@@ -4645,6 +5759,100 @@ catch_discover_tests(test-piano-transcription
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - onsets-and-frames — live integration tests
+add_executable(test-onsets-and-frames
+    test_onsets_and_frames_live.cpp
+)
+target_include_directories(test-onsets-and-frames PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-onsets-and-frames PRIVATE
+    Catch2::Catch2WithMain
+    onsets-and-frames
+)
+catch_discover_tests(test-onsets-and-frames
+    TEST_SPEC "[onsets-and-frames]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── oaf-parity-dump — the C++ half of tools/oaf_parity.py.
+# Not registered with CTest: it needs a model, a WAV and onnxruntime on the
+# other side of it. Built so the parity script cannot drift from the runtime.
+add_executable(oaf-parity-dump oaf_parity_dump.cpp)
+target_include_directories(oaf-parity-dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(oaf-parity-dump PRIVATE onsets-and-frames)
+
+# ─── test - hft-transformer — live integration tests
+add_executable(test-hft-transformer
+    test_hft_transformer_live.cpp
+)
+target_include_directories(test-hft-transformer PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-hft-transformer PRIVATE
+    Catch2::Catch2WithMain
+    hft-transformer
+)
+catch_discover_tests(test-hft-transformer
+    TEST_SPEC "[hft-transformer]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── hft-parity-dump — the C++ half of tools/hft_parity.py.
+# Not registered with CTest, for the same reason oaf-parity-dump is not: it
+# needs a model, a WAV and onnxruntime on the other side of it.
+add_executable(hft-parity-dump hft_parity_dump.cpp)
+target_include_directories(hft-parity-dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(hft-parity-dump PRIVATE hft-transformer)
+
+# ─── test - mt3 — live integration tests (#250, multi-instrument)
+# Stage parity is the crispasr-diff mt3 harness's job; this covers the C ABI
+# contract, the decode-budget knob and the drum/instrument invariants.
+add_executable(test-mt3 test_mt3_live.cpp)
+target_include_directories(test-mt3 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-mt3 PRIVATE
+    Catch2::Catch2WithMain
+    mt3
+)
+catch_discover_tests(test-mt3
+    TEST_SPEC "[mt3]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - basic-pitch — live integration tests (#250)
+add_executable(test-basic-pitch
+    test_basic_pitch_live.cpp
+)
+target_include_directories(test-basic-pitch PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-basic-pitch PRIVATE
+    Catch2::Catch2WithMain
+    basic-pitch
+)
+catch_discover_tests(test-basic-pitch
+    TEST_SPEC "[basic-pitch]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── C2PA native-JS signer — unit + live parity tests (node --test) ──────────
 # The signer (bindings/javascript/c2pa.mjs) re-implements C2PA signing in pure
 # WebCrypto so the wasm build needs no c2pa-rs. Unit tests are hermetic (CBOR
@@ -4674,3 +5882,91 @@ foreach(_stub fastconformer-ctc wav2vec2 bananamind-tts)
     target_link_libraries(${_tgt} PRIVATE Catch2::Catch2WithMain)
     catch_discover_tests(${_tgt} TEST_SPEC "[unit]" PROPERTIES LABELS "unit")
 endforeach()
+
+# ─── test-subprocess — core/subprocess.h must hand argv to the child verbatim,
+# never through a shell (server uploads and TTS request fields reach it).
+add_executable(test-subprocess
+    test-subprocess.cpp
+)
+target_include_directories(test-subprocess PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-subprocess PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-subprocess
+    TEST_SPEC "[subprocess]"
+    PROPERTIES LABELS "unit;subprocess"
+)
+
+# ─── test-crispasr-diff-compare — Ref::compare must fail a candidate buffer
+# the runtime never wrote (all-zero rows), not score it cos=1 PASS (#445).
+# crispasr-diff-lib is defined later (examples/cli); link names resolve at
+# generate time, so guard on the option that creates it rather than TARGET.
+if (CRISPASR_BUILD_EXAMPLES)
+    add_executable(test-crispasr-diff-compare
+        test-crispasr-diff-compare.cpp
+    )
+    target_link_libraries(test-crispasr-diff-compare PRIVATE
+        Catch2::Catch2WithMain
+        crispasr-diff-lib
+    )
+    catch_discover_tests(test-crispasr-diff-compare
+        TEST_SPEC "[diff]"
+        PROPERTIES LABELS "unit;diff"
+    )
+endif()
+
+# ─── test-qwen3-stream — core/qwen3_stream.h (Qwen3-ASR / Confucius4-R2T2
+# prefix-rollback streaming, #445) against outputs of the upstream Python
+# helpers (tests/fixtures/qwen3_stream_cases.json).
+add_executable(test-qwen3-stream
+    test-qwen3-stream.cpp
+)
+target_include_directories(test-qwen3-stream PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_compile_definitions(test-qwen3-stream PRIVATE
+    CRISPASR_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+)
+target_link_libraries(test-qwen3-stream PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-qwen3-stream
+    TEST_SPEC "[qwen3-stream]"
+    PROPERTIES LABELS "unit;qwen3-stream"
+)
+
+# ─── test-kaldi-fbank — core_kaldi::compute_fbank vs kaldi-native-fbank ────
+# snip_edges=false + mel-domain triangles (X-ASR / sherpa-onnx, #436) pinned to
+# golden knf frames; frame-count rules; the per-thread filter cache key.
+add_executable(test-kaldi-fbank
+    test-kaldi-fbank.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/kaldi_fbank.cpp
+)
+target_include_directories(test-kaldi-fbank PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-kaldi-fbank PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-kaldi-fbank
+    TEST_SPEC "[kaldi_fbank]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-torchaudio-resample — header-only torchaudio sinc resampler (#455) ───
+add_executable(test-torchaudio-resample
+    test-torchaudio-resample.cpp
+)
+target_include_directories(test-torchaudio-resample PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-torchaudio-resample PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-torchaudio-resample
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;resample"
+)

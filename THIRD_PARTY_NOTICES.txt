@@ -336,9 +336,56 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-NOTE: OpenBLAS is dynamically linked (not bundled in the release tarball)
-on Linux builds compiled with -DGGML_OPENBLAS=ON. Users must have
-libopenblas installed on their system.
+NOTE: OpenBLAS IS bundled in the Linux release archives, alongside its own
+dependency closure. It used to be dynamically linked and left to the user,
+which is what CrispASR #296 fixed — the loader failed before main() on any
+machine without it. This paragraph said otherwise until 2026-08-10.
+
+
+────────────────────────────────────────────────────────────────────────────────
+GNU OpenMP runtime — libgomp (https://gcc.gnu.org/)
+GPL-3.0-or-later WITH GCC-exception-3.1 (GCC Runtime Library Exception)
+────────────────────────────────────────────────────────────────────────────────
+
+The Linux release archives bundle `libgomp.so.1`, the OpenMP runtime that ships
+with GCC, because GGML is compiled with OpenMP enabled and the library is absent
+from minimal installs.
+
+CrispASR's own source remains under the MIT licence in LICENSE. The GCC Runtime
+Library Exception grants permission to propagate the compiled result of
+combining this runtime with independent modules under any licence, provided all
+target code was produced by Eligible Compilation Processes — which GCC is. The
+exception is what makes an MIT-licensed binary linking libgomp unproblematic;
+it does not change the licence of libgomp itself.
+
+Redistributing the `libgomp.so.1` FILE is separately a conveyance of a
+GPL-3.0-or-later work, and carries the corresponding-source obligation of
+GPLv3 section 6. The bundled copy is the unmodified library from the GCC
+package of the distribution the release was built on (Ubuntu 22.04, `gcc-12`).
+Complete corresponding source for that exact build is available from Ubuntu's
+source archive (`apt-get source gcc-12`) and from https://gcc.gnu.org/, and the
+CrispASR maintainers will provide it on request for three years from the date
+of the release that carried it — open an issue at
+https://github.com/CrispStrobe/CrispASR.
+
+Licence texts: https://www.gnu.org/licenses/gpl-3.0.html and
+https://www.gnu.org/licenses/gcc-exception-3.1.html
+
+
+────────────────────────────────────────────────────────────────────────────────
+LLVM OpenMP runtime — libomp (https://openmp.llvm.org/)
+Apache License 2.0 WITH LLVM-exception
+────────────────────────────────────────────────────────────────────────────────
+
+The Linux HIP/ROCm release archives bundle `libomp.so`, the LLVM OpenMP runtime.
+ROCm's compiler is clang, so `-fopenmp` resolves to LLVM's runtime rather than
+GCC's, and it lives under `/opt/rocm/lib/llvm/lib` — a directory the dynamic
+loader does not search, so it must travel with the binaries (CrispASR #339).
+
+Unmodified. Apache-2.0 with the LLVM exception is a permissive licence; it
+imposes no copyleft on CrispASR's MIT-licensed source and no source-availability
+obligation on this redistribution. Licence text and the exception:
+https://llvm.org/LICENSE.txt
 
 
 ────────────────────────────────────────────────────────────────────────────────
@@ -427,3 +474,70 @@ runtime and the clustering stack are independent implementations written from
 the published architecture and algorithms; the upstream packages are used only
 as measurement oracles by the reference dumper, never vendored or linked.
 
+────────────────────────────────────────────────────────────────────────────────
+NVIDIA Nemotron-3-Diarization (streaming Sortformer v3) — MODEL WEIGHTS
+(https://huggingface.co/nvidia/Nemotron-3-Diarization)
+OpenMDW License Agreement v1.1
+────────────────────────────────────────────────────────────────────────────────
+
+`--diarize-method sortformer` (issue #466) downloads NVIDIA's own
+Nemotron-3-Diarization.q8_0.gguf from the model repo above;
+models/convert-nemotron3-diar-to-gguf.py converts the same repo's safetensors
+into that GGUF layout. OpenMDW-1.1 permits use, modification and
+redistribution, including commercially; redistributions must carry the
+licence and its notices.
+
+  Source model : nvidia/Nemotron-3-Diarization
+  Licence      : OpenMDW-1.1 — https://openmdw.ai/license/1-1/
+
+The ggml runtime in src/nemotron3_diar.cpp is an independent implementation.
+Its offline chunk loop and Arrival-Order Speaker Cache follow the algorithm of
+transformers' modeling_nemotron3_diarization.py (Apache-2.0, HuggingFace), which
+is also the measurement oracle for tools/reference_backends/nemotron3_diar.py.
+The GGUF tensor/metadata layout is the one NVIDIA's NeMo-Speech.cpp (Apache-2.0)
+reads, so both runtimes load the same files; no NeMo-Speech.cpp code is vendored.
+
+────────────────────────────────────────────────────────────────────────────────
+Managed model-weight policy — additional Hugging Face sources
+────────────────────────────────────────────────────────────────────────────────
+
+The following supported downloads are conversions of the upstream model cards;
+their upstream terms apply to the weights and any redistribution of them:
+
+  NVIDIA Parakeet, Canary, FastConformer and FastPitch
+    CC-BY-4.0. Sources include:
+    https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+    Attribution is required; commercial use is permitted by that license.
+
+  OuteAI/OuteTTS-0.3-1B
+    CC-BY-NC-SA-4.0 (non-commercial, ShareAlike):
+    https://huggingface.co/OuteAI/OuteTTS-0.3-1B
+
+  Kyutai Pocket TTS
+    CC-BY-4.0 with Hugging Face gated access and upstream acceptable-use
+    conditions, including restrictions on voice impersonation/cloning and
+    deceptive or harmful use:
+    https://huggingface.co/kyutai/pocket-tts
+
+  Facebook fastText language identification (LID-176)
+    CC-BY-NC-4.0 (non-commercial):
+    https://huggingface.co/facebook/fasttext-language-identification
+
+  LiquidAI LFM2.5-Audio
+    LFM Open License v1.0, with additional component notices described by the
+    upstream card:
+    https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B
+
+  Llama-based TTS weights (TADA, Orpheus and related variants)
+    These conversions contain or derive from Llama 3.2 materials. The Llama
+    3.2 Community License, attribution and acceptable-use terms apply; the
+    downstream GGUF card's Apache label does not remove those upstream terms.
+    Sources include:
+    https://huggingface.co/HumeAI/tada-3b-ml
+    https://huggingface.co/canopylabs/orpheus-3b-0.1-ft
+
+  FunASR / SenseVoice / Paraformer and Google Gemma derivatives
+    These remain subject to their upstream custom terms. CrispASR marks them
+    as restricted and requires an explicit acceptance tag before managed
+    auto-download; see the original model cards and licenses linked by the
+    respective entries in the model registry.

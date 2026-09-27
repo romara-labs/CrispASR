@@ -47,6 +47,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -282,8 +283,20 @@ bool load_model(crisp_audio_context& ctx, const char* path, const crisp_audio_pa
     }
 
     // ---- pass 2: weights via shared loader ----
+    // Only this tower's tensors (<tensor_prefix>*). crisp_audio lives inside a
+    // larger GGUF - qwen3-asr / Raon-Speech carry the whole LLM next to the
+    // audio tower, and the host runtime loads that itself. load_weights() here
+    // uploaded the entire file a second time: on a GPU backend a duplicate of
+    // the LLM in VRAM (~5 GB for Raon-Speech-9B Q4_K).
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, ctx.backend, "crisp_audio", wl)) {
+    struct Prefix {
+        std::string p;
+    } pre{tprefix};
+    auto in_tower = [](const char* name, void* user) {
+        const std::string& p = static_cast<Prefix*>(user)->p;
+        return std::strncmp(name, p.c_str(), p.size()) == 0;
+    };
+    if (!core_gguf::load_weights_filtered(path, ctx.backend, in_tower, &pre, "crisp_audio", wl)) {
         return false;
     }
     ctx.model_ctx = wl.ctx;
@@ -633,13 +646,13 @@ struct crisp_audio_context* crisp_audio_init_from_file(const char* gguf_path, co
             ctx->backend = ggml_backend_dev_init(gdev, nullptr);
     }
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
-    ctx->backend_cpu = ggml_backend_is_cpu(ctx->backend) ? nullptr : ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::is_cpu(ctx->backend) ? nullptr : core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     } else {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     if (!load_model(*ctx, gguf_path, eff)) {
@@ -684,8 +697,12 @@ void crisp_audio_free(struct crisp_audio_context* ctx) {
 #endif
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
-    if (ctx->model_buf)
-        ggml_backend_buffer_free(ctx->model_buf);
+    // model_buf came from core_gguf::load_weights, so on a device advertising
+    // buffer_from_host_ptr it is a view onto a host mmap the backend does not
+    // own. ggml_backend_buffer_free() alone would leave the weight file mapped
+    // for the life of the process. The release entry point takes the loader's
+    // side-map entry and unmaps; it no-ops on a null handle and nulls ours.
+    core_gguf::release_weight_buffer(ctx->model_buf);
     if (ctx->model_ctx)
         ggml_free(ctx->model_ctx);
     if (ctx->backend_cpu)
@@ -749,6 +766,7 @@ float* crisp_audio_compute_mel(struct crisp_audio_context* ctx, const float* sam
     p.matmul = core_mel::MatmulPrecision::Double;
     p.log_eps = 1e-10f;
     p.center_pad = true;
+    p.center_pad_reflect = true; // torch.stft / WhisperFeatureExtractor: pad_mode="reflect"
     p.drop_last_frame = true;
 
     int T_ret = 0;

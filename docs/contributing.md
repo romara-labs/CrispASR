@@ -255,7 +255,7 @@ The `--list-backends` capability row is read live from the backend's
 
 ### C ABI — `src/crispasr_c_api.cpp` (this is what the bindings/server call)
 Python/Go/Dart/server use the **session C ABI**, not the CLI factory.
-Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
+Ten edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
 1. **include + flag:** `#if __has_include("yourmodel.h")` → `#include` →
    `#define CA_HAVE_YOURMODEL 1` → `#endif`.
 2. **session struct field:** `#ifdef CA_HAVE_YOURMODEL  yourmodel_context* yourmodel_ctx = nullptr;  #endif`.
@@ -277,15 +277,20 @@ Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
    prompt)` setter to the runtime, and forward `s->ask` in the transcribe
    dispatch. This lets `set_ask()` override the default transcription
    instruction. Currently wired for: granite, voxtral, qwen3-asr,
-   glm-asr, gemma4-e2b, mimo-asr, higgs-stt.
+   glm-asr, gemma4-e2b, mimo-asr, higgs-stt, ark-asr, moss-audio,
+   moss-diarize, mini-omni2, lfm2-audio.
 9b. **`params.language` wiring** — if the backend is an audio-LLM, also
    inject a language hint into the prompt when `params.language` is set
    and non-auto. Pattern: `else if (!params.language.empty() && params.language
    != "auto") { sys_instruction = "Transcribe the speech in " + lang_name(params.language) + "."; }`.
-   For **English-only** models (moonshine-streaming, kyutai-stt), emit a
-   `fprintf(stderr, ...)` warning instead of silently ignoring the flag.
+   For a model that cannot honour the request, emit a `fprintf(stderr, ...)`
+   warning instead of silently ignoring the flag — moonshine-streaming warns
+   "English-only model; language=… ignored", and kyutai-stt asks the context
+   (`kyutai_stt_supports_language`) and names what the loaded GGUF actually
+   supports (#366: the blanket "English-only" warning was wrong for the default
+   `stt-1b-en_fr`). Both warnings live in the CLI adapters.
    Currently wired for: granite (v3 + v4 templates), qwen3-asr, glm-asr,
-   moss-audio, mimo-asr, higgs-stt; warned for moonshine-streaming, kyutai-stt.
+   moss-audio, mimo-asr, higgs-stt, ark-asr.
 10. **`crispasr_session_set_speaker_id()`** — if the backend is a
     multi-speaker TTS model with integer-indexed speakers (e.g. melotts,
     piper, fastpitch). Add a dispatch block that bounds-checks against
@@ -308,7 +313,21 @@ endif()
 - `python/crispasr/_binding.py` — add the name to the TTS-backend lists in
   the `synthesize` comment + docstring.
 - `bindings/go/crispasr_session.go` — add to the header/type comments.
-  Go links `-lcrispasr` (not per-backend), so **no LDFLAGS change**.
+- ⚠ `bindings/go/whisper.go` — **REGENERATE THE cgo LDFLAGS**. This step used
+  to be documented here as unnecessary ("Go links `-lcrispasr`, not
+  per-backend"), which is wrong and cost two red-CI incidents (basic-pitch,
+  then mt3): the `#cgo linux/darwin LDFLAGS` lines enumerate EVERY static
+  library by name, so a new `add_library(<backend> STATIC …)` in
+  `src/CMakeLists.txt` must be added there or the Go bindings fail to link
+  with `undefined reference to <backend>_*`. Do not hand-edit the list — run
+
+  ```bash
+  python tools/sync_go_cgo_ldflags.py           # regenerates from a cmake graph
+  python tools/sync_go_cgo_ldflags.py --check   # what CI asserts
+  ```
+
+  `tools/check-backend-wiring.py` runs the `--check` form; a failure prints
+  `RESULT: FAIL (Go cgo LDFLAGS drift)` and names this script.
 - `flutter/crispasr/lib/src/crispasr.dart` — add to the synthesize
   docstring. Dart uses `DynamicLibrary.lookupFunction` with symbol-presence
   checks, so new C-ABI functions are discovered automatically.
@@ -382,9 +401,30 @@ Rules when you touch one of these structs:
    calls to the wrong method. The index-parity tests pin this.
 
 **C# is CI-tested** (`.github/workflows/bindings-csharp.yml`) — it compiles the
-binding against the ABI and runs `CrispASR.Tests`. Do not let it drift; it was
-unbuilt for a long time and shipped a units bug (#291) precisely because nothing
-compiled the wrapper against the header.
+binding against the ABI and runs `CrispASR.Tests` on **ubuntu and windows**, each
+against a real moonshine GGUF and `samples/jfk.wav`, with
+`CRISPASR_CS_REQUIRE_LIVE=1` so a skipped live test is a failure. Do not let it
+drift; it was unbuilt for a long time and shipped a units bug (#291) precisely
+because nothing compiled the wrapper against the header.
+
+Three C#-specific rules the second round of #291 established:
+- **The managed assembly is `CrispASR.Net.dll`, never `CrispASR.dll`** — the
+  native library is `crispasr.dll` and Windows file names are case-insensitive,
+  so the two would be one file. `NativeLibraryResolverTests` pins this on every
+  platform, including the Linux ones where the collision cannot occur.
+- **Every time value the binding exposes is SECONDS** (`Segment`, `Word`,
+  `AlignedWord`, `VadSpan`, `StreamingUpdate`, the music types). Convert at the
+  boundary via `Session.Seconds()`, which also preserves the C ABI's `-1`
+  "no timing" sentinel instead of scaling it to `-0.01`.
+- **A live test may not skip silently in CI.** Route every guard through
+  `Live` (`bindings/csharp/CrispASR.Tests/Live.cs`); a bare
+  `if (!CanLoadLibrary()) return;` makes the suite green on a machine with no
+  native library at all, which is how "all xunit tests pass" came to mean
+  nothing.
+
+`bindings/csharp/README.md` is the consumer-facing guide: which release archive
+to download, where to put the native library, and the `CRISPASR_LIBRARY_PATH`
+escape hatch.
 
 ### Docs
 - `README.md` — model-table row (TTS or ASR section).
@@ -393,11 +433,14 @@ compiled the wrapper against the header.
   architecture details"; README/tts.md link `docs/architecture.md#yourmodel`.
 
 ### Build targets (don't be fooled by stale binaries)
-- `crispasr` → the **library** (libcrispasr / `.dylib`).
+- `crispasr-lib` → the **library** (`OUTPUT_NAME crispasr` → libcrispasr / `.dylib`).
 - `crispasr-cli` → the **CLI binary** (`OUTPUT_NAME crispasr`).
 - `crispasr-diff` → the diff harness.
 
-After C-ABI edits, build **`crispasr`** (the dylib) and re-test the Python
+(There is no bare `crispasr` target — `add_library(whisper ALIAS crispasr-lib)`
+is the only alias.)
+
+After C-ABI edits, build **`crispasr-lib`** (the dylib) and re-test the Python
 `Session` — building only `crispasr-cli` may leave the dylib stale, and the
 binding then loads an old backend list. Verify with:
 ```python
@@ -416,6 +459,31 @@ dumpers are handled, not false-flagged:
 ```bash
 python tools/check-backend-wiring.py --crispasr ./build/bin/crispasr   # exit 1 on a required gap
 ```
+
+**The shipped-library check, and how to read it.** One of the audit's checks is
+not source text: it reads the symbol table of a *built* `libcrispasr` and asserts
+each backend's `<x>_init_from_file` survived the link, because the linker drops a
+static-archive member that nothing references and CMake linkage therefore proves
+nothing. It only runs when a shared library exists, so:
+
+```bash
+cmake -S . -B build -DBUILD_SHARED_LIBS=ON && cmake --build build --target crispasr-lib crispasr-cli
+python tools/check-backend-wiring.py --crispasr ./build/bin/crispasr --require-lib
+```
+
+- Without `-DBUILD_SHARED_LIBS=ON` there is no `.so`, the check prints
+  `skipped`, and the run passes **having proved nothing**. `--require-lib` turns
+  that skip into a failure; use it wherever the result is treated as a gate.
+- The library is now located next to the `--crispasr` binary you pass (with
+  `--lib PATH` to override), *not* at a fixed `build/src/` path. Auditing a
+  library from a **different build** than the binary is the classic false
+  positive here: a stale `build/src/libcrispasr.so` checked against a fresh
+  roster reports every backend added since as "ABSENT from the shipped library"
+  — a long list of names that are all correctly wired. Before adding session
+  arms for such a list, confirm the two artifacts came from one build.
+- In CI the check has teeth in `bindings-rust.yml`, the job that builds a shared
+  `libcrispasr` on Linux; `ci.yml`'s wiring-audit step builds a static library
+  and skips it.
 
 > ⚠️ **Commit from a separate `git worktree`, or `git pull --rebase`
 > immediately before committing.** A `git add -A` / `commit -a` from a
@@ -575,8 +643,9 @@ This is not hypothetical: #308's capitalisation fix landed in
 `src/fireredpunc.cpp` while `crisp_punc/src/fireredpunc.cpp` — the copy that
 actually links — kept the bug for months. Every symptom pointed at the file that
 was already correct, and instrumenting that file produced no output at all,
-which is the tell. `tests/test-punc-copies-in-sync.cpp` now fails when the two
-diverge; keep it green rather than deleting the assertion.
+which is the tell. `tests/test-copies-in-sync.cpp` now fails when the two
+diverge (it was extended from the punc pair to all 14 duplicated files); keep it
+green rather than deleting the assertion.
 
 ### Mel spectrogram
 

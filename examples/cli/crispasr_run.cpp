@@ -10,6 +10,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_gap_fill.h"
+#include "crispasr_split_pipeline.h"
 #include "tada_encoder.h"
 
 #include <sys/stat.h>
@@ -85,6 +86,8 @@
 #include <fcntl.h>
 #include <io.h>
 #endif
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -461,9 +464,15 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
             out.push_back(std::move(s));
     }
 
+    // Issue #356: the structural chokepoint every slice result passes through
+    // is also the last place a producer's ordering mistake can be caught before
+    // it reaches the writers. Diagnostic only — this reports, it never reorders,
+    // because a reorder here would paper over the producing bug.
     const auto hy = core_seg_hygiene::config_from_env();
-    if (!core_seg_hygiene::any_enabled(hy))
+    if (!core_seg_hygiene::any_enabled(hy)) {
+        crispasr_warn_if_segments_backward(out, "slice merge");
         return out;
+    }
 
     std::vector<core_seg_hygiene::Seg> view;
     view.reserve(out.size());
@@ -491,8 +500,10 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
             break;
         pick.push_back(oi++);
     }
-    if (pick.size() != kept.size()) // unmatched view: never silently lose content
+    if (pick.size() != kept.size()) { // unmatched view: never silently lose content
+        crispasr_warn_if_segments_backward(out, "slice merge");
         return out;
+    }
 
     std::vector<crispasr_segment> res;
     res.reserve(pick.size());
@@ -504,11 +515,81 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
     }
     if (dropped > 0 || res.size() != out.size())
         fprintf(stderr, "crispasr[hygiene]: %zu -> %zu segments (%d dropped)\n", out.size(), res.size(), dropped);
+    crispasr_warn_if_segments_backward(res, "slice merge + hygiene");
     return res;
 }
 
 bool crispasr_words_have_positive_span(const std::vector<crispasr_word>& words) {
     return !words.empty() && words.back().t1 > words.front().t0;
+}
+
+// The Python forced-aligner blueprint runs once for an audio chunk and that
+// chunk's complete transcript.  Doing one model call per ASR segment loses the
+// global monotonic sequence and was the root of #444.  Align the slice once,
+// then partition the returned units back onto the original display segments.
+static bool crispasr_align_slice_segments(const std::string& aligner_model, const std::vector<float>& samples,
+                                          int range_start, int range_end, int64_t offset_cs, int n_threads,
+                                          bool force_aligner, std::vector<crispasr_segment>& segs,
+                                          bool* out_load_failed = nullptr) {
+    std::vector<size_t> targets;
+    std::vector<size_t> counts;
+    std::string transcript;
+    size_t expected_words = 0;
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (!segs[i].words.empty() && !force_aligner)
+            continue;
+        const size_t n = crispasr_tokenise_align_words(segs[i].text).size();
+        if (n == 0)
+            continue;
+        if (!transcript.empty())
+            transcript += ' ';
+        transcript += segs[i].text;
+        targets.push_back(i);
+        counts.push_back(n);
+        expected_words += n;
+    }
+    if (targets.empty() || range_end <= range_start)
+        return false;
+
+    auto aligned = crispasr_align_words(aligner_model, transcript, samples.data() + range_start,
+                                        range_end - range_start, offset_cs, n_threads, out_load_failed);
+    if (aligned.size() != expected_words) {
+        fprintf(stderr, "crispasr[aligner]: slice returned %zu units for %zu inputs; keeping ASR timestamps\n",
+                aligned.size(), expected_words);
+        return false;
+    }
+
+    // A model class outside the supplied clip is not a usable alignment.
+    // Reject the complete result rather than installing a partly clamped,
+    // apparently precise subtitle track.
+    const int64_t end_cs = offset_cs + (int64_t)(range_end - range_start) * 100 / 16000;
+    int64_t previous_end = offset_cs;
+    for (const auto& w : aligned) {
+        if (w.t0_cs < previous_end || w.t1_cs < w.t0_cs || w.t0_cs < offset_cs || w.t1_cs > end_cs + 8) {
+            fprintf(stderr,
+                    "crispasr[aligner]: non-monotonic/out-of-range slice result at %lld..%lld cs "
+                    "(clip %lld..%lld); keeping ASR timestamps\n",
+                    (long long)w.t0_cs, (long long)w.t1_cs, (long long)offset_cs, (long long)end_cs);
+            return false;
+        }
+        previous_end = w.t1_cs;
+    }
+    if (aligned.back().t1_cs <= aligned.front().t0_cs)
+        return false;
+
+    size_t cursor = 0;
+    for (size_t j = 0; j < targets.size(); j++) {
+        auto& seg = segs[targets[j]];
+        seg.words.clear();
+        seg.words.reserve(counts[j]);
+        for (size_t k = 0; k < counts[j]; k++) {
+            auto& src = aligned[cursor++];
+            seg.words.push_back({std::move(src.text), src.t0_cs, src.t1_cs});
+        }
+        seg.t0 = seg.words.front().t0;
+        seg.t1 = seg.words.back().t1;
+    }
+    return true;
 }
 
 // True if any segment carries a non-whitespace character (i.e. real text).
@@ -1054,7 +1135,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         if (effective_chunk_seconds == 0 && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
             fprintf(stderr,
                     "crispasr: %s backend — full-audio / library-internal streaming "
-                    "(use --chunk-seconds N if OOM, --vad for long files)\n",
+                    "(use --chunk-seconds N if OOM; --vad to skip silence)\n",
                     backend.name());
         } else if (params.chunk_seconds_explicit && params.chunk_seconds > 0 &&
                    (backend.capabilities() & CAP_UNBOUNDED_INPUT) && (int)samples.size() > params.chunk_seconds * SR) {
@@ -1252,13 +1333,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             for (auto& seg : segs) {
                 if (!seg.words.empty() && !params.force_aligner)
                     continue;
-                // Find the original audio region for this segment.
-                const int s = (int)((double)seg.t0 / 100.0 * SR);
-                const int e = std::min((int)samples.size(), (int)((double)seg.t1 / 100.0 * SR));
-                if (e > s) {
+                // Align this segment against its own original-audio region.
+                const auto range = crispasr_alignment_audio_range(seg.t0, seg.t1, 0, (int)samples.size(), SR);
+                if (range.valid()) {
                     bool load_failed = false;
-                    auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + s, e - s, seg.t0,
-                                                    params.n_threads, &load_failed);
+                    auto words =
+                        crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + range.start,
+                                           range.end - range.start, range.offset_cs, params.n_threads, &load_failed);
                     aligner_load_failed = aligner_load_failed || load_failed;
                     if (crispasr_words_have_positive_span(words)) {
                         seg.t0 = words.front().t0;
@@ -1424,7 +1505,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
     // #324: foxnose diarizes in ONE global pass after transcription so speaker
     // identities are consistent across slices; the per-slice path stands down.
-    if (params.diarize && params.diarize_embedder_is_foxnose())
+    if (params.diarize && params.diarize_is_global_method())
         const_cast<whisper_params&>(params).diarize_foxnose_global = true;
 
     CrispasrPyannoteCache pyannote_cache;
@@ -1481,21 +1562,35 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // Atomic so parallel workers can safely increment it.
     std::atomic<size_t> slices_done{0};
 
-    auto process_slice = [&](size_t i, CrispasrBackend& be) {
+    // Slice i's encoder input range (slice ± optional acoustic context).
+    auto slice_ext_range = [&](size_t i, int& ext_start, int& ext_end, int64_t& ext_t0_cs) {
         const auto& sl = slices[i];
-
-        // Optionally extend the slice with acoustic context.
-        int ext_start = sl.start;
-        int ext_end = sl.end;
+        ext_start = sl.start;
+        ext_end = sl.end;
         if (use_chunk_context) {
             const int ctx_samples = (int)(kChunkContextS * SR);
             ext_start = std::max(0, sl.start - ctx_samples);
             ext_end = std::min((int)samples.size(), sl.end + ctx_samples);
         }
-        const int64_t ext_t0_cs = (int64_t)((double)ext_start / SR * 100.0);
+        ext_t0_cs = (int64_t)((double)ext_start / SR * 100.0);
+    };
 
-        std::vector<crispasr_segment> segs =
-            be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params);
+    // Everything after the model call: logits capture, context trimming,
+    // storage, progress. Shared by the sequential, worker-pool and pipelined
+    // paths so all three produce identical per_slice contents.
+    // Per-slice progress, split out of finish_slice so the pipelined path can
+    // report as each slice DECODES while still storing segments after the join.
+    auto tick_slice_progress = [&]() {
+        if (params.print_progress && slices.size() > 1) {
+            const size_t done = slices_done.fetch_add(1) + 1;
+            const int pct = (int)(done * 100 / slices.size());
+            fprintf(stderr, "crispasr: progress = %3d%% (%zu/%zu slices)\n", pct, done, slices.size());
+        }
+    };
+
+    auto finish_slice = [&](size_t i, std::vector<crispasr_segment> segs, CrispasrBackend& be,
+                            bool report_progress = true) {
+        const auto& sl = slices[i];
         if (params.return_logits) {
             if (const auto* logits = be.last_ctc_logits())
                 per_slice_logits[i] = *logits;
@@ -1591,19 +1686,10 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                     params.force_aligner ? 1 : 0, want_align ? 1 : 0);
         }
         if (want_align) {
-            for (auto& seg : segs) {
-                if (!seg.words.empty() && !params.force_aligner)
-                    continue;
-                bool load_failed = false;
-                auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + sl.start,
-                                                sl.end - sl.start, sl.t0_cs, params.n_threads, &load_failed);
-                aligner_load_failed = aligner_load_failed || load_failed;
-                if (crispasr_words_have_positive_span(words)) {
-                    seg.t0 = words.front().t0;
-                    seg.t1 = words.back().t1;
-                    seg.words = std::move(words);
-                }
-            }
+            bool load_failed = false;
+            crispasr_align_slice_segments(params.aligner_model, samples, sl.start, sl.end, sl.t0_cs, params.n_threads,
+                                          params.force_aligner, segs, &load_failed);
+            aligner_load_failed = aligner_load_failed || load_failed;
         }
 
         // Issue #267: diarize AFTER alignment so word timestamps (native
@@ -1666,12 +1752,17 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
         // Per-slice progress for unified backends (whisper uses its own
         // encoder-level callback). Print to stderr so it doesn't mix
-        // with transcript output.
-        if (params.print_progress && slices.size() > 1) {
-            const size_t done = slices_done.fetch_add(1) + 1;
-            const int pct = (int)(done * 100 / slices.size());
-            fprintf(stderr, "crispasr: progress = %3d%% (%zu/%zu slices)\n", pct, done, slices.size());
-        }
+        // with transcript output. The pipelined path already ticked it at
+        // decode time, so it passes report_progress=false here.
+        if (report_progress)
+            tick_slice_progress();
+    };
+
+    auto process_slice = [&](size_t i, CrispasrBackend& be) {
+        int ext_start = 0, ext_end = 0;
+        int64_t ext_t0_cs = 0;
+        slice_ext_range(i, ext_start, ext_end, ext_t0_cs);
+        finish_slice(i, be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params), be);
     };
 
     const int n_workers = params.return_logits ? 1 : std::min(params.n_processors, (int32_t)slices.size());
@@ -1694,7 +1785,161 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         return merged;
     };
 
-    if (n_workers > 1 && slices.size() > 1) {
+    // Encode ∥ decode pipelining over slices. Backends that expose a split
+    // transcribe run the encoder (GPU) for slice N+1 on a worker thread while
+    // this thread runs the decoder (CPU) for slice N. Same shape of win as the
+    // worker pool below, but with ONE model resident instead of N — so it is
+    // preferred whenever the user has not explicitly asked for -p workers.
+    //
+    // Skipped when return_logits is set: last_ctc_logits() is per-backend state
+    // read right after the model call, and only the serial path can attribute it
+    // to the right slice.
+    //
+    // Not every slice necessarily qualifies (a slice long enough to take a
+    // backend's multi-window route does not), and the pipeline must never fall
+    // back to transcribe() while the producer is running — that would encode on
+    // two threads at once. So the slice list is walked in RUNS of consecutive
+    // qualifying slices: each run gets its own producer thread that is joined
+    // before anything else touches the model, and non-qualifying slices are
+    // processed sequentially in between.
+    //
+    // The conditions live in crispasr_split_pipeline.h so there is one place to
+    // add one and a unit test per condition. Two were missing here: the env
+    // override dropped return_logits / worker-pool, and NOTHING covered the #89
+    // gap-fill that finish_slice runs when vad_slice_cap_seconds() > 0 — that
+    // one re-enters be.transcribe() on the consumer thread and aborts the
+    // process on a ggml assert when the producer is mid-encode.
+    crispasr_split::Inputs split_in;
+    split_in.multiple_slices = slices.size() > 1;
+    split_in.backend_supports_split = backend.supports_split_transcribe();
+    split_in.worker_pool_requested = n_workers > 1;
+    split_in.return_logits = params.return_logits;
+    {
+        const char* gf = getenv("CRISPASR_GAP_FILL");
+        const bool gap_fill_on = !gf || atoi(gf) != 0;
+        split_in.post_pass_reenters_model = backend.vad_slice_cap_seconds() > 0 && gap_fill_on;
+    }
+    const bool use_split_pipeline = crispasr_split::enabled(split_in, getenv("CRISPASR_SLICE_PIPELINE"));
+
+    // Run slices [lo, hi) through the encode ∥ decode pipeline.
+    auto pipeline_run = [&](size_t lo, size_t hi) {
+        struct pending {
+            CrispasrBackend::encoded_slice enc;
+            int64_t t0_cs = 0;
+            bool ok = false;
+        };
+        std::deque<pending> q;
+        std::mutex m;
+        std::condition_variable cv_full, cv_empty;
+        std::vector<size_t> failed_slices;
+        const size_t kCap = 2;
+
+        std::thread producer([&] {
+            for (size_t i = lo; i < hi; i++) {
+                int ext_start = 0, ext_end = 0;
+                int64_t ext_t0_cs = 0;
+                slice_ext_range(i, ext_start, ext_end, ext_t0_cs);
+                pending p;
+                p.t0_cs = ext_t0_cs;
+                p.enc = backend.encode_slice(samples.data() + ext_start, ext_end - ext_start, params);
+                p.ok = (p.enc.h != nullptr);
+                std::unique_lock<std::mutex> lk(m);
+                cv_full.wait(lk, [&] { return q.size() < kCap; });
+                q.push_back(p);
+                cv_empty.notify_one();
+            }
+        });
+
+        // Join on every exit path. Without this an exception escaping the loop
+        // below reaches ~std::thread with the producer still joinable, which is
+        // std::terminate.
+        struct join_guard {
+            std::thread& t;
+            ~join_guard() {
+                if (t.joinable())
+                    t.join();
+            }
+        } jg{producer};
+
+        // Decoded segments are held until the producer has joined: the repair
+        // pass below re-encodes, so it cannot run while the producer is
+        // encoding — and it has to run BEFORE finish_slice trims and stores,
+        // which is where transcribe() applies it. Progress is still ticked here
+        // so a pipelined run reports as it goes rather than all at the end.
+        std::vector<std::vector<crispasr_segment>> decoded(hi - lo);
+        for (size_t i = lo; i < hi; i++) {
+            pending p;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv_empty.wait(lk, [&] { return !q.empty(); });
+                p = q.front();
+                q.pop_front();
+                cv_full.notify_one();
+            }
+            if (!p.ok) {
+                // Unexpected encode failure (e.g. VRAM OOM) on a slice that did
+                // qualify. Defer to AFTER the join: the fallback re-encodes, and
+                // that must not overlap the producer.
+                failed_slices.push_back(i);
+                continue;
+            }
+            decoded[i - lo] = backend.decode_slice(p.enc, p.t0_cs, params);
+            tick_slice_progress();
+        }
+
+        producer.join();
+
+        // Single-threaded again: repair, then store; then retry anything the
+        // encoder dropped (process_slice re-encodes too, hence also here).
+        for (size_t i = lo; i < hi; i++) {
+            if (std::find(failed_slices.begin(), failed_slices.end(), i) != failed_slices.end())
+                continue;
+            int ext_start = 0, ext_end = 0;
+            int64_t ext_t0_cs = 0;
+            slice_ext_range(i, ext_start, ext_end, ext_t0_cs);
+            backend.repair_slice(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, decoded[i - lo], params);
+            finish_slice(i, std::move(decoded[i - lo]), backend, /*report_progress=*/false);
+        }
+        for (size_t i : failed_slices)
+            process_slice(i, backend);
+    };
+
+    if (use_split_pipeline) {
+        // Per-call settings that transcribe() would apply on every call —
+        // sampling, beam, attention context, hotwords. The split pair cannot do
+        // it (encode_slice runs on the producer thread), so it happens once
+        // here, on this thread, before any producer starts. Without it
+        // `--beam-size 4` decoded greedily.
+        backend.begin_split_run(params);
+        std::vector<char> qualifies(slices.size(), 0);
+        size_t n_ok = 0;
+        for (size_t i = 0; i < slices.size(); i++) {
+            int es = 0, ee = 0;
+            int64_t et = 0;
+            slice_ext_range(i, es, ee, et);
+            qualifies[i] = backend.can_split_slice(ee - es, params) ? 1 : 0;
+            n_ok += qualifies[i];
+        }
+        if (!params.no_prints && params.verbose)
+            fprintf(stderr, "crispasr: pipelining encode/decode over %zu/%zu slices\n", n_ok, slices.size());
+
+        size_t i = 0;
+        while (i < slices.size()) {
+            if (!qualifies[i]) {
+                process_slice(i, backend);
+                i++;
+                continue;
+            }
+            size_t j = i;
+            while (j < slices.size() && qualifies[j])
+                j++;
+            if (j - i >= 2)
+                pipeline_run(i, j);
+            else
+                process_slice(i, backend); // lone qualifying slice: nothing to overlap
+            i = j;
+        }
+    } else if (n_workers > 1 && slices.size() > 1) {
         // Parallel slice processing with separate backend instances
         if (!params.no_prints) {
             fprintf(stderr, "crispasr: parallel processing %zu slices with %d workers\n", slices.size(), n_workers);
@@ -2081,7 +2326,7 @@ static std::string crispasr_stream_common_speaker(const std::vector<crispasr_seg
     std::string spk;
     for (const auto& s : segs) {
         if (s.speaker.empty())
-            continue;
+            return "";
         if (spk.empty())
             spk = s.speaker;
         else if (spk != s.speaker)
@@ -2377,6 +2622,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // words can be re-grouped per segment afterwards.
         std::vector<std::string> segment_texts;
         bool is_srt_input = false;
+        bool is_json_input = false;
         auto trim = [](std::string s) {
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
                 s.erase(s.begin());
@@ -2385,28 +2631,78 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return s;
         };
         if (!params.text_file.empty()) {
-            FILE* tf = fopen(params.text_file.c_str(), "rb");
-            if (!tf) {
-                fprintf(stderr, "crispasr[align-only]: cannot open text file '%s'\n", params.text_file.c_str());
-                return 10;
-            }
-            fseek(tf, 0, SEEK_END);
-            long sz = ftell(tf);
-            fseek(tf, 0, SEEK_SET);
-            std::string raw(sz, '\0');
-            if ((long)fread(&raw[0], 1, sz, tf) != sz) {
-                fprintf(stderr, "crispasr[align-only]: short read from '%s'\n", params.text_file.c_str());
+            std::string raw;
+            // "-" means stdin (#317). An embedder like Subtitle Edit already
+            // holds the transcript in memory and would otherwise have to spill
+            // it to a temp file purely to hand it over — a temp file it then
+            // owns, has to name uniquely, and has to clean up. Piping is one
+            // less thing to get wrong, and costs nothing when unused.
+            if (params.text_file == "-") {
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0)
+                    raw.append(buf, n);
+                if (ferror(stdin)) {
+                    fprintf(stderr, "crispasr[align-only]: error reading transcript from stdin\n");
+                    return 10;
+                }
+                if (raw.empty()) {
+                    fprintf(stderr, "crispasr[align-only]: --text-file - was given but stdin was empty.\n");
+                    return 10;
+                }
+            } else {
+                FILE* tf = fopen(params.text_file.c_str(), "rb");
+                if (!tf) {
+                    fprintf(stderr, "crispasr[align-only]: cannot open text file '%s'\n", params.text_file.c_str());
+                    return 10;
+                }
+                fseek(tf, 0, SEEK_END);
+                long sz = ftell(tf);
+                fseek(tf, 0, SEEK_SET);
+                raw.assign((size_t)sz, '\0');
+                if ((long)fread(&raw[0], 1, sz, tf) != sz) {
+                    fprintf(stderr, "crispasr[align-only]: short read from '%s'\n", params.text_file.c_str());
+                    fclose(tf);
+                    return 10;
+                }
                 fclose(tf);
-                return 10;
             }
-            fclose(tf);
 
-            // Detect .srt by extension: cue texts kept, timestamps/indices stripped.
+            // Detect format by extension; stdin has no extension so sniff
+            // content instead. Order: .srt, .json, then plain .txt fallback.
             const std::string& p = params.text_file;
             is_srt_input = (p.size() >= 4 && (p.substr(p.size() - 4) == ".srt" || p.substr(p.size() - 4) == ".SRT"));
+            if (p == "-")
+                is_srt_input = raw.find(" --> ") != std::string::npos;
+
+            // #317: detect JSON — by extension or by content sniff for stdin.
+            // Accepts CrispASR --output-json transcription and the align-only
+            // JSON format, extracting the "text" field from each segment.
+            is_json_input = (p.size() >= 5 && (p.substr(p.size() - 5) == ".json" || p.substr(p.size() - 5) == ".JSON"));
+            if (p == "-" && !is_srt_input) {
+                // Sniff: JSON starts with '{' or '[' (ignoring whitespace).
+                for (size_t c = 0; c < raw.size(); c++) {
+                    if (raw[c] == ' ' || raw[c] == '\t' || raw[c] == '\n' || raw[c] == '\r')
+                        continue;
+                    is_json_input = (raw[c] == '{' || raw[c] == '[');
+                    break;
+                }
+            }
+
             if (is_srt_input) {
                 for (auto& cue : crispasr_parse_srt_cues(raw))
                     segment_texts.push_back(trim(std::move(cue)));
+            } else if (is_json_input) {
+                segment_texts = crispasr_parse_json_segments(raw);
+                if (segment_texts.empty()) {
+                    fprintf(stderr, "crispasr[align-only]: JSON input has no 'text' fields. "
+                                    "Expected CrispASR --output-json format with a \"transcription\" array, "
+                                    "or an array of {\"text\": \"...\"}.\n");
+                    return 10;
+                }
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr[align-only]: parsed %zu segment(s) from JSON input\n",
+                            segment_texts.size());
             } else {
                 // Plain .txt: each non-empty line is one segment.
                 size_t i = 0;
@@ -2428,7 +2724,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (!t.empty())
                 segment_texts.push_back(std::move(t));
         } else {
-            fprintf(stderr, "crispasr[align-only]: requires --ref-text or --text-file.\n");
+            // #317: two people hit this and read it as the aligner failing. It
+            // is not — alignment needs a transcript to align, and only the
+            // caller has one. Say what to pass, since the answer is short.
+            fprintf(stderr, "crispasr[align-only]: no transcript given — alignment needs the text to align.\n"
+                            "  --text-file <file.txt>   one segment per line\n"
+                            "  --text-file <file.srt>   re-time existing cues (text kept, timings discarded)\n"
+                            "  --text-file <file.json>  CrispASR JSON output (--output-json); extracts segment texts\n"
+                            "  --text-file -            read from stdin (auto-detects SRT/JSON/plain text)\n"
+                            "  --ref-text \"...\"         a single segment inline\n"
+                            "Only -am (the aligner model) is needed besides; -m/--backend, --vad and\n"
+                            "--max-len belong to transcription and are unused here.\n");
             return 10;
         }
 
@@ -2444,8 +2750,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 10;
         }
 
-        // segment output: explicit, or auto for .srt input (re-timed cues).
-        const bool segment_mode = gran == "segment" || (gran == "auto" && is_srt_input);
+        // segment output: explicit, or auto for structured input (SRT cues / JSON segments).
+        const bool segment_mode = gran == "segment" || (gran == "auto" && (is_srt_input || is_json_input));
 
         // Load audio.
         if (params.fname_inp.empty()) {
@@ -2644,7 +2950,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // PLAN #74a — chatterbox-family auto-route by --language. Pure
     // English variants ("chatterbox" / "chatterbox-turbo" / aliases)
     // get swapped to the language-matching sibling when the user passes
-    // `-l de` (kartoffelbox-turbo) or `-l ar` (lahgtna-chatterbox), but
+    // `-l de` (kartoffelbox-turbo), `-l ar` (lahgtna-chatterbox), or
+    // `-l fi` (chatterbox-finnish-nano), but
     // only when -m auto is in effect — if the user passed an explicit
     // model path they've already picked the variant. Mirrors the kokoro
     // `-l de` German-backbone routing convention. No-op when the user
@@ -2660,6 +2967,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 routed = "kartoffelbox-turbo";
             } else if (params.language == "ar") {
                 routed = "lahgtna-chatterbox";
+            } else if (params.language == "fi") {
+                routed = "chatterbox-finnish-nano";
             }
             if (!routed.empty()) {
                 if (!params.no_prints) {
@@ -2669,6 +2978,34 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 backend_name = routed;
                 params.backend = routed;
             }
+        }
+    }
+
+    // #411 — Pocket-TTS publishes a separate checkpoint per language. Keep
+    // the simple `--backend pocket-tts -m auto -l xx` interface and select
+    // the matching registry entry before model resolution. An explicit model
+    // path remains authoritative.
+    if (model_is_auto && !params.language.empty() && params.language != "auto" &&
+        (backend_name == "pocket-tts" || backend_name == "pocket_tts" || backend_name == "pockettts" ||
+         backend_name == "pocket")) {
+        std::string routed;
+        if (params.language == "de")
+            routed = "pocket-tts-de";
+        else if (params.language == "es")
+            routed = "pocket-tts-es";
+        else if (params.language == "it")
+            routed = "pocket-tts-it";
+        else if (params.language == "pt")
+            routed = "pocket-tts-pt";
+        else if (params.language == "fr")
+            routed = "pocket-tts-fr";
+        if (!routed.empty()) {
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: -l %s with --backend %s — auto-routing to %s\n", params.language.c_str(),
+                        backend_name.c_str(), routed.c_str());
+            }
+            backend_name = routed;
+            params.backend = routed;
         }
     }
 
@@ -2967,6 +3304,26 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
 
     warn_unsupported(*backend, params);
+
+    // A monolingual backend can only ever emit sole_language(); asking it for a
+    // different one is not a warning, it is a request it cannot satisfy. Before
+    // this, `crispasr -m moonshine.gguf -l de audio.wav` transcribed ENGLISH and
+    // exited 0 — the wrong-language output looked like a model quality problem
+    // rather than a rejected flag. Compared through whisper_lang_id() so the
+    // spelled-out form (`-l german`) is caught the same way, with a raw string
+    // compare as the fallback for codes outside whisper's table.
+    if (const char* sole_lang = backend->sole_language(); sole_lang && params.language != "auto") {
+        const int want = whisper_lang_id(params.language.c_str());
+        const int have = whisper_lang_id(sole_lang);
+        const bool same = (want != -1 && have != -1) ? (want == have) : (params.language == sole_lang);
+        if (!same) {
+            fprintf(stderr,
+                    "crispasr: error: backend '%s' is %s-only and cannot transcribe '%s'. "
+                    "Use -l %s, or -l auto, or pick a multilingual backend.\n",
+                    backend->name(), sole_lang, params.language.c_str(), sole_lang);
+            return 14;
+        }
+    }
 
     if (!backend->init(params)) {
         fprintf(stderr, "crispasr: error: failed to initialise backend '%s'\n", backend_name.c_str());
@@ -3403,6 +3760,16 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
+        // Optional leading-silence padding. Useful to bypass VLC playback bugs
+        // where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+        if (params.tts_pad_silence_ms > 0) {
+            size_t pad_samples = (size_t)((double)params.tts_pad_silence_ms / 1000.0 * sr_in);
+            audio.insert(audio.begin(), pad_samples, 0.0f);
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: padded %.2fs of leading silence\n",
+                        (double)params.tts_pad_silence_ms / 1000.0);
+        }
+
         // Resolve the output path first so we can enforce the watertight floor
         // BEFORE embedding: if this container can't carry C2PA, --no-watermark is
         // overridden so the file is never fully unmarked.
@@ -3785,6 +4152,38 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::string last_partial_text; // dedupe key + prefix-mode tail
         int64_t last_partial_decode_sample = -1;
         int64_t cumulative_samples = 0;
+        // --stream-partial-tail-sec (#404): per-utterance tail-cap state.
+        // `tail_anchor_abs` is the absolute sample the next partial decode
+        // starts from; `tail_committed` is the post-processed text of
+        // everything decoded ahead of it. Both reset when an utterance
+        // finalizes. See crispasr::plan_partial_tail for the policy.
+        const int tail_cap_samples =
+            params.stream_partial_tail_sec > 0
+                ? std::max(params.stream_partial_tail_sec * SR, 2 * crispasr::kStreamRedecodeMinSamples)
+                : 0;
+        const int tail_slack_samples = std::max(tail_cap_samples / 2, crispasr::kStreamRedecodeMinSamples);
+        int64_t tail_anchor_abs = -1;
+        std::string tail_committed;
+        // CRISPASR_STREAM_SLICE_MEMO (#404): memoize per-slice partial
+        // decodes by their ABSOLUTE sample range. A VAD-closed slice keeps the
+        // same (start, end) while it stays in the rolling window, and the
+        // decode is deterministic, so re-decoding it every step repeats
+        // byte-identical work — the bulk of the RFC's "194 full transcribes".
+        // The still-growing slice changes its end every step and always
+        // misses. Exact by construction. DEFAULT ON since the quiet-box A/B
+        // (chr1str/crispasr-stream404-ab, P100 + Xeon): finals byte-equal in
+        // every arm, wall −12.2 % (multi-utterance CPU) / −5.9 % (GPU), never
+        // a regression beyond noise. Set =0 to restore the re-decode path
+        // (the gate stays per the never-remove-gates rule).
+        struct StreamSliceMemo {
+            int64_t s = 0, e = 0;
+            std::vector<crispasr_segment> segs; // pristine, pre-post-chain
+        };
+        std::vector<StreamSliceMemo> slice_memo;
+        const bool slice_memo_on = [] {
+            const char* e = getenv("CRISPASR_STREAM_SLICE_MEMO");
+            return !e || !*e || *e != '0';
+        }();
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
         const int64_t partial_decode_interval_samples =
             crispasr_stream_partial_decode_interval_samples(params.stream_partial_decode_ms, params.stream_step_ms, SR);
@@ -3876,6 +4275,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // trim finalized rolling-window slices before decode;
                         // plain-text mode below still decodes full slices.
                         std::vector<crispasr_segment> sl_for_text;
+                        // #404: how many leading segments of sl_for_text came
+                        // from a tail-cap COMMIT decode. Their post-processed
+                        // text is promoted into `tail_committed` after the
+                        // post chain below. `tail_stitch` marks the one slice
+                        // (the growing one, under an active cap) whose emitted
+                        // text must be prefixed with `tail_committed`.
+                        size_t tail_commit_seg_count = 0;
+                        bool tail_stitch = false;
 
                         // Round 3 (CKwasd #1 corner): if the VAD slice
                         // straddles a previously-finalized boundary
@@ -3922,9 +4329,78 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             // step once the subrange exceeds the min.
                         } else {
                             partial_decode_attempted_this_step = true;
-                            const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
-                            sl_for_text =
-                                backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, abs_t0_cs, params);
+                            const int64_t abs_s = window_start_sample_now + (int64_t)sl.start;
+                            const int64_t abs_e = window_start_sample_now + (int64_t)sl.end;
+                            // The still-growing slice is the one whose end
+                            // rides the window edge; VAD-closed slices keep a
+                            // fixed absolute range while the window holds them.
+                            const bool slice_growing = sl.end >= (int)pcm_window.size() - step_samples;
+                            bool served = false;
+                            if (slice_memo_on && !slice_growing) {
+                                for (const auto& m : slice_memo) {
+                                    if (m.s == abs_s && m.e == abs_e) {
+                                        sl_for_text = m.segs; // copy: post chain mutates
+                                        served = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // #404: tail-cap the live partial decode of the
+                            // GROWING slice only. The plan either says "decode
+                            // the whole range" (cap off / slice short / stale
+                            // anchor), or first commits [commit_start,
+                            // commit_end) — one decode, its post-processed
+                            // text promoted into `tail_committed` below — and
+                            // starts this step's decode at the energy-min cut,
+                            // keeping per-step cost O(tail).
+                            if (!served) {
+                                const int cap_here = slice_growing ? tail_cap_samples : 0;
+                                const auto tail_plan = crispasr::plan_partial_tail(
+                                    pcm_window.data(),
+                                    tail_anchor_abs < 0 ? sl.start : (int)(tail_anchor_abs - window_start_sample_now),
+                                    sl.start, sl.end, cap_here, tail_slack_samples, kStraddleMinSamples);
+                                if (getenv("CRISPASR_STREAM_TAIL_DEBUG")) {
+                                    fprintf(stderr,
+                                            "stream-tail: t=%.2f grow=%d anchor_abs=%lld range=[%d,%d) plan{start=%d "
+                                            "commit=%d [%d,%d)} committed=%zuB\n",
+                                            (double)cumulative_samples / SR, (int)slice_growing,
+                                            (long long)tail_anchor_abs, sl.start, sl.end, tail_plan.decode_start,
+                                            (int)tail_plan.commit, tail_plan.commit_start, tail_plan.commit_end,
+                                            tail_committed.size());
+                                }
+                                if (tail_plan.commit) {
+                                    whisper_params commit_params = params;
+                                    commit_params.vad = false;
+                                    commit_params.vad_model.clear();
+                                    const int64_t commit_cs =
+                                        (window_start_sample_now + (int64_t)tail_plan.commit_start) * 100 / SR;
+                                    sl_for_text = backend->transcribe(pcm_window.data() + tail_plan.commit_start,
+                                                                      tail_plan.commit_end - tail_plan.commit_start,
+                                                                      commit_cs, commit_params);
+                                }
+                                tail_commit_seg_count = sl_for_text.size();
+                                if (cap_here > 0) {
+                                    tail_anchor_abs = window_start_sample_now + (int64_t)tail_plan.decode_start;
+                                    tail_stitch = true;
+                                }
+                                const int64_t abs_t0_cs =
+                                    (window_start_sample_now + (int64_t)tail_plan.decode_start) * 100 / SR;
+                                auto tail_segs =
+                                    backend->transcribe(pcm_window.data() + tail_plan.decode_start,
+                                                        sl.end - tail_plan.decode_start, abs_t0_cs, params);
+                                sl_for_text.insert(sl_for_text.end(), std::make_move_iterator(tail_segs.begin()),
+                                                   std::make_move_iterator(tail_segs.end()));
+                                // Memoize only complete, uncapped decodes of a
+                                // CLOSED slice — its range is stable, so later
+                                // steps replay this result instead of paying
+                                // an identical encoder pass.
+                                if (slice_memo_on && !slice_growing && tail_commit_seg_count == 0 &&
+                                    tail_plan.decode_start == sl.start) {
+                                    if (slice_memo.size() >= 8)
+                                        slice_memo.erase(slice_memo.begin());
+                                    slice_memo.push_back({abs_s, abs_e, sl_for_text});
+                                }
+                            }
                         }
                         if (!sl_for_text.empty())
                             decoded_segments_this_step = true;
@@ -3938,9 +4414,29 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             for (auto& seg : sl_for_text)
                                 crispasr_strip_punctuation(seg);
                         }
+                        // #404: promote this step's commit-decode text (the
+                        // first tail_commit_seg_count segments, now post-
+                        // processed) into the per-utterance committed prefix,
+                        // then emit committed + tail so partial.text still
+                        // covers the whole utterance under the tail cap.
                         std::string sl_text;
-                        for (const auto& s : sl_for_text)
-                            sl_text += s.text;
+                        for (size_t si = 0; si < sl_for_text.size(); ++si) {
+                            if (si < tail_commit_seg_count) {
+                                // Successive commit decodes are independent
+                                // clips whose texts rarely carry boundary
+                                // whitespace — join with a space like the
+                                // stitcher does, or words fuse at the seam.
+                                const std::string& t = sl_for_text[si].text;
+                                if (!tail_committed.empty() && !t.empty() && tail_committed.back() != ' ' &&
+                                    t.front() != ' ')
+                                    tail_committed += ' ';
+                                tail_committed += t;
+                            } else {
+                                sl_text += sl_for_text[si].text;
+                            }
+                        }
+                        if (tail_stitch && !tail_committed.empty())
+                            sl_text = crispasr::stitch_partial_accumulator(tail_committed, sl_text);
                         step_slice_text.emplace_back(sl, std::move(sl_text));
                     } else {
                         const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
@@ -4099,6 +4595,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.clear();
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    tail_anchor_abs = -1; // #404: tail-cap state is per-utterance
+                    tail_committed.clear();
                 };
 
                 auto open_utterance_at = [&](int window_offset, int64_t stream_start) {
@@ -4113,6 +4611,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.assign(pcm_window.begin() + window_offset, pcm_window.end());
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    tail_anchor_abs = -1; // #404: fresh utterance, fresh tail state
+                    tail_committed.clear();
                 };
 
                 auto on_partial_text = [&](const std::string& new_text) {
@@ -4623,21 +5123,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         want_align ? 1 : 0);
             }
             if (want_align) {
-                for (auto & seg : segs) {
-                    if (!seg.words.empty() && !params.force_aligner) continue; // already aligned
-                    auto words = crispasr_ctc_align(
-                        params.aligner_model,
-                        seg.text,
-                        samples.data() + sl.start,
-                        sl.end - sl.start,
-                        sl.t0_cs,
-                        params.n_threads);
-                    if (crispasr_words_have_positive_span(words)) {
-                        seg.t0 = words.front().t0;
-                        seg.t1 = words.back().t1;
-                        seg.words = std::move(words);
-                    }
-                }
+                crispasr_align_slice_segments(params.aligner_model, samples, sl.start, sl.end, sl.t0_cs,
+                                               params.n_threads, params.force_aligner, segs);
             }
 
             // Issue #267: diarize AFTER alignment so word timestamps

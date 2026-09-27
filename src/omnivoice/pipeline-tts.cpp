@@ -11,7 +11,6 @@
 #include "audio-postproc.h"
 #include "bpe.h"
 #include "debug.h"
-#include "duration-estimator.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -24,6 +23,7 @@
 #include "voice-design.h"
 
 #include "core/crispasr_env.h"
+#include "core/omnivoice_duration.h"
 #include "core/omnivoice_instruct.h"
 #include "core/omnivoice_lang.h"
 
@@ -790,7 +790,8 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
 
     // Estimated tokens for the full text. Chunking trigger uses the same
     // estimator as the single-shot path for consistency with upstream.
-    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T, speed);
+    int T_total = (T_override > 0) ? T_override
+                                   : core_omnivoice_duration::estimate_target_tokens(text, ref_text, ext_ref_T, speed);
 
     int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
     bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
@@ -862,7 +863,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
             int                 this_T        = first_no_ref ? 0 : prompt_T;
             const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
 
-            int Ti = duration_estimate_tokens(ct, this_ref_text, this_T, speed);
+            int Ti = core_omnivoice_duration::estimate_target_tokens(ct, this_ref_text, this_T, speed);
 
             // Dump intermediate tensors only for chunk 0 so cossim tests
             // compare matching chunks across Python and C++.
@@ -1071,7 +1072,8 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
 
     // Same chunking decision as the buffered path: single shot below the
     // threshold, otherwise split on punctuation and chain chunks.
-    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T, speed);
+    int T_total = (T_override > 0) ? T_override
+                                   : core_omnivoice_duration::estimate_target_tokens(text, ref_text, ext_ref_T, speed);
 
     int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
     bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
@@ -1128,7 +1130,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
             int                 this_T        = first_no_ref ? 0 : prompt_T;
             const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
 
-            int          Ti             = duration_estimate_tokens(ct, this_ref_text, this_T, speed);
+            int          Ti             = core_omnivoice_duration::estimate_target_tokens(ct, this_ref_text, this_T, speed);
             const char * chunk_dump_dir = (i == 0) ? dump_dir : NULL;
 
             ov_log(OV_LOG_INFO, "[TTS-Stream] Chunk %zu/%zu: chars=%d T=%d ref_T=%d", i + 1, chunks.size(),

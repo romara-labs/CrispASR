@@ -1,3 +1,4 @@
+#include <chrono>
 #include "crispasr.h"
 #include "crispasr-arch.h"
 
@@ -204,6 +205,7 @@ static bool ggml_graph_compute_helper(struct ggml_cgraph* graph, int n_threads, 
 // instances (e.g. Ruby bindings) don't race on shared threadpool fields.
 #include <mutex>
 #include <unordered_map>
+#include "core/ggml_cpu_backend.h"
 struct cpu_pool_entry {
     ggml_threadpool_t pool = nullptr;
     int n_threads = 0;
@@ -215,24 +217,23 @@ static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_thre
     std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-        if (!ggml_backend_is_cpu(backend))
+        if (!core_cpu_backend::is_cpu(backend))
             continue;
 
         auto& entry = g_cpu_pools[backend];
         if (entry.pool && entry.n_threads >= n_threads) {
-            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            core_cpu_backend::set_threadpool(backend, entry.pool);
             continue;
         }
         // (Re)create with the requested size.
         if (entry.pool) {
-            ggml_backend_cpu_set_threadpool(backend, nullptr);
-            ggml_threadpool_free(entry.pool);
+            core_cpu_backend::set_threadpool(backend, nullptr);
+            core_cpu_backend::threadpool_free(entry.pool);
         }
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
-        entry.pool = ggml_threadpool_new(&tpp);
+        entry.pool = core_cpu_backend::threadpool_new(n_threads);
         entry.n_threads = entry.pool ? n_threads : 0;
         if (entry.pool) {
-            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            core_cpu_backend::set_threadpool(backend, entry.pool);
         }
     }
 }
@@ -247,8 +248,8 @@ static void whisper_release_cpu_threadpool(ggml_backend_t backend) {
     if (it == g_cpu_pools.end())
         return;
     if (it->second.pool) {
-        ggml_backend_cpu_set_threadpool(backend, nullptr);
-        ggml_threadpool_free(it->second.pool);
+        core_cpu_backend::set_threadpool(backend, nullptr);
+        core_cpu_backend::threadpool_free(it->second.pool);
     }
     g_cpu_pools.erase(it);
 }
@@ -1915,7 +1916,17 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU Extra
+    //
+    // Issue #405: under GGML_BACKEND_DL the registry can have NO CPU device
+    // (every shipped libggml-cpu variant refused by ggml_backend_score() on a
+    // host below their ISA floor). ggml_backend_dev_backend_reg(nullptr)
+    // aborts the process (GGML_ASSERT(device), ggml-backend.cpp:595 — the LID
+    // crash in the report), so return the GPU-only list and let the caller
+    // fail the model load with a real error message.
     auto* cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        return buft_list;
+    }
     auto* cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
         cpu_reg, "ggml_backend_dev_get_extra_bufts");
@@ -1928,7 +1939,7 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU
-    buft_list.emplace_back(cpu_dev, ggml_backend_cpu_buffer_type());
+    buft_list.emplace_back(cpu_dev, core_cpu_backend::buffer_type());
 
     return buft_list;
 }
@@ -1939,7 +1950,7 @@ static bool weight_buft_supported(const whisper_hparams& hparams, ggml_tensor* w
 
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == ggml_backend_cpu_buffer_type())) {
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == core_cpu_backend::buffer_type())) {
         // GPU and default CPU backend support all operators
         op_supported = true;
     } else {
@@ -2326,6 +2337,14 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
 
     // Create a list of available bufts, in priority order
     buft_list_t buft_list = make_buft_list(wctx.params);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place model weights. "
+                           "If this is a packaged (dynamic-backend) build, the shipped libggml-cpu modules "
+                           "may all require CPU features this host lacks; use the crispasr-*-cpu-legacy "
+                           "artifact or build from source on this machine.\n",
+                           __func__);
+        return false;
+    }
 
     auto create_tensor = [&](asr_tensor type, asr_system system, ggml_tensor* meta, int layer = 0) -> ggml_tensor* {
         ggml_op op = ASR_TENSOR_INFO.at(type);
@@ -5011,7 +5030,7 @@ static bool weight_buft_supported(const whisper_vad_hparams& hparams, ggml_tenso
 
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == ggml_backend_cpu_buffer_type())) {
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == core_cpu_backend::buffer_type())) {
         // GPU and default CPU backend support all operators
         op_supported = true;
     } else {
@@ -5269,10 +5288,7 @@ static bool whisper_vad_init_context(whisper_vad_context* vctx) {
     // This avoids creating/destroying a disposable threadpool on every
     // chunk (~250 per 8 s audio).  After many server requests the
     // accumulated malloc/free fragmentation degrades performance (#132).
-    {
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
-        vctx->threadpool = ggml_threadpool_new(&tpp);
-    }
+    { vctx->threadpool = core_cpu_backend::threadpool_new(1); }
 
     return true;
 }
@@ -5425,6 +5441,12 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
     wparams.use_gpu = params.use_gpu;
     wparams.gpu_device = params.gpu_device;
     buft_list_t buft_list = make_buft_list(wparams);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place VAD weights (see the "
+                           "cpu-legacy note in the ASR loader error above / issue #405).\n",
+                           __func__);
+        return nullptr;
+    }
 
     auto create_tensor = [&](vad_tensor type, ggml_tensor* meta) -> ggml_tensor* {
         ggml_op op = VAD_TENSOR_OPS.at(type);
@@ -5674,7 +5696,7 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     // ggml_graph_compute directly per chunk.  This bypasses the scheduler
     // overhead and all threadpool creation entirely.
 
-    struct ggml_cplan cplan = ggml_graph_plan(gf, /*n_threads=*/1, vctx->threadpool);
+    struct ggml_cplan cplan = core_cpu_backend::plan(gf, /*n_threads=*/1, vctx->threadpool);
 
     // Persistent work buffer — reused across calls via vctx member.
     if (vctx->work_buf.size() < cplan.work_size) {
@@ -5704,7 +5726,7 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
         ggml_backend_tensor_set(frame, window.data(), 0, ggml_nelements(frame) * sizeof(float));
 
         // Direct graph compute — no scheduler, no threadpool churn.
-        if (ggml_graph_compute(gf, &cplan) != GGML_STATUS_SUCCESS) {
+        if (core_cpu_backend::compute_planned(gf, &cplan, 1) != GGML_STATUS_SUCCESS) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD graph\n", __func__);
             break;
         }
@@ -6007,7 +6029,7 @@ void whisper_vad_free(whisper_vad_context* ctx) {
         }
 
         if (ctx->threadpool) {
-            ggml_threadpool_free(ctx->threadpool);
+            core_cpu_backend::threadpool_free(ctx->threadpool);
         }
 
         delete[] ctx->model.hparams.encoder_in_channels;
@@ -6399,6 +6421,20 @@ static void whisper_suppress_invalid_grammar(whisper_context& ctx, const whisper
     //if (!allow_eot) {
     //    logits[eot] -= params.grammar_penalty;
     //}
+    // Opt-in (grammar_strict): the check above, enabled. End-of-text is only
+    // allowed once some parse of the grammar has been completed.
+    if (params.grammar_strict) {
+        bool allow_eot = false;
+        for (const auto& stack : grammar.stacks) {
+            if (stack.empty()) {
+                allow_eot = true;
+                break;
+            }
+        }
+        if (!allow_eot) {
+            logits[eot] -= params.grammar_penalty;
+        }
+    }
     //fprintf(stderr, "Allowed: (%zu tokens)\n", size - rejects.size());
 }
 
@@ -6465,6 +6501,268 @@ struct whisper_context* whisper_init_from_file_with_params_by_ref(const char* pa
 struct whisper_context* whisper_init_from_file_with_params_no_state_by_ref(const char* path_model,
                                                                            struct whisper_context_params* params) {
     return whisper_init_from_file_with_params_no_state(path_model, *params);
+}
+
+int whisper_score_texts(struct whisper_context* ctx, const float* samples, int n_samples, const char* language,
+                        const char* initial_prompt, const char** texts, int n_texts, float* out_logprobs,
+                        int* out_n_tokens, int n_threads) {
+    if (!ctx || !samples || n_samples <= 0 || !texts || n_texts <= 0 || !out_logprobs) {
+        return -1;
+    }
+    // CRISPASR_WHISPER_SCORE_PROFILE=1 prints where the time goes.
+    const bool prof = getenv("CRISPASR_WHISPER_SCORE_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t_start = now();
+    whisper_state* state = whisper_init_state(ctx);
+    const auto t_init = now();
+    if (!state) {
+        return -2;
+    }
+    struct state_guard {
+        whisper_state* s;
+        ~state_guard() { whisper_free_state(s); }
+    } guard{state};
+
+    if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, n_threads) != 0) {
+        return -3;
+    }
+    const auto t_mel = now();
+    if (whisper_encode_with_state(ctx, state, 0, n_threads) != 0) {
+        return -4;
+    }
+    const auto t_enc = now();
+
+    const int n_vocab = whisper_n_vocab(ctx);
+    const int n_ctx = whisper_n_text_ctx(ctx);
+
+    // The prompt whisper_full uses for a plain transcription without
+    // timestamps, optionally preceded by previous text (initial_prompt, as in
+    // whisper_full_params.initial_prompt) to prime the vocabulary.
+    std::vector<whisper_token> prompt;
+    if (initial_prompt && initial_prompt[0]) {
+        std::vector<whisper_token> prev(n_ctx);
+        const std::string text = std::string(" ") + initial_prompt;
+        const int n_prev = whisper_tokenize(ctx, text.c_str(), prev.data(), (int)prev.size());
+        if (n_prev > 0) {
+            prompt.push_back(whisper_token_prev(ctx));
+            // Keep the most recent tokens, as whisper_full does (n_text_ctx / 2).
+            const int keep = std::min(n_prev, n_ctx / 2 - 1);
+            prompt.insert(prompt.end(), prev.begin() + (n_prev - keep), prev.begin() + n_prev);
+        }
+    }
+    prompt.push_back(whisper_token_sot(ctx));
+    if (whisper_is_multilingual(ctx)) {
+        const int lang_id = whisper_lang_id(language && language[0] ? language : "en");
+        if (lang_id < 0) {
+            return -5;
+        }
+        prompt.push_back(whisper_token_lang(ctx, lang_id));
+        prompt.push_back(whisper_token_transcribe(ctx));
+    }
+    prompt.push_back(whisper_token_not(ctx));
+    const int n_prompt = (int)prompt.size();
+    const whisper_token eot = whisper_token_eot(ctx);
+
+    auto log_softmax_at = [n_vocab](const float* row, whisper_token target) {
+        float mx = row[0];
+        for (int v = 1; v < n_vocab; ++v) {
+            mx = std::max(mx, row[v]);
+        }
+        double sum = 0.0;
+        for (int v = 0; v < n_vocab; ++v) {
+            sum += std::exp((double)(row[v] - mx));
+        }
+        return (double)(row[target] - mx) - std::log(sum);
+    };
+
+    // Decode the shared prompt once; its cache is kept and every candidate
+    // continues from it.
+    whisper_batch_prep_legacy(state->batch, prompt.data(), n_prompt, 0, 0);
+    whisper_kv_cache_seq_rm(state->kv_self, 0, 0, -1);
+    if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, false, nullptr, nullptr)) {
+        return -6;
+    }
+    const auto t_prompt = now();
+    int n_steps = 0;
+    double t_dec = 0.0, t_sm = 0.0;
+    const std::vector<float> prompt_logits(state->logits.begin() + (size_t)(n_prompt - 1) * n_vocab,
+                                           state->logits.begin() + (size_t)n_prompt * n_vocab);
+
+    // Tokenize every candidate, then visit them in token order so that
+    // neighbours share prefixes ("knight", "knight to ..."): the cache and
+    // the per-position log-probabilities of the shared part are kept and
+    // only the rest is decoded. Tokens are fed one at a time, like
+    // whisper_full's own decoding, so the decoder graph keeps its shape
+    // instead of being re-planned for every candidate length.
+    std::vector<std::vector<whisper_token>> seqs(n_texts);
+    std::vector<whisper_token> buf(n_ctx);
+    for (int t = 0; t < n_texts; ++t) {
+        out_logprobs[t] = -INFINITY;
+        if (out_n_tokens) {
+            out_n_tokens[t] = 0;
+        }
+        const std::string text = std::string(" ") + (texts[t] ? texts[t] : ""); // leading space, as Whisper emits
+        const int n = whisper_tokenize(ctx, text.c_str(), buf.data(), (int)buf.size());
+        if (n > 0 && n_prompt + n < n_ctx) {
+            seqs[t].assign(buf.begin(), buf.begin() + n);
+        }
+    }
+    std::vector<int> order(n_texts);
+    for (int t = 0; t < n_texts; ++t) {
+        order[t] = t;
+    }
+    std::sort(order.begin(), order.end(), [&](int x, int y) { return seqs[x] < seqs[y]; });
+
+    // Batched path (default; CRISPASR_WHISPER_SCORE_SEQUENTIAL=1 restores the
+    // one-token-per-call path below): the candidates' tokens form a prefix
+    // tree, and every node of it is decoded in ONE batch. Tree attention comes
+    // from sequence ids: candidate t is sequence t + 1, a node's cell carries
+    // every candidate that passes through it, and a token attends with one of
+    // its own candidates - so it sees exactly the prompt and its ancestors (a
+    // cell off its path shares no candidate with it). A/B on 30 Piper/Kokoro
+    // utterances, whisper tiny: same best candidate 30/30, 1.8x faster overall;
+    // log-probabilities differ by batched-matmul rounding (a single phrase with
+    // no tree already moves 0.03-0.09).
+    const char* sequential_env = getenv("CRISPASR_WHISPER_SCORE_SEQUENTIAL");
+    if (!(sequential_env && sequential_env[0] == '1')) {
+        struct tree_node {
+            whisper_token tok;
+            int depth;
+        };
+        std::vector<tree_node> nodes;
+        std::map<std::pair<int, whisper_token>, int> child_of;
+        std::vector<std::vector<int>> node_path(n_texts);
+        for (int t = 0; t < n_texts; ++t) {
+            int parent = -1;
+            for (size_t i = 0; i < seqs[t].size(); ++i) {
+                const auto key = std::make_pair(parent, seqs[t][i]);
+                auto it = child_of.find(key);
+                if (it == child_of.end()) {
+                    it = child_of.emplace(key, (int)nodes.size()).first;
+                    nodes.push_back({seqs[t][i], (int)i});
+                }
+                node_path[t].push_back(it->second);
+                parent = it->second;
+            }
+        }
+        const int n_nodes = (int)nodes.size();
+        if (n_nodes > 0 && n_nodes <= n_ctx && n_prompt + n_nodes <= (int)state->kv_self.size) {
+            std::vector<std::vector<whisper_seq_id>> members(n_nodes);
+            for (int t = 0; t < n_texts; ++t) {
+                for (int id : node_path[t]) {
+                    members[id].push_back(t + 1);
+                }
+                whisper_kv_cache_seq_cp(state->kv_self, 0, t + 1, -1, -1); // the prompt, for every candidate
+            }
+            whisper_batch tree = whisper_batch_init(n_nodes, n_texts);
+            tree.n_tokens = n_nodes;
+            for (int i = 0; i < n_nodes; ++i) { // parents precede children: creation order
+                tree.token[i] = nodes[i].tok;
+                tree.pos[i] = n_prompt + nodes[i].depth;
+                tree.n_seq_id[i] = (int32_t)members[i].size();
+                std::copy(members[i].begin(), members[i].end(), tree.seq_id[i]);
+                tree.logits[i] = 1;
+            }
+            const auto t0 = now();
+            const bool ok = whisper_decode_internal(*ctx, *state, tree, n_threads, false, nullptr, nullptr);
+            whisper_batch_free(tree);
+            for (int t = 0; t < n_texts; ++t) {
+                whisper_kv_cache_seq_rm(state->kv_self, t + 1, -1, -1);
+            }
+            if (!ok) {
+                return -6;
+            }
+            t_dec += ms(t0, now());
+            n_steps = 1;
+            const auto t1 = now();
+            // log-softmax(x)[v] = x[v] - logsumexp(x): one logsumexp per node.
+            std::vector<double> lse(n_nodes);
+            for (int i = 0; i < n_nodes; ++i) {
+                const float* row = state->logits.data() + (size_t)i * n_vocab;
+                const float mx = *std::max_element(row, row + n_vocab);
+                double sum = 0.0;
+                for (int v = 0; v < n_vocab; ++v) {
+                    sum += std::exp((double)(row[v] - mx));
+                }
+                lse[i] = mx + std::log(sum);
+            }
+            for (int t = 0; t < n_texts; ++t) {
+                const auto& seq = seqs[t];
+                if (seq.empty()) {
+                    continue;
+                }
+                double logprob = log_softmax_at(prompt_logits.data(), seq[0]);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    const int id = node_path[t][i];
+                    const whisper_token target = i + 1 < seq.size() ? seq[i + 1] : eot;
+                    logprob += state->logits[(size_t)id * n_vocab + target] - lse[id];
+                }
+                out_logprobs[t] = (float)logprob;
+                if (out_n_tokens) {
+                    out_n_tokens[t] = (int)seq.size() + 1;
+                }
+            }
+            t_sm += ms(t1, now());
+            if (prof) {
+                fprintf(stderr,
+                        "score_texts (batched): %d texts, %d tree nodes, encode %.0f ms, prompt(%d) %.0f ms, "
+                        "decode %.0f ms, softmax %.0f ms, total %.0f ms\n",
+                        n_texts, n_nodes, ms(t_mel, t_enc), n_prompt, ms(t_enc, t_prompt), t_dec, t_sm,
+                        ms(t_start, now()));
+            }
+            return 0;
+        }
+        // Too many nodes for one batch or the cache: score one token at a time.
+    }
+
+    // path[i] = token i of the candidate whose tokens are in the cache;
+    // lp_after[i] = log-probabilities (full row) after path[0..i].
+    std::vector<whisper_token> path;
+    std::vector<std::vector<float>> logits_after;
+    for (int t : order) {
+        const auto& seq = seqs[t];
+        if (seq.empty()) {
+            continue;
+        }
+        size_t common = 0;
+        while (common < path.size() && common < seq.size() && path[common] == seq[common]) {
+            ++common;
+        }
+        path.resize(common);
+        logits_after.resize(common);
+        whisper_kv_cache_seq_rm(state->kv_self, 0, n_prompt + (int)common, -1);
+        for (size_t i = common; i < seq.size(); ++i) {
+            whisper_batch_prep_legacy(state->batch, &seq[i], 1, n_prompt + (int)i, 0);
+            const auto t0 = now();
+            if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, false, nullptr, nullptr)) {
+                return -6;
+            }
+            t_dec += ms(t0, now());
+            ++n_steps;
+            path.push_back(seq[i]);
+            logits_after.emplace_back(state->logits.begin(), state->logits.begin() + n_vocab);
+        }
+        const auto t1 = now();
+        double logprob = log_softmax_at(prompt_logits.data(), seq[0]);
+        for (size_t i = 0; i < seq.size(); ++i) {
+            const whisper_token target = i + 1 < seq.size() ? seq[i + 1] : eot;
+            logprob += log_softmax_at(logits_after[i].data(), target);
+        }
+        t_sm += ms(t1, now());
+        out_logprobs[t] = (float)logprob;
+        if (out_n_tokens) {
+            out_n_tokens[t] = (int)seq.size() + 1; // text tokens and end-of-text
+        }
+    }
+    if (prof) {
+        fprintf(stderr,
+                "score_texts: %d texts, init %.0f ms, mel %.0f ms, encode %.0f ms, prompt(%d) %.0f ms, "
+                "%d decode steps %.0f ms (%.1f ms/step), softmax %.0f ms, total %.0f ms\n",
+                n_texts, ms(t_start, t_init), ms(t_init, t_mel), ms(t_mel, t_enc), n_prompt, ms(t_enc, t_prompt),
+                n_steps, t_dec, n_steps ? t_dec / n_steps : 0.0, t_sm, ms(t_start, now()));
+    }
+    return 0;
 }
 
 int whisper_full_by_ref(struct whisper_context* ctx, struct whisper_full_params* params, const float* samples,
@@ -6562,6 +6860,8 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /* vad_params =*/whisper_vad_default_params(),
 
         /*.alt_n =*/0,
+
+        /*.grammar_strict =*/false,
     };
 
     switch (strategy) {
@@ -8624,12 +8924,33 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                             }
                         }
                         text = "";
-                        while (i < (int)tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx) &&
-                               ctx->vocab.is_timestamp(tokens_cur[i].id)) {
-                            i++;
-                        }
-                        i--;
+                        // Issue #388 (backport of ggml-org/whisper.cpp#2279, fixing
+                        // whisper.cpp#2271): around a pause the model emits TWO
+                        // timestamp tokens — the end of this utterance and the start
+                        // of the next. Consuming them and then setting t0 = t1 threw
+                        // the second one away, so every segment began where the
+                        // previous one ended and the silence between utterances
+                        // vanished from the transcript / SRT.
+                        //
+                        // Look AHEAD at i + 1 instead, and take t0 from the LAST
+                        // timestamp consumed — that is the next utterance's real
+                        // start. Index-equivalent to the old loop (which advanced
+                        // past the run and backed off one), so only t0 and the
+                        // print_special echo change.
+                        //
+                        // The is_timestamp() guard is kept, deliberately diverging
+                        // from upstream: CrispASR has extra special tokens above
+                        // token_beg ([SOLM], <|speakerN|>) that must not be eaten
+                        // as timestamps.
                         t0 = t1;
+                        while (i + 1 < (int)tokens_cur.size() && tokens_cur[i + 1].id > whisper_token_beg(ctx) &&
+                               ctx->vocab.is_timestamp(tokens_cur[i + 1].id)) {
+                            i++;
+                            if (params.print_special) {
+                                text += whisper_token_to_str(ctx, tokens_cur[i].id);
+                            }
+                            t0 = seek + 2 * (tokens_cur[i].tid - whisper_token_beg(ctx));
+                        }
                         i0 = i + 1;
                         speaker_turn_next = false;
                     }
@@ -8647,8 +8968,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                    text.c_str());
                         } else {
                             printf("%s", text.c_str());
-                            fflush(stdout);
                         }
+                        fflush(stdout); // #388: flush the timestamped form too, as whisper.cpp master does
                     }
 
                     result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next, {}});

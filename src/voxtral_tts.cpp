@@ -55,6 +55,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -392,54 +393,10 @@ static void tekken_bpe_encode(const voxtral_tts_vocab& v, const uint8_t* data, s
     }
 }
 
-// Tekken regex pre-tokenizer, hand-rolled. The tekken.json pattern
-// (`[^\r\n\p{L}\p{N}]?[\p{Lu}...]*[\p{Ll}...]+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+`)
-// attaches an optional single leading non-alphanumeric byte (typically a space)
-// to the following letter/number run — so "Hello world" → ["Hello", " world"] not
-// ["Hello", " ", "world"]. Skipping this lets greedy BPE merge across word
-// boundaries and mis-tokenise. UTF-8 continuation/lead bytes (≥0x80) are treated
-// as letters (approximates \p{L} without a full Unicode table).
+// Pre-tokenizer lives in voxtral_tekken_vocab.h so the runtime and its
+// tests share one implementation (the #338 lesson).
 static std::vector<std::string> tekken_pre_tokenize(const std::string& text) {
-    std::vector<std::string> out;
-    const size_t n = text.size();
-    auto is_alpha = [](unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80; };
-    auto is_digit = [](unsigned char c) { return c >= '0' && c <= '9'; };
-    auto is_ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-    size_t i = 0;
-    while (i < n) {
-        const unsigned char c = (unsigned char)text[i];
-        // Optional single leading non-alnum/non-newline byte before a word/number.
-        size_t k = i;
-        if (!is_alpha(c) && !is_digit(c) && c != '\n' && c != '\r')
-            k = i + 1;
-        if (k < n && is_alpha((unsigned char)text[k])) {
-            size_t j = k;
-            while (j < n && is_alpha((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        } else if (k < n && is_digit((unsigned char)text[k])) {
-            size_t j = k;
-            while (j < n && is_digit((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        } else if (is_ws(c)) {
-            size_t j = i;
-            while (j < n && is_ws((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        } else {
-            size_t j = i;
-            while (j < n && !is_alpha((unsigned char)text[j]) && !is_digit((unsigned char)text[j]) &&
-                   !is_ws((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        }
-    }
-    return out;
+    return voxtral_tekken::pre_tokenize(text);
 }
 
 static std::vector<int32_t> voxtral_tts_tokenize(voxtral_tts_context* ctx, const std::string& text) {
@@ -618,7 +575,7 @@ extern "C" voxtral_tts_context* voxtral_tts_init_from_file(const char* path_mode
     core_gguf::free_metadata(gctx);
 
     // Load weights
-    ggml_backend_t be = ggml_backend_cpu_init();
+    ggml_backend_t be = core_cpu_backend::init();
     ctx->backend_cpu = be;
     if (params.use_gpu) {
         ggml_backend_t gpu = crispasr_init_gpu_backend();
@@ -631,7 +588,7 @@ extern "C" voxtral_tts_context* voxtral_tts_init_from_file(const char* path_mode
         ctx->backend = be;
 
     if (ctx->backend_cpu && params.n_threads > 0)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     // FM_STEPS: experimental Euler ODE step-count override (default 8). See header.
     ctx->fm_flow_steps = env_int("CRISPASR_VOXTRAL_TTS_FM_STEPS", VTTS_FLOW_STEPS);
@@ -1858,7 +1815,7 @@ extern "C" void voxtral_tts_free(voxtral_tts_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

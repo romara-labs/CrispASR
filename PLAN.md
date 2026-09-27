@@ -1,5 +1,713 @@
 # CrispASR — Pending work
 
+## CLAIMED 2026-09-24 — #466 NVIDIA Nemotron-3-Diarization (streaming Sortformer v3)
+
+Worktree `.claude/worktrees/feat-466-nemotron3-diar`, branch `feat/466-nemotron3-diar`.
+~100M params, OpenMDW-1.1 (commercial OK), 8 speakers in arrival order, 10 ms
+frames. NeMo log-mel (128, preemph 0.97) -> 8x feature stacking -> 31-layer pre-LN
+RoPE transformer (d=512) -> 192-d head (8 channels) -> sub-pixel Conv1D upsample.
+References: transformers Nemotron3DiarizationForAudioFrameClassification (Python,
+diff harness) and NVIDIA's Apache-2.0 NeMo-Speech.cpp (sortformer_model.cpp,
+aosc_state.cpp; uses ggml patches, so port to stock ops). DER on its AMI clip.
+Order: converter -> offline backend -> --diarize integration -> C-ABI/registry ->
+streaming AOSC presets.
+
+## DEFERRED 2026-09-24 — #456 nyra-forced-aligner
+
+Deferred by the maintainer. Assessment posted on the issue: WavLM-large + a
+Kaldi-style GMM-HMM (model.npz ~2 MB, decision trees, projections) + 41k-word
+lexicon + beam Viterbi. Inference code MIT, but model files AND outputs (the
+timestamps) are under the nyra health Non-Commercial Research License with
+share-alike and a contractual-binding clause (3.3) -> would ship as a gated NC
+GGUF; espeak-ng OOV fallback is GPL and cannot be bundled. WavLM exists in-tree
+(MioCodec). Not started.
+
+## CLAIMED 2026-09-26 — §247 shared scheduler profiler, then hidden-F16 audit
+
+Worktree `.claude/worktrees/roadmap-445-438-337-perf`, branch
+`feat/445-orukeet`. The prerequisite model and GPU stages are complete: Orukeet
+and R2T2 (#445), both Hojo checkpoints (#438), and native gfx1100 Vulkan
+Qwen3-TTS (#337) are on `main` with model or hardware proof. The remaining
+sequence is strict:
+
+1. move the FastConformer scheduler callback into `src/core/sched_prof.h` and
+   expose one opt-in profiler usable by scheduler-based runtimes — **DONE**:
+   `CRISPASR_SCHED_PROFILE=1` is wired through Canary CTC, Cohere, FireRed-ASR,
+   Granite Speech, Moonshine, Moonshine Streaming and Paraformer; the legacy
+   `CRISPASR_FC_PROFILE` switch still works;
+2. run the profiler/metadata audit over quantized GGUF families, fix the largest
+   hidden-F16 matmul offenders one at a time, and prove each A/B before defaulting.
+   **NOW:** remote-header audit found Cohere's published Q4 retains 96 F16
+   pointwise matrices (~450 MiB) and FireRed-ASR retains 32 (~300 MiB). Granite
+   and Moonshine have no large F16 residuals; Paraformer's are mostly tiny FSMN
+   kernels. Cohere CPU A/B preserved the transcript and cut the two pointwise
+   op groups from 1663 ms to 638 ms (encoder profile 9658 to 8593 ms), but
+   load-time conversion made a one-shot CLI run 10.06 to 11.09 s. Do not ship
+   the runtime repack; requantize the published artifacts once so users get the
+   inference win without paying conversion on every process start.
+
+## CLAIMED 2026-09-15 — #412 Breeze TTS 2 (backend key `bt2-tts`)
+
+NOW (2026-09-17): **the port is correct.** Run 2 on f16 vs the bf16 oracle:
+**50/55 stages, worst cosine 0.999861**, and not one MODEL stage fails.
+Text encoder 0.999963/0.999970, projection 0.999933, prompt assembly
+0.999957, all 28 backbone layers 0.999997 → 0.999976, codebook-0 head
+0.999992 with argmax 404 = 404, all fifteen depth heads 0.999991 → 0.999861
+with every argmax matching, and frame-0 codes **exact, 16/16**.
+
+It speaks: 3.92 s of 24 kHz audio, ASR roundtrip "The quick brown dot fox
+jumps over the lazy dog." against target "The quick brown fox jumps over the
+lazy dog.", with the oracle's own clip run through the same ASR as the
+control. NC gate refuses `-m auto` without acceptance, by observation.
+`cstr/breeze-tts-2-GGUF` is PUBLIC; LICENSE §4(a)-(d) verified anonymously.
+
+THE ONE TRAP WORTH CARRYING FORWARD: run 1 diffed **q4_k against bf16** and
+read 1/16 frame-0 codes, which sent a whole round of suspicion at the depth
+decoder's llama3 RoPE and head indices. The same code on f16 is exact. The
+tell was in the data — a MONOTONIC cosine decay with layer depth at pinned
+magnitude ratios is the quantizer, not a structural bug, which appears as a
+step at one layer. **Diff the reference-precision artifact first.**
+
+Open:
+1. Run 3 in flight (f16 + fixed tokenizer + regenerated fixture) — expect
+   55/55. The 5 remaining failures in run 2 were all input-side and are
+   already fixed: the ref_codes resampler (harness now feeds both sides
+   24 kHz) and the Gemma tokenizer + missing instruction on the prompt
+   stages.
+2. **q4_k fidelity — RESOLVED 2026-09-17: keep q4_k, change nothing.** The
+   three-way A/B (4 sentences, 1 seed, whisper-scored) gives normalised WER
+   q4_k 0.0357 / q8_0 0.0278 / f16 0.0000 at 2.05 / 3.19 / 5.32 GiB. One real
+   word error each for the two quants, none for f16. The +1.14 GiB for q8_0
+   buys code exactness (16/16 frame-0 codes vs q4_k's 1/16) that demonstrably
+   does NOT reach the audio. f16 is materially better and is published for
+   anyone who wants it.
+   Two things to carry: RAW WER ranked the quants backwards because whisper
+   normalises "seventeen"→"17" and Americanises spellings — the metric now
+   normalises both. And code exactness does not predict audio quality: q8_0 is
+   code-EXACT and still made a real error, so no code-level metric should be
+   promoted into a quality gate.
+3. **CFG multi-branch is NOT implemented** — Voice Clone and plain TTS ship;
+   Voice Design and Voice Direction are REFUSED at three layers rather than
+   silently downgraded. The cache topology and branch index are in place;
+   what is missing is per-branch prompt assembly and the logits combine.
+
+Branch feat/412-breeze-tts-2. Artifacts: cstr/breeze-tts-2-GGUF (f16 5.32,
+q8_0 3.19, q4_k 2.05 GiB), fixture at cstr/crispasr-regression-fixtures
+breeze-tts-2/ (65 stages). Kernels: chr1s4/crispasr-breeze-{refdump,convert},
+chr1str/crispasr-breeze-validate.
+
+## CLAIMED 2026-09-12 — #377 FireRedTTS3
+
+NOW (2026-09-13): converter + refdump + runtime + full wiring DONE on
+branch feat/377-fireredtts3 (7220c67b). f16 GGUFs live on
+cstr/fireredtts3-GGUF (base 4.15 GiB, redae+campp 1.01 GiB, Apache-2.0
+card). Reference ref.gguf on cstr/crispasr-regression-fixtures
+(fireredtts3/jfk_11s). CONTROL ARM done: the Python pipeline's own audio
+transcribes (whisper-base) as 'All there, how are you today?' vs target
+'Hello there, how are you today?' — overlap 0.83. In flight:
+chr1s4/crispasr-fireredtts3-validate (CPU build + per-stage diff with
+noise replay + q4_k + TTS-to-ASR roundtrip).
+
+### 2026-09-13 — the spk_emb divergence was a SHARED CAM++ bug, now fixed
+
+v3 localised it to the embedder half: spk_emb_orafb (the x-vector computed on
+the REFERENCE fbank) failed at cos 0.278 with |mine|/|ref| = 1.67 while the
+fbank itself read 0.9976. Cosine near zero with a magnitude ratio far from 1 is
+a "different class" signature, not precision — and against the ORACLE fbank it
+could only be the network.
+
+Cause: CAM++ `seg_pooling` is `F.avg_pool1d(k=100, stride=100, ceil_mode=True)`,
+and the port divided EVERY window by 100 including the partial tail. Torch
+divides the tail by its own width. Fixed on main (8bf88724), pinned by
+tests/test-campplus-segpool.cpp. It was shared by chatterbox, confucius4,
+cosyvoice3, dots and fireredtts3 — all accepted END-TO-END, which is exactly why
+a tail-only error survived: no acceptance test diffs that stage against upstream.
+
+Result on v5 — the fix was the whole of it:
+
+    spk_emb_orafb   cos 0.277717 -> 0.999997   |mine| 35.09 -> 20.97 (ref 20.96)
+    spk_emb         cos 0.268065 -> 0.999452   |mine| 35.63 -> 20.92 (ref 20.96)
+
+Every other stage passes: penc_prompt / prefill_embeds / llm_prefill_out /
+stop_scores / latents_gen / dec_hidden at cos 1.000000, gen_audio 0.999999.
+
+### The remaining campp_fbank 0.9976 is the RESAMPLER — do not chase it as a bug
+
+campp_fbank reads cos 0.997589 with |mine| 827.1 vs |ref| 821.8 (0.64%). Two
+candidates were tested locally against torch rather than argued:
+
+  - **int16 scaling: ruled OUT.** `kaldi.fbank` on [-1,1] input vs the same
+    input x32768 differs by cos 0.952 / 11% magnitude — an order larger than
+    what we see. And the reference (`extract_kaldi_mel`) feeds torchaudio's
+    [-1,1] floats, so `int16_scale = false` in compute_fbank is CORRECT.
+    (A constant scale mostly cancels under per-utterance mean subtraction; what
+    does not cancel is which low-energy bins hit Kaldi's log floor.)
+  - **Resampler family: CONSISTENT.** C++ resamples 24k->16k with
+    `core_audio::resample_polyphase`; the reference uses
+    `torchaudio.functional.resample`. Running the same clip through both and
+    then through the identical fbank gives cos 0.998250 with a 0.4% magnitude
+    difference — the same order as observed.
+
+Cost downstream is negligible and bounded by measurement: spk_emb on OUR fbank
+scores 0.999452 against 0.999997 on the oracle fbank, so the resampler delta
+costs 0.0005 of embedding cosine. Matching it exactly would mean reimplementing
+torchaudio's Kaiser-windowed sinc, which is not worth it for that.
+
+Next: commit the regenerated docs/feature-matrix.{md,html} and
+src/core/backend_caps_table.h emitted by kernel v6 (a new backend makes both
+stale, and ci.yml:80 runs check-backend-wiring.py), then merge.
+
+Worktree `.claude/worktrees/feat-377-fireredtts3`, branch `feat/377-fireredtts3`.
+Port FireRedTTS3 (FireRedTeam/FireRedTTS3, Apache-2.0) — the last remaining
+model in #377 (Confucius4-TTS and Raon-OpenTTS are already shipped). Base
+variant: Qwen3 LLM backbone over continuous speech representations + redae
+acoustic autoencoder + CAM++ speaker encoder, 16 kHz, zero-shot voice cloning.
+Porting from the OFFICIAL fp32 checkpoint (~8.5 GB); the drbaph int8 mirror is
+Hadamard-rotated comfy-kitchen weights and unsuitable as a conversion source.
+Heavy convert/refdump on Kaggle chr1s4 (chr1str is taken by a parallel task).
+Converter + backend + diff harness + TTS-to-ASR roundtrip acceptance.
+
+## CLAIMED 2026-09-12 — #434 supertonic-3
+
+Worktree `.claude/worktrees/feat-434-supertonic`, branch `feat/434-supertonic`.
+Port Supertonic-3 TTS (Supertone/supertonic-3, ONNX-only distribution:
+text_encoder + duration_predictor + vector_estimator + vocoder, ~400 MB,
+non-AR flow matching, 44.1 kHz). Licence to be re-verified from the HF card
+before shipping. Converter + backend + diff harness (ONNX intermediates as
+reference) + TTS-to-ASR roundtrip acceptance. Heavy build/convert/validate on
+Kaggle chr1str.
+
+## NOW — #416 Sidon quantized models decode to silence (Vulkan MMQ)
+
+Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.
+Reporter Disonantemus: `sidon-v0.1-f16.gguf` restores correctly; `q4_k` and
+`q8_0` write a full-length file of pure silence.
+
+**Localized to the Vulkan MMQ path. Fix + re-quantized artifacts shipped;
+reporter confirmation of the mechanism still pending.**
+
+Reporter's environment (they answered): Arch Linux, Intel i7-4790, **NVIDIA GTX
+1660 SUPER**, release 0.8.31, `ggml backends : cpu,vulkan`. Their own control:
+same model, same clip, `-ng` -> **-20.0 dB** (works), Vulkan -> **-91.0 dB**.
+
+Mechanism: `mul_mat(distance_w, Q)` is the only matmul in sidon whose src0 is a
+quantized weight AND is broadcast (ne2=1) across H=16 heads. ggml routes a
+quantized src0 to the MMQ/Q8_1 pipeline only when the device advertises integer
+dot product (`quantize_y = ctx->device->integer_dot_product && ...`,
+ggml-vulkan.cpp ~8863). Their GPU reports `int dot: 1`. f16 weights never enter
+that path — the "only quantized models fail" signature.
+
+**Correction worth remembering:** an earlier pass declared Vulkan exonerated on
+1536/1536 `test-backend-ops -o MUL_MAT` cases plus an exact-shape probe, run on
+lavapipe. That measured the WRONG code — lavapipe reports `int dot: 0` and the
+local glslc cannot compile `GL_EXT_integer_dot_product`, so the MMQ pipelines
+were never built and only the dequant-to-F16 fallback ran. A green sweep on a
+device whose caps exclude the path under test proves nothing about that path.
+(`GGML_VK_FORCE_INTEGER_DOT_PRODUCT=1` forces the flag, but the shaders still
+need a glslang newer than Ubuntu's 15.1.0 — i.e. built from source.)
+
+Shipped:
+- **Runtime fix** (`6b396bb9`) — gather the 73x64 position table to F32 via
+  `get_rows` before the multiply (not `ggml_cast`: no k-quant CPY kernel on
+  Metal; Vulkan `get_rows` for q4_0/q8_0/q4_K verified via test-backend-ops).
+  f16 output bit-identical (max|diff| 0); q8_0 spectral agreement with f16
+  unchanged. `CRISPASR_SIDON_QUANT_RPE=1` restores the old multiply as the
+  upstream-fix bisection gate.
+- **Quantizer rules** (`f198f967`) — sidon had no entry at all (checklist point
+  8). The position table and the 160x1024 input projection are no longer
+  quantized; neither row is 256-aligned, so both had been silently falling back
+  to legacy Q4_0 under `--q4_k`. 9 Q4_0 tensors -> 0 for +282 KB (+0.12 %).
+- **Re-quantized + re-uploaded** `cstr/Sidon-GGUF` (q8_0/q6_k/q4_k, 2026-09-02).
+  Remote headers verified: all 9 lookup tensors F16 in every published quant.
+  Each decodes correctly under `CRISPASR_SIDON_QUANT_RPE=1` — i.e. the FILES
+  fix affected GPUs on **existing 0.8.31 binaries**, without waiting for a
+  release. Card updated; `license: mit` still set.
+- **Coverage** (`f198f967`) — `env-live-tests.sh` pointed `CRISPASR_MODEL_SIDON`
+  at f16 ONLY, so no quantized Sidon was ever executed. Added
+  `CRISPASR_MODEL_SIDON_QUANT` + a live case, watched failing on injected
+  silence before keeping.
+- **Diagnostics** (`63e7def6`) — a degenerate decode now names the failing stage
+  (predictor vs DAC) and NaN vs all-zero instead of writing a silent WAV rc=0.
+
+Cross-runtime exposure — RESOLVED for two of three. Static reading could not
+answer this: two independent greps each missed sites the other found, and both
+undercounted badly against reality. `core_quant_bcast::audit`
+(`CRISPASR_AUDIT_QUANT_BCAST=1`) walks the real graph at every compute site and
+is the authority.
+
+| runtime | detector, real run | default | evidence |
+|---|---|---|---|
+| beat-this | **29** sites (attn q/k/v/o/gates + BOTH FFN layers, r2=113) | fold **ON** | 29 -> 0; emitted beats BYTE-IDENTICAL |
+| cosyvoice3-tts | **133** per graph (DiT q/k/v/o + both FFN across 22 blocks + proj_out, r2=2 from default CFG batching) | fold **ON** | 133 -> 0; synthesized PCM **bit-identical** (an earlier 'not byte-identical' note was my `cmp` reading the trailing C2PA timestamp chunk, not the audio) |
+| qwen3-asr | **0**, despite `audio.conv_out.weight` being Q4_K 7680x896 and matching the pattern | fold **OFF** | all 7 compute sites hooked, real 66 s multi-chunk run (132 words) — cannot demonstrate the site firing, so not flipped |
+
+Static reading had found 3 sites in beat-this and 1 in cosyvoice3; reality was
+29 and 133. `CRISPASR_{BEATTHIS,COSYVOICE3}_FOLD_BCAST=0` restores the legacy
+path — the gate moved to the OLD path, never removed.
+
+With no env set, sidon / beat-this / cosyvoice3 all now report zero broadcasting
+quantized matmuls. Unit suite 1780/1780.
+
+**Mechanism PROVEN on the affected hardware; only the exact code path is
+unexercised.** Earlier notes here overstated the gap and are corrected.
+
+The reporter ran four arms on their own GTX 1660 SUPER (`int dot: 1`):
+
+| arm | mean_volume | establishes |
+|---|---|---|
+| new GGUF, default | -19.9 dB | re-quantized files fix it with no new binary |
+| old GGUF, default | -91.0 dB | reproduces the original bug |
+| old GGUF, `RPE=expand` | **-20.0 dB** | quantized matmul in GENERAL is fine on that GPU |
+| old GGUF, `RPE=bucket` | -91.0 dB | it is specifically the BROADCAST RPE matmul |
+
+The `expand` arm is the important one, and it does more than isolate the bug:
+`expand` dequantizes the table with `ggml_get_rows(l.distance_w, rel_idx)`
+(sidon.cpp:477) and then does an F32xF32 matmul — the SAME mechanism the fix
+applies at sidon.cpp:520 via `ggml_get_rows(dist_w, bucket_ids)`. So "gather the
+quantized table to F32 before the multiply" is confirmed to fix this ON THE
+HARDWARE THAT EXHIBITED IT. The two differ only in the index shape (T*T vs 73
+buckets) and hence output shape, not in whether a quantized weight reaches MMQ.
+
+Residual risk is therefore narrow and nameable: the fix's specific 73-element
+gather has not itself run on an int-dot device. Vulkan `get_rows` for
+q4_0/q8_0/q4_K at these shapes was verified via test-backend-ops on lavapipe,
+and the detector shows the fix removes every broadcasting quantized matmul
+(sidon 8->0, beat-this 29->0, cosyvoice3 133->0).
+
+**THE FIX SHIPPED IN v0.8.32** (2026-09-04, tag at `26a3d2a6`). It was
+unreleased for two days: 6b396bb9 was not in v0.8.31, which is what the reporter
+runs, so users who downloaded the old quantized GGUFs and never re-download were
+exposed and the runtime fix was the only thing that would protect them. Shipping
+was the concrete remaining action and it is done — v0.8.32 carries 6b396bb9, the
+`core_quant_bcast::audit` detector, and the beat-this / cosyvoice3 folds.
+
+The reporter still has to be told, and the residual risk below is unchanged: the
+fix's specific 73-element gather has still not run on an int-dot device, so this
+issue stays OPEN on evidence, not on shipping.
+
+Verification routes for the exact path, all three now closed with evidence:
+- *local Vulkan* — one build away, glslc solved (LunarG SDK shaderc v2026.3 at
+  /mnt/volume1/tmp-overflow/1.4.357.1/x86_64/bin/glslc; configure prints
+  "GL_EXT_integer_dot_product supported by glslc"). Blocked on memory: ggml's
+  generated mul_mm.comp.cpp is a 122 MB single TU needing ~2-3 GB, while the box
+  holds ~4.3 GB across 17 Claude sessions AND SwapFree sits at ~1%, so
+  MemAvailable is not the binding constraint and a build can OOM-kill another
+  session (one peer lost its context this way). Use clang (peak 1.16 GB vs gcc),
+  -j1, and 4a's `set_source_files_properties(... "-O0")` on the shader TUs.
+- *Kaggle Vulkan* — dead structurally: no NVIDIA ICD, only llvmpipe; installing
+  libnvidia-gl-580 places nvidia_icd.json and then enumerates ZERO devices.
+- *Kaggle CUDA* — not answerable today: ~20 consecutive P100 draws across both
+  accounts (sm_60 is below `GGML_CUDA_CC_DP4A == 610`, so MMQ is off). The
+  fail-fast guard made each bad draw ~1 min rather than a wasted run.
+
+
+
+Open: (a) reporter to run `CRISPASR_SIDON_RPE=expand` vs `=bucket` (confirms the
+op); (b) `tools/kaggle/sidon-quant-cuda/` — three arms per quant (fixed graph on
+CUDA, pre-fix graph via the gate, CPU control) answering whether CUDA's MMQ
+shares the defect and whether the fix regresses CUDA.
+
+## 2026-09-02 — #387 Quds v4 Persian ASR: ported from the author's ONNX export
+
+Worktree `.claude/worktrees/feat-387-quds`, branch `feat/387-quds-fa`.
+Author added CC-BY-NC-4.0 (license IS the redistribution permission — the
+voxtral precedent) but only ships ONNX. Ported directly from it:
+
+- `models/convert-nemo-rnnt-onnx-to-gguf.py` — generic NeMo FastConformer-
+  RNNT ONNX→GGUF (parakeet contract): anonymous `onnx::{MatMul,Conv,LSTM}_*`
+  initializers recovered via consumer-node scopes, MatMul [in,out]→[out,in],
+  ONNX LSTM iofc→torch ifgo unpack, folded-BN → identity stats, fb/window
+  COPIED from the CC-BY-4.0 NVIDIA base .nemo (never recomputed).
+- Runtime: single-LSTM predictors (pred_layers=1, no CTC) now decode on both
+  the CPU and ggml RNNT paths (was: 2 layers hardcoded; the old CTC fallback
+  comment is now a hybrid preference, not a requirement).
+- Backend alias `quds`/`quds-fa` → parakeet runtime; registry entries (q8_0
+  default) with the CC-BY-NC-4.0 acceptance gate + attribution.
+- HF: cstr/quds-v4-fa-GGUF (f16 219M / q8_0 122M / q4_k 77M), card license
+  verified landed.
+
+Validation (decoded-output first, real audio): 5 Common Voice fa clips
+(CC0) — q8_0 and f16 transcripts BYTE-IDENTICAL to the upstream ONNX under
+onnx_asr (the model card's own runner) on 4/5; on cv0 ours keeps an onset
+word the reference drops (closer to the human sentence — their front-end
+trims onsets, not a port defect). q4_k shows minor word drift (documented
+on the card; q8_0 is the default). Out-of-domain English (jfk) diverges
+after a shared prefix — near-tie flips on garbage input, per the MOSS
+lesson. `samples/fa-common-voice.wav` (CC0, 3.2 s) + exact-transcript
+live test `test-quds-fa-live.sh` lock it.
+
+Follow-ups: CTC head when the author uploads the .nemo; feature-matrix
+regen rides the next docs pass (file is dirty in other sessions' flows).
+
+## 2026-09-01 — #419 aligner romanization leaked into display text (FIX)
+
+Worktree `.claude/worktrees/fix-419-canary`, branch `fix/419-canary-cyrillic`.
+
+Reporter (Subtitle Edit, Windows): canary `-l ru` output clean translit
+("vikingi, otvazhnye voyny") instead of Cyrillic. Reproduced on Linux CPU —
+NOT platform-, quant-, or sensitivity-dependent: the trigger is any flag
+that wants word timestamps (`-sp`/`-sow`/srt/vtt/max-len/print-colors),
+which auto-enables the canary-ctc-aligner with force_aligner. Exonerated
+first (worth recording): GGUF vocab == upstream tokenizer.json exactly
+(<|ru|>=157, 2175 Cyrillic pieces at identical ids), prompt construction,
+sensitivity presets, GPU.
+
+Root cause: `crispasr_align_words` romanized the WHOLE transcript
+(core_uroman, #252 — needed as labels for Latin-vocab CTC aligners) and
+returned the romanized strings as the aligned words' TEXT. Display paths
+that rebuild text from words then showed the romanization — Cyrillic AND
+CJK (ja/zh srt output got romaji/pinyin — wider blast radius than the
+report).
+
+Fix: tokenise the ORIGINAL transcript, romanize per-word (1:1) as the
+aligner's labels only, map original words back onto aligned timings
+(`restore_text`, size-guarded) for all three arms (qwen3-fa, wav2vec2,
+canary-ctc). Verified: -sp / reporter's full flags / -osrt all emit
+Cyrillic with correct timings; uroman label-safety unit test added
+(per-word romanization stays single non-empty tokens). Unit suite rerun
+pending RAM headroom (box contended).
+## 2026-08-29 — #409 silero-LID garbage languages on hard audio: confidence gate + whisper fallback
+
+Worktree `.claude/worktrees/fix-409-lid`, branch `fix/409-lid-confidence`.
+
+Root cause is NOT a port bug. Reproduced on stock samples: jfk.mp3 → 'yo'
+(logp -3.46) while the same speech as wav/opus/vorbis-webm → 'en' (-0.79 to
+-0.29); ko-369.wav → 'zh-CN'. The CONTROL ARM settles it: the upstream ONNX
+(deepghs/silero-lang95-onnx, onnxruntime venv ~/venvs/onnx-lid) produces the
+SAME wrong answers with the same top-5 ordering (jfk.mp3 → yo -3.35/en -4.23;
+ko-369 → zh-CN -5.14). Both C++ arms (ggml + LEGACY=1) agree with each other
+to 3 decimals and track the reference — the silero-lang95 model itself
+collapses to near-uniform on codec-artifacted / hard audio, and #409's
+'be' p=-7.455 (=0.06 %) on French OGG is that collapse being TRUSTED.
+Also ruled out for #409: Vulkan (the v0.8.30 build already routes this graph
+to CPU via the CRISPASR_SILERO_LID_VULKAN guard) and our audio decoders
+(ffmpeg-decoded jfk.mp3 fails identically).
+
+Fix, split across two sessions (cross-session coordination 2026-08-29):
+- fbe39169 (session 01Fn…): silero out_confidence becomes the softmax
+  PROBABILITY (whisper-arm contract). Important negative result from the
+  full-vector softmax: the probability does NOT separate the failures —
+  jfk.mp3 reads yo at p=0.578, ko-369 reads zh-CN at p=0.627 — because the
+  whole logit vector deflates and softmax renormalizes noise into fake
+  confidence.
+- e9f767d7 (same session, to this session's spec): evidence floor on the
+  RAW top logit inside silero_lid_detect — env CRISPASR_SILERO_LID_MIN_LOGIT,
+  default -2.0 (observed separation: correct >= ~-1.1, every failure
+  <= -3.35; free-energy OOD scoring), stderr note, returns null.
+- this branch: crispasr_lid_cli.cpp falls back to whisper-tiny LID when
+  silero comes back inconclusive/failed (both the gguf-native and sherpa
+  arms; CLI and server share the path — whisper on the same jfk clip:
+  en 0.977). C-API callers see rc=1 (no detection) per contract.
+  Docs: cli.md evidence-gate note + environment-variables.md row.
+
+Relation to the "silero-lid audio arm misclassifies (pa-in)" NOW entry
+above/below: that C-API-path repro could NOT be reproduced via the CLI here
+(both arms say en on jfk.wav); if pa-in is real it lives in the caller's
+input conditioning, not the LID compute — coordinated with the owning
+session via cross-session message 2026-08-29.
+## 2026-08-29 — #404 resolution: --stream-partial-tail-sec (text-level streaming incrementality)
+
+Worktree `.claude/worktrees/feat-stream-tail`, branch `feat/stream-partial-tail`.
+
+**The architectural verdict that settles the RFC:** the cohere encoder is a
+Conformer with UNMASKED Transformer-XL relative-position self-attention over
+the whole window in all 48 layers (`cohere_rel_shift`, `pos_enc [d, 2T-1]`).
+Every cached frame's encoding depends on audio that arrives later, so the
+RFC's activation-level delta cache (cross-KV trim + T_guard splice) can never
+be transcript-exact — T_guard=floor(K/2) covers the conv modules only, and
+attention influence is unbounded. Its measured wins are real but the approach
+is structurally approximate, plus per-model splice state forever.
+
+**The exact alternative (this branch), at the orchestration layer:**
+- Finals stay bit-exact — `--stream-final-mode redecode` (default) re-decodes
+  the buffered utterance PCM; that path is untouched.
+- `--stream-partial-tail-sec N` (default 0 = off) bounds each live PARTIAL
+  decode to ~the last N s of the open utterance. The region behind the cap is
+  decoded once, cut at the quietest 100 ms (`find_energy_min_split`, same
+  policy as the long-audio chunker), its post-processed text promoted into a
+  per-utterance committed prefix; `partial.text` = committed + tail via the
+  existing `stitch_partial_accumulator`. Pure planner
+  (`crispasr::plan_partial_tail` in crispasr_stream_finalize.h) with unit
+  tests; per-utterance state resets at open/finalize.
+- Measured cost model (VPS, 4-core CPU, cohere q4_k): encode ≈ 22 s constant
+  (weights-bandwidth: 1.5 GB streamed per graph) + ~0.22 s per encoder frame.
+  So on CPU the decode COUNT dominates (use `--stream-partial-decode-ms`);
+  the tail cap's per-decode saving dominates on GPU (the RFC's own Vulkan
+  numbers: cost ≈ 18 ms + ~11 ms/s of window). Also measured: enc graph
+  build+alloc = 41 ms vs 32.6 s compute on CPU (0.13 %) — the RFC's "graph
+  reuse" option A is a GPU-only lever, not worth CPU complexity.
+
+Proofs (2026-08-29, cohere q4_k on the VPS; wall-clock void — shared box —
+so judged on the load-independent telemetry + byte equality):
+- jfk2 (6 utterances) 3-arm off/memo/memo+tail: finals AND partials
+  byte-identical across all arms; memo cut decoded audio 43.42s → 38.82s
+  (−10.6 % on a short clip; grows with window/slice count). First run
+  caught a real bug via the debug trace: a GLOBAL anchor was poisoned
+  across VAD slices in multi-slice steps (0-length decode, lost prefix,
+  and a partly FABRICATED speedup — the 4a lesson). Fixed: cap applies
+  only to the growing slice + stale-anchor guard + regression unit test.
+- long-utt (12.3 s continuous synth sentence): commits engage (3 anchor
+  advances at energy-min cuts), stitched partial covers the WHOLE
+  utterance under a 4 s decode cap, final byte-identical to the off arm.
+  Seam artifacts in partials are cosmetic (capitalization/periods at
+  join points — documented); finals replace them.
+- 14 planner/stitcher unit cases green; full unit label green.
+
+## 2026-08-29 — external PRs #408 + #406 merged (with fixes); #404 stays open
+
+Worktree: `.claude/worktrees/integr-prs`, branch `integr/prs` (merge commits
+preserve contributor authorship).
+
+**#408 (tilllt) — `GET /progress`** merged, then hardened: the
+`progress_scope` moved INSIDE the model-mutex block (a request queued behind
+a running job used to reset the live job's progress to 0, and the first
+finisher flipped the server "idle" while the second still ran); busy is now
+an active-job COUNTER so it stays honest under `--server-workers`; the chunk
+loop claims a chunk when it STARTS (`i`, not `i+1` — which read 100 while the
+last chunk was still decoding) and pins 100 through the diarize/punc/truecase
+tail; the route is auth-gated like /backends (only /health is public);
+contributor's "Change 150 (polyschnack)" German comments replaced; endpoint
+documented in docs/server.md ("Progress endpoint").
+
+**#406 (jltjarvinen) — packed SIMD Conv1d (Chatterbox F0 + HiFT ResBlocks,
+CosyVoice3 HiFT)** merged as-is: it already follows the house rules — opt-in
+env gates (`CRISPASR_S3GEN_SIMDCONV`, `CRISPASR_COSYVOICE3_SIMDCONV`, plus
+`*_DEBUG`), default ggml path untouched, engages only when the vocoder is
+CPU-resident, load-time pack with full rollback on any unexpected tensor,
+runtime ISA dispatch (scalar/NEON/AVX2/AVX-512F via target attributes, so no
+portable-CPU-baseline violation), fp-contract off + fixed K→IC reduction
+order for scalar/SIMD parity, hermetic unit tests for both adapters. F0's
+k=3 conv was refactored onto the shared `core/cpu_packed_conv1d.h` (covered
+by the pre-existing `test-chatterbox-f0-simd` suite). Author measured
+~20–25 % CPU HiFT reduction on Zen 4. Follow-up before any default flip:
+Kaggle A/B under identical load + TTS→ASR roundtrip per HARD RULE 4 (local
+roundtrip proof for chatterbox in this merge's validation, below).
+
+**#404 (CKwasd) — cohere streaming delta encoding RFC** NOT merged, by the
+author's own framing ("proposal, not ready-to-merge"): the delta chain
+replaces the full-encode streaming path UNCONDITIONALLY (no env gate — the
+one hard blocker), clang-format job is red, and the 11-point A/B matrix is
+partially `pending_re-run`. Direction to give: stage it, P0 ring-buffer +
+VAD-throttle first (uncontroversial), delta encode behind
+`CRISPASR_COHERE_DELTA=1` with the full-encode default retained, acceptance
+= transcript equality vs the full-encode path over long audio, not wall
+clock.
+## CLAIMED 2026-08-28 — #397 Windows first-run recovery and release proof
+
+Worktree: `.claude/worktrees/fix-397-windows-release-proof`.
+Correct the missed diagnosis in #397 (the reporter's v0.8.29 Windows CUDA
+`ggml-cpu.dll` executes AVX-512 at the exact dumped `+0x98e9` offset, already
+root-caused in #374), make the beginner PowerShell path genuinely copy-pasteable,
+and stop describing every SIGILL as user CPU error. Add post-package gates that
+prove an AVX2 artifact contains no ZMM instructions and embeds the release tag's
+SHA, plus a Windows archive E2E that runs the exact packaged CLI through Kokoro
+TTS and a Parakeet round-trip. Audit the in-flight v0.8.30 repair run and its
+asset provenance before declaring the release stable.
+
+## CLAIMED 2026-08-26 — #395 FoxNose turns were unreachable from the C ABI
+
+Additive plumbing of a value the library already computed. `apply_foxnose`
+labels each caller segment with the turn it overlaps MOST, so a segment
+straddling a speaker change was silently awarded to the majority speaker —
+and callers could not send a finer grid either, because FoxNose skips spans
+under `kMinSegmentSeconds = 0.4 s`. The C++ entry point had exposed the
+audio-derived turns since #324 (`out_turns`); the C ABI was the one layer
+that dropped them, so no Rust/Dart/Go/Python consumer could see them.
+
+Landed: `crispasr_diarize_segments_turns_abi` (a NEW symbol — the existing
+ABI is untouched, same append-only convention as `crispasr_diarize_opts_abi`)
+plus `crispasr_diarize_turn_abi`, the `crispasr-sys` `extern "C"` mirror with
+a layout test, and `crispasr::diarize_segments_with_turns` in the safe crate.
+Turns come out in centiseconds on the CALLER's absolute timeline
+(`slice_t0_cs` added back), so they compare directly with the caller's
+segments. Truncation follows the `crispasr_detect_language_pcm` house style:
+rc 2, with `*out_n_turns` holding the required capacity; the Rust wrapper
+sizes from the audio length (one slot per 0.5 s, above the 0.6 s embedding
+hop) and retries once, so callers never see it.
+
+Tests: model-free contract in `tests/test-session-abi-nulls.cpp` (validation,
+"no turn buffer == the older symbol", 0 turns from the methods that derive
+none) and `tests/test-diarize-foxnose-turns-live.cpp` for everything that
+needs REAL turns — well-formedness, the truncation protocol, the
+`slice_t0_cs` shift, and "asking for turns does not change the labels".
+Opt-in via `CRISPASR_TEST_FOXNOSE_WAV` + `CRISPASR_TEST_FOXNOSE_EMBEDDER`;
+verified locally on `samples/multispeaker.wav` + wespeaker-resnet34-lm, where
+the fixture does exercise a segment covering two speakers. Same pair of
+levels on the Rust side in `crispasr/tests/integration.rs`.
+
+Follow-up completed 2026-09-06: Go, Python, and Dart now size and retry the
+turn buffer and expose typed turn results; Java declares both calls on its
+low-level JNA surface. The Python audit also found and repaired a separate
+ABI bug: its options mirror had remained at 24 bytes after FoxNose extended
+the native append-only struct to 48 bytes. JavaScript and Ruby have no public
+standalone diarization API today (their unused C declarations were previously
+mistaken for binding support), so there is no turn-returning surface to extend.
+
+## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
+
+Root cause found + fixed 2026-08-19: NOT `73bb9b2f` (exonerated,
+byte-identical) but glint's AAC-LC decoder — window_shape discarded + TNS
+mis-decode → every real-world .aac at ~17 dB SNR since glint became the first
+AAC decoder (`f3d82d30`). Fixed upstream (glint `77738f3`), synced in-tree
+(`0e5d1344`), Tier-3 foreign-decode gate red-verified in glint. Awaiting the
+reporter's input-format confirmation on #375; full trail in
+`docs/handover/375-canary-streaming-regression.md` (fix-wiring branch).
+
+**Canary seam artifacts (pre-existing, #365/#375 fallout): FIXED by porting
+the actual blueprint.** The 8 s / 2 s LCS-prefix streaming was parakeet
+machinery grafted onto canary; canary-1b-v2's own `.transcribe()` does
+dynamic 30..40 s raw-waveform chunks with a 1 s overlap, per-chunk
+normalization, and an LCS-alignment merge (`lcs_alignment_merge_buffer`,
+`_find_optimal_chunk_size` — both ported exactly into
+`core/canary_chunk_merge.h`, pinned by `tests/test-canary-chunk-merge.cpp`
+against vectors generated from the nemo 2.7.3 Python functions). jfk_x12
+(quote ×12) now transcribes as 12 clean repetitions (legacy gate reproduces
+`ask not Ask not` ×2 etc.); fleurs_600s has zero repeated n-grams in 925
+words. Old path gated `CRISPASR_CANARY_LEGACY_STREAM=1`
+(CRISPASR_CANARY_SEAM_DEDUP applies only there). Both CLI and session
+surfaces route through the library.
+
+Decoded-output acceptance vs the Python blueprint (HARD RULE 3, Kaggle
+kernel `tools/kaggle/canary-blueprint-ref/`, nemo 2.7.3 CPU, bf16 vs our
+q4_k): word similarity jfk_x12 **1.000** (264/264), fleurs_60s **1.000**
+(92/92 — incl. the dropped trailing incomplete sentence, which the
+blueprint drops identically), fleurs_600s **0.982** (925 vs 936 words;
+diffs are proper-noun spellings + one boundary sentence — quantization-
+class variance, zero repeated bigrams on either side). Main CI green on
+the port tree.
+
+Still open on the general quality front (separate from #375): the
+pre-existing linear-resampler gap on 44.1/48 kHz compressed input via the
+glint decode paths (~28 vs ~38 dB after the decoder fix).
+
+**Canary speed audit (2026-08-19, M1 Metal, warm medians).** GPU default is
+19–25× RT (132 s in 5.34 s); CPU `-ng` is 2.7× — any doc/bench quoting ~2×
+was a `-ng` run. Quant A/B on the same clip: **q4_k is the fastest**
+(enc 399 / dec 230 ms) vs q8_0 (418/297) vs F16 (382/380) — the decoder is
+weight-bandwidth-bound, the encoder quant-INVARIANT, i.e. compute-bound at
+~600 effective GFLOPS (≈ M1 mul_mm ceiling for ~680 GFLOP per 34 s chunk of
+the 32-layer FastConformer): no encoder headroom on this hardware. Cross-KV
+already lives on the decode backend (the "CPU buffer" comment at
+`canary_build_cross_kv` is stale). Two real levers remain, both proper
+graph projects with mandatory byte-identical Metal+CPU A/B and Kaggle CUDA
+validation before any default flip:
+1. **Persistent decoder step graph** — `canary_decode_step` rebuilds +
+   sched-allocs per token (~4.2 ms/tok on Metal, mostly build/alloc/launch,
+   not FLOPs). The `core_rnnt_ggml::Decoder` pattern took parakeet decode
+   5.3× / nemotron 12.4× on P100; here decode is ~35 % of GPU wall →
+   est. ~1.3× total on Metal, more on CUDA.
+2. **Chunk-batched encode/decode for long-form** — the NeMo blueprint runs
+   chunks at batch_size=8; we encode+decode the 30–40 s chunks
+   sequentially. Mostly a CUDA/utilization win.
+
+## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
+
+Worktree: `.claude/worktrees/review-pr-352`.
+Review PR #352 end to end, validate that its long-form routing and gap repair
+do not regress any language path, add targeted unit/live coverage where needed,
+and merge or improve the change after local/SSD validation.
+
+## OPEN 2026-08-19 — vibevoice-asr 7B answers "[Silence]" on time-stretched audio
+
+The transcript-side damage is FIXED (`3b1bc0b2`, see HISTORY): `[Silence]` is a
+Content value the MODEL emits and we no longer pass it through as transcript
+text, so it cannot reach an SRT or suppress the empty-transcript warning.
+
+Still open: why the 7B says it at all. Both members of the reporter's atempo pair
+(`ko-test` stretched 3.26 s -> ~6 s at atempo 0.535 / 0.525) come back with no
+utterance, on CPU and CUDA, in EVERY arm including one with all four #369 fixes
+rolled back — so this is not something we introduced. The 1.5B BitNet checkpoint
+transcribes the same two files, so it is specific to the 7B. A 2x time-stretch is
+not exotic input, and a long recording containing a slow passage would lose it.
+
+Next: dump `speech_features` for a stretched clip against its unstretched
+original. The encoder is trustworthy now (cos 0.999926 vs upstream's own
+modules), so if the conditioning matches, the divergence is the LM's. Also check
+the prompt's duration string ("This is a 6.11 seconds audio") against the 46
+speech tokens for an inconsistency the model could read as "mostly empty".
+
+## OPEN 2026-08-19 — vibevoice-bitnet advertises caps its default output cannot support
+
+Fallout from `51b99d1b`, recorded rather than fixed on the way past. The 1.5B now
+gets its own plain-text instruction, and in that mode it returns prose rather
+than the JSON array — which is what "plain text output" means upstream. So there
+are no per-utterance timings and no speaker labels, while `vibevoice-bitnet`
+still declares `CAP_DIARIZE` and `CAP_TIMESTAMPS_CTC`.
+
+That is the same class of false claim as the `CAP_TEMPERATURE` removed in
+`23107227`: a capability bit is a promise about output the framework then acts
+on. Two defensible fixes and they need a decision, not a reflex:
+  (a) drop both caps for the 1.5B — honest, and `--diarize` then warns; or
+  (b) have the adapter switch to `CRISPASR_VIBEVOICE_ASR_PROMPT=json` when the
+      user actually asks for diarization or timestamps, trading the non-English
+      quality back for the structure they asked for.
+(b) is friendlier but makes output quality depend on an unrelated flag, which is
+the kind of thing that gets rediscovered as a bug later.
+
+## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
+
+`vibevoice-asr-bitnet-*` (TQ2_0 LM weights) yields an EMPTY transcript on Metal:
+
+    ggml_metal_library_compile_pipeline: failed to compile pipeline:
+      base = 'kernel_mul_mm_tq2_0_f32'
+    Error: Function kernel_mul_mm_tq2_0_f32 was not found in the library
+
+`ggml/src/ggml-metal/ggml-metal.metal` contains ZERO occurrences of `tq2_0` — no
+`mul_mm`, no `mul_mv`, no dequant — and `ggml-metal-device.m` has no TQ2_0 entry
+either. The type is not supported at all, yet a pipeline for it is still
+requested, so it fails hard instead of falling back.
+
+Same clip, same build, only the backend differs:
+
+    ko-mic-cue-kept.wav   CPU (-ng) -> 내일 오전에 회의 자료 교육 보내주세요.
+                          Metal     -> (nothing; pipeline compile error)
+
+Impact: every Metal user of a TQ2_0 model gets silence. Ternary/BitNet GGUFs are
+what people reach for on laptops, so this is the wrong platform to be missing.
+
+Two questions before fixing: (a) why is a TQ2_0 matmul scheduled onto Metal when
+the device declares no support — a type absent from the support switch should
+route to CPU, so something is bypassing that; (b) whether the fix is a real
+`kernel_mul_mm_tq2_0_f32` (check upstream ggml first — it may already exist) or
+an explicit unsupported-declaration so the scheduler falls back cleanly. The
+second is small and unbreaks the platform immediately.
+
+Found while reproducing #369, and NOT that issue's cause: the reporter is on
+Windows CPU/Vulkan and sees wrong-language output, not silence.
+
+## TRIAGED 2026-09-12 — #436 X-ASR + Dolphin-CN-Dialect (both NEW architectures)
+
+Reporter xbin9679-lab asks for two ASR models. Licences are clear (both
+Apache-2.0, checked via the HF API, not inferred from the card text). The cost
+is that NEITHER fits a runtime we already have:
+
+- **X-ASR** (`GilgameshWind/X-ASR-zh-en`) — tags say
+  `x-asr-zipformer-transducer, icefall, k2, sherpa-onnx`. We have **zero**
+  zipformer code (`grep -rli zipformer src/ models/ tools/` → 0 files). The k2
+  hits in this repo are `k2-fsa/OmniVoice`, a TTS model, and coincidental.
+  Zipformer is not a FastConformer variant: downsampling stacks, bypass
+  connections and Swoosh activations are all structurally different, so
+  `parakeet.cpp` is a template at best, not a base.
+  ONE REAL LEVER: it ships sherpa-onnx exports, and #387 (Quds) established the
+  pattern for porting from an ONNX-only release —
+  `models/convert-nemo-rnnt-onnx-to-gguf.py` recovers anonymous initializers by
+  tracing consumer scopes. That converter is FastConformer-contract, so it is a
+  precedent rather than a tool that will just work here.
+
+- **Dolphin-CN-Dialect** (`DataoceanAI1/dolphin-cn-dialect-small-streaming`) —
+  ships `global_cmvn`, `train.yaml`, `units.txt`, `small.cn.streaming.pt`, which
+  is the WeNet layout. Our only wenet-e2e code is `src/wespeaker.cpp`, a speaker
+  EMBEDDER — it shares an upstream org and nothing else. A WeNet U2++
+  conformer encoder/decoder is a new runtime.
+
+So: two new encoder families, each a multi-day port on the scale of #387/#250,
+not an afternoon. Worth doing — both are permissive and fill real gaps (Chinese
+dialects; streaming zh-en) — but scope it honestly before claiming it.
+
+Prerequisite either way, per HARD RULE #1: read the icefall / WeNet inference
+path line by line first. Streaming models in particular hide their chunking and
+cache contracts in the inference loop, not in the config.
+
 ## Start here
 
 Live work only. Completed threads move to `HISTORY.md`; technical deep-dives to
@@ -11,462 +719,43 @@ to main before you start**. Several agents run here at once; a claim that lands
 with the work is a claim that did nothing. Delete it when the work lands, or if
 it goes stale for more than a day.
 
-## LANDED 2026-08-07 — #13273 omnivoice language knob, dead on three surfaces
+## CLAIMED 2026-08-13 — #350 parakeet non-JA long-form drops whole spans
 
-Full write-up: `docs/omnivoice/PLAN.md` §LANDED 2026-08-07. Fixed the CLI
-adapter (language applied only in `init()`, so a persistent server could never
-change it per request), the session C-ABI arm (#329's bug one backend over), and
-the runtime (no `_resolve_language()` mirror, so `de-DE` or a typo went into
-`<|lang_start|>` verbatim). Guards: `tests/test-omnivoice-lang.cpp` — predicate
-AND joins, all four join assertions watched red first.
+Worktree: `.claude/worktrees/crisp-asr-issue-filing-0ca183`.
+Two defects behind one symptom on parakeet-tdt-0.6b-v3 (30-300 s, non-JA):
+the unified dispatch read `chunk_seconds = 0` (documented "per-model defaults")
+as "not chunked" and ran an explicitly chunked session call as one unbounded
+pass; and the TDT decoder drops whole spans past ~30 s at any routing, so no
+cap alone fixes it. Fix = a `chunked_requested` flag that caps such calls at
+the reliable window, plus a shared gap-fill repair pass over holes in the word
+timeline. Reporter's clip: 66 % → 95 % coverage (CLI), 66 % → 100 % (session
+chunked API); jfk×21 regression guard added.
 
-**Two things to know before touching this again:**
+## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata review and validation
 
-- **A/B omnivoice on CODES, never on the WAV.** Output is watermarked and
-  carries a spoken disclaimer, so `cmp` on audio differs for every render
-  including two that should match. Use `CRISPASR_OMNIVOICE_DUMP_CODES` with
-  `--no-spoken-disclaimer --accept-marking-responsibility`, and include a
-  control arm whose expected answer is IDENTICAL.
-- **The accent half of the report is NOT fixed and may not be fixable here.**
-  whisper LID cannot separate tagged from untagged output (accent-robust by
-  design; the one sentence that moved was noise), and OmniVoice has no
-  cross-lingual drop-ref path to port #329 into. Needs a listener, not another
-  metric.
+Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`.
+Audit PR #345, verify the additive C ABI and failure contracts, and run the
+hermetic plus available model-backed/live tests before deciding whether any
+changes are needed.
 
-**SE-side gap, no longer blocking:** `OmniVoiceCrispAsr.Speak()` accepts the
-language and never puts it in the payload. Worked around on our side —
-omnivoice guesses the language from the target text when nobody supplies one
-(`CRISPASR_OMNIVOICE_AUTO_LANG`, default ON; explicit always wins), verified
-byte-identical to an explicit `-l de` against the exact SE request shape.
-Sending the field is still better (exact, covers languages the detector does
-not); snippet is on the issue, but nothing here waits on it.
+## CLAIMED 2026-08-31 — next release (#411 implementation complete)
 
-**Honest residual, closed cheaply:** the style-token live test pins ids from a
-tokenizer run; a red test alone could not say which side moved. Now it can —
-the test header records the upstream revision (`c5fdb5cc`) + tokenizer.json
-sha256 and the one-command disambiguation, all 9 pins re-derived byte-identical
-2026-08-07. Vendoring the 7 MB tokenizer.json remains not worth it.
+Worktree: `.claude/worktrees/feat-pocket-multilingual`.
+#411 shipped on main with all five F16/Q8_0 artifacts and hosted decoded-output
+proof (run 33371566746); see HISTORY.md. Comprehensive v0.8.31 notes are drafted.
+Cut the version only after the final tip is green.
 
-### Ready to take — scoped, unblocked, nobody on them
+## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
-| # | Task | Size | Where |
-|---|---|---|---|
-| 1 | **Delete the duplicated fallback copies** instead of keeping 14 files in sync | M | §"OPEN follow-ups from #300 / #308" item 3 |
-| 2 | **`CAP_PUNCTUATION_NATIVE` audit** for `lfm2-audio`, `fastconformer-ctc`, `wav2vec2` | S | same section, item 2 |
-| 3 | **#326 speaker-count estimator** — the last diarization accuracy item | M | §"NOW — #326" |
-| 4 | **VAD + mel front-end parallelization** — remaining backends | M | §"NOW — VAD + mel" |
-| 5 | **Diff harness: per-step talker logits** — validates the sampler over verified logits | M | §"Diff-harness extensions" |
-| 6 | **Diff harness: replay-token dual-mode** — makes sampling-dependent stages diff deterministically | M | §"Diff-harness extensions" |
-
-### Blocked, and on what
-
-| Task | Blocked by |
-|---|---|
-| **Stamp the kartoffel repos** (§below) | Disk. `/Volumes/backups` has ~1.8 GB free of 1.9 TB; `ai/cache` alone is 347 GB. Needs ~15 GB. Everything else it needs is built and proven. |
-
-### Machine state a newcomer will trip over
-
-- **Disk is effectively full** (above). It is also a hazard: several agents build
-  here concurrently and a full disk kills processes rather than failing cleanly.
-- **Load spikes to 100+.** Time-based test assertions and tight ctest timeouts
-  fail here for reasons that have nothing to do with the code. A `TIMEOUT` is a
-  backstop against a hang, not an assertion about speed — size it for the worst
-  machine, not the median one.
-- **Worktrees need `git submodule update --init --recursive ggml
-  third_party/c2pa-audio`.** `ggml` is a submodule, so a fresh worktree has it
-  empty and cannot configure, let alone build.
-- **`ls build/src/libcrispasr*.dylib | head -1` picks a STALE versioned dylib.**
-  Use `ls -t`. Two binding-parity tests "failed" on this until the tell was
-  noticed: another agent's brand-new symbol was missing too.
-- **CI runs are cancelled constantly, and `cancelled` is not `success`.** With
-  several agents pushing to `main` every few minutes, each push cancels the
-  previous commit's in-flight Lint/CI/Ruby — a run can sit at `cancelled` all
-  day and never verify anything. Do not chase green on HEAD. Verify locally
-  (`ctest -L unit`, `tools/format.sh --check`, `tools/check-readme-langs.py`,
-  `tools/check-kaggle-harness-sync.py`) and treat a LATER run that *contains*
-  your commit as the real signal. Gotcha when scripting that check: `gh run
-  list` returns a full 40-char `headSha`, so comparing an 8-char prefix matches
-  nothing and makes a wait-loop exit instantly, looking like "it finished".
-
-### Conventions worth knowing before you write a test
-
-Earned the hard way; each cost a real bug getting through.
-
-1. **A gate CI cannot run is a gate that ships wrong.** Compliance and policy
-   logic belongs in weight-free headers with unit tests, not only behind a live
-   server.
-2. **Prove the gate can go red.** Re-introduce the thing it forbids and watch it
-   fail. Every guard in `tests/test-compliance-wiring.cpp` and
-   `tests/test-copies-in-sync.cpp` was verified this way — and that pass has
-   caught more broken *tests* than broken code.
-3. **Assert the token that only exists when the behaviour does.** Never one that
-   also appears in prose, a help string, a comment, or an unrelated function.
-   Four separate guards passed while the behaviour was gutted because they
-   matched a substring that survived.
-4. **Guard the joins, not just the predicate.** Every compliance failure in this
-   repo's history happened while the pure predicate tests were green: missing
-   call sites, unstamped bakers, ungated endpoints.
-5. **A hand-maintained list needs a machine check that it is complete.** The
-   copies-in-sync guard covered 1 of 14 files for months — not a wrong entry, a
-   missing one.
-
-## LANDED 2026-08-06 — #335 `Session::open()` could not open granite-speech
-
-Root cause is NOT granite-specific. The `general.architecture` → backend table
-existed **twice** — `examples/cli/crispasr_backend.cpp` pass 2 and
-`crispasr_detect_backend_from_gguf()` in `src/crispasr_c_api.cpp` — and the two
-had drifted by **113 architecture strings**. Every granite-speech GGUF carries
-`general.architecture = "granite_speech"` (underscore; that is what
-`models/convert-granite-speech-to-gguf.py` writes, confirmed by range-reading
-the header of the published `granite-speech-4.1-2b-plus-q4_k.gguf`), and the
-C-ABI copy only knew the hyphen spelling → detect returned `""` →
-`crispasr_session_open` returned NULL for every binding. The CLI never noticed
-because its **filename** pass matches `granite`+`speech` and short-circuits
-pass 2 — so **auto-detect working in the CLI proves nothing about the
-bindings**, and that is the durable lesson here.
-
-granite was one of many: nemotron, moonshine, kokoro, piper, melotts,
-sensevoice, funasr, paraformer, glm-asr, kyutai-stt, mini-omni2, csm, dia,
-bark, speecht5, fastpitch, pocket-tts, gemma4-e2b, mimo-asr, voxtral-tts,
-piano-transcription and more were CLI-only too — no binding could auto-detect
-any of them.
-
-Fix: one shared table, `src/core/arch_backend_map.h`, read by both surfaces.
-`tests/test-arch-backend-map.cpp` pins it and drives the real C-ABI export over
-a synthesised metadata-only GGUF (hermetic, no models) — deleting the
-`granite_speech` row makes it fail with `"" == "granite"`, rc=0, which is the
-reported bug exactly. Verified on the reporter's own artifact:
-`crispasr_session_open()` returns a live handle reporting backend `granite` and
-transcribes `samples/jfk.wav` correctly through the session ABI.
-
-## LANDED 2026-08-06 — cohere: the language whitelist, + probe LID
-
-Prompted by reading [bakrianoo/cohereX](https://github.com/bakrianoo/cohereX)
-(a WhisperX-shaped Python wrapper around the same model). Nothing to take from
-its runtime — we have the native port, CTC alignment and native diarization —
-but it validates `-l` against the model's `config.json` and we did not.
-
-**The bug.** Cohere Transcribe answers a wrong language *fluently* instead of
-failing, and we had no whitelist, so an unsupported `-l` was accepted in
-silence. Reachable without user error: `-l auto` is the CLI default and
-whisper-tiny LID knows 99 languages against this model's 14 — or the Arabic
-finetune's **two**.
-
-**The thing I got wrong first, and the reason this needed metadata.** I assumed
-`<|ru|>` was absent from the vocab and silently dropped by the prompt builder's
-`remove_if`. Measured on the published Arabic GGUF: the tokenizer carries **183
-`<|xx|>` tokens — the whole of ISO 639-1** — while the model supports two. So
-every real code is well-formed and a vocab check catches nothing. On one 8 s
-Arabic clip: `-l ru` added a hallucinated leading word, `-l ja` swapped the
-quote marks for brackets, `-l de` changed the diacritics. All plausible, none
-flagged. `config.json`'s `supported_languages` is the ONLY available signal —
-which is why it now rides in the GGUF (`cohere_transcribe.supported_languages`)
-rather than being inferred. (The `remove_if` backstop stays, but it only ever
-fires for non-ISO input: `<|auto|>` genuinely is absent.)
-
-Fixing it in `cohere_transcribe_ex` covers CLI + session ABI + server at once —
-no three-surface edit needed.
-
-**Probe LID** (`--lid-backend probe`, cohereX's `langid.py` idea): transcribe a
-20 s clip once per supported language, score
-`len × (1 + 3·text-LID-agreement) × distinct-token-ratio²`. Needs no second
-model and **cannot return a language the model does not support**. Verified on
-the Arabic finetune: Arabic clip → `ar` p=0.675, `jfk.wav` → `en` p=0.647.
-
-Measured again on the **real 14-language base model** (`cohere-transcribe-q4_k`,
-after republishing): the forced 14-way probe is **correct on both clips** —
-`jfk.wav` → `en` (228, p=0.169), Arabic clip → `ar` (292, p=0.254). The ≤4
-ceiling (`CRISPASR_COHERE_PROBE_MAX_LANGS`) is therefore a **cost** gate: 14
-probes take 37 s on an M1 against ~1 s for whisper-tiny.
-
-⚠ **I first documented the opposite and it was wrong.** The "forcing 14
-candidates picks `fr`" result came from forcing a 14-language list onto the
-**two-language Arabic finetune** — a model with no French, which *translates*
-rather than degrading, and cld3 then confirms the translation at 1.00. The real
-base model's `fr` probe code-switches instead ("Et so, my fellow Americans…",
-agreement 0.00, score 57) and loses. I had flagged that extrapolation as
-"suggestive, not conclusive" and shipped the conclusion anyway. **The lesson is
-narrow and reusable: a forced/mismatched capability list does not simulate a
-model that genuinely has that capability.** The scoring soft spot itself is real
-and stays documented (a fluent translation *can* outscore repetitive truth); it
-is just not what the candidate count controls.
-
-### Closed since (2026-08-06, same day)
-
-- **Metadata republished — all 10 GGUFs**, via `tools/gguf-add-cohere-langs.py`
-  (tensors passed through, per-tensor sha256 verified) on Kaggle kernel
-  `chr1str/cohere-langs-republish`. Confirmed independently by range-reading each
-  live file's KV section: Arabic ×4 = `['en','ar']`, base ×6 = the 14. The fix is
-  no longer inert; `CRISPASR_COHERE_LANGS` is now only for third-party GGUFs.
-- **Converter runs end-to-end** (2104 tensors, 4.14 GB, key + `max_clip_s`
-  present, output transcribes and enforces its own whitelist). Running it
-  surfaced a pre-existing bug: it wrote `general.architecture` twice, which
-  strict gguf-py versions reject.
-- **Server and session C-ABI surfaces exercised**, not just compiled — probe
-  fires and substitution warns on both.
-- **UTF-8 truncation bug** in the probe log (`%.60s` cut mid-character, killed
-  the Kaggle run via Python's stderr decode). Fixed + guarded.
-
-- **`prefers_vad()` for cohere** — and it was a bigger deal than "a plausible
-  quality win". The model transcribes SILENCE as speech: 10 s of pure digital
-  silence returns *"And I'm going to go ahead and do that."*, and 20 s of
-  trailing silence appends that same sentence to an otherwise perfect
-  `jfk.wav` transcript. (Low-level noise and a 440 Hz tone produce nothing, so
-  it is silence specifically.) A/B'd on real speech before flipping: on a 60 s
-  FLEURS clip the un-VAD'd run also cut mid-sentence, garbled a clause and
-  **dropped a whole sentence** the VAD run recovers — so it is content
-  recovery, not just a silence guard. Uses the existing >30 s safeguard.
-- **The cheaper probe** — encode once, decode per candidate. The two encode
-  blocks were already brace-delimited, so it is two `{` → `if (!reuse_enc) {`
-  with no re-indentation, and the cross-KV free/realloc lives *inside* the
-  second block so skipping it keeps the allocation live. 14-candidate A/B,
-  back-to-back and repeated in reverse order: **12 s → 4–5 s, byte-identical
-  output**. Gated `CRISPASR_COHERE_PROBE_REUSE_ENC=0`.
-- **`tools/gguf-add-merges.py`** — passed `sub_type=` to a `MetadataDetails`
-  that the installed gguf-py does not have, so it raised TypeError and could
-  not run at all. Now passes it only when the field exists; verified on a
-  synthetic glm-asr GGUF (merges land ARRAY/STRING, both pair- and string-form
-  inputs normalise, arch/vocab/tensors pass through).
-
-### Open follow-ups
-
-None tracked for cohere. Two things deliberately NOT done, with reasons:
-
-1. **Fresh-conversion vs published-f16 tensor equality** was never checked (it
-   would cost a 4.14 GB download to compare a converter run against an artifact
-   produced by an older converter). The republished files are guaranteed
-   byte-identical to their *pre-rewrite* selves by the tool's per-tensor sha256
-   `--verify`, which is the property that actually matters.
-2. ~~Silence-hallucination below the 30 s threshold~~ — **fixed** (99d8e60b),
-   and not the way I expected. Measuring first showed the defect is narrower
-   than "silence in a short clip": 23 s of speech + trailing silence is CLEAN.
-   Only an all-silent span fabricates, which means it needed no VAD at all —
-   just a digital-silence gate in `cohere_transcribe_ex`, free and with no
-   extra model. Threshold sits below one int16 LSB so one non-zero sample
-   disables it; the quietest real speech to hand peaks ~3800x higher.
-
-## LANDED 2026-08-09 — #337 qwen3-tts "GPU runaway" is NOT a miscompute
-
-Reported on HIP: the talker picks a different token from CPU at frame 0, then
-runs to the KV ceiling — 3796 frames / 303.76 s for one sentence — with exit
-code 0 and a valid WAV. Reporter ruled out quantization, model size,
-flash-attn, HIP graph capture and the voice reference, each with a paired test.
-
-**Three measurements, and the second one overturned the first conclusion.**
-
-1. His CPU-vs-GPU token table was confounded: the talker hardcoded top_k=50 /
-   temp=0.9, and `qwen3_tts_set_temperature` reached the code predictor but NOT
-   the talker. The RNG stream is identical across backends, but the pick is a
-   multinomial draw over a softmax of 50 logits, so any float difference moves
-   it. Added `CRISPASR_QWEN3_TTS_GREEDY=1` (top_k=1) and wired the temperature.
-2. Under greedy on M1, CPU and Metal diverge — I first read that as "the bug
-   reproduces on Metal, so it is a GPU-path defect". **Wrong.** Dumping the raw
-   talker logits (`CRISPASR_QWEN3_TTS_DUMP_LOGITS`, the glm_ocr `*_DUMP_LOGITS`
-   pattern) shows cos **0.99992** at frame 0 — better than the 0.998–0.999 band
-   the guide calls normal for GPU-vs-CPU — decaying to 0.990 by frame 3 and
-   0.84 by frame 5 as the AR loop amplifies it. Neither `--no-flash-attn`
-   (bit-identical) nor `CRISPASR_KV_QUANT_{K,V}=f32` (5th decimal) moves it.
-   This is the voxtral-tts pattern in the guide verbatim: an AR pipeline
-   reproduces the reference at frame 0 then diverges as rounding amplifies —
-   NOT a bug. The two backends simply follow different plausible trajectories
-   after the argmax flips at frame 5; one of them didn't terminate.
-3. `core_repeat::tail_is_repetition` looked like the fix — 3 backends use it,
-   qwen3-tts never adopted it, and the degenerate output repeats. **Rejected by
-   measurement**: healthy CPU output repeats a codec frame **7×** mid-utterance
-   (period-1 `[1657]`) against the degenerate run's 8×. Structurally identical.
-   The helper was written for TEXT tokens; at 12 Hz a held sound legitimately
-   repeats, so it cannot discriminate here. Shipping the library default would
-   have truncated good audio — a worse bug than the one being fixed.
-
-**The actual defect** is that `max_frames` was the KV ceiling, so any input was
-allowed 4096 frames (340 s). Now bounded by the text, the same
-max_token_text_ratio idea upstream TTS models carry and that #334 ported for
-cosyvoice3: `max(240, codepoints × 12)`. Sized from measurement — five
-utterances ran 1.35–2.61 frames per codepoint, so 12 is ~5× the worst observed;
-verified all five are untouched (79–124 frames against caps of 528–804) and the
-cap branch is reachable. It only ever tightens the ceiling; `max_codec_steps`
-and `CRISPASR_QWEN3_TTS_MAX_FRAMES` still override.
-
-Hitting either bound now prints an explicit ERROR saying the output is a
-runaway and should be discarded, and that a GPU-only reproduction is expected
-arithmetic rather than a miscompute.
-
-### Still open
-
-- Making a runaway a non-zero exit rather than a log line. Deliberately not
-  done: it changes the contract for callers who may be relying on truncated
-  output.
-- The reporter's HIP run diverged at frame 0 under SAMPLING; whether it also
-  diverges at frame 0 under greedy is unknown and worth asking — a frame-0
-  greedy divergence would point at the prefill and would be a different story
-  from what Metal shows.
-
-## LANDED 2026-08-05 — #334 cosyvoice3 WAV cloning (85d60ba9, 88c02788)
-
-Reported as "long delay, pitch shifting and accent issues", blamed on sample
-rate. **The sample rate was a red herring** and that is worth remembering: the
-C++ speech tokens are byte-exact vs `speech_tokenizer_v3.onnx` (201/201) at
-every reference rate, and our polyphase resampler tracks torchaudio to inside
-the tokenizer's own sensitivity. What is real:
-
-- **s3tok token ids are NOT stable across resamplers.** ONNX on a sox-16 kHz
-  file vs the same audio resampled from 24 kHz agrees on only ~62% of tokens —
-  and torchaudio scores the same 62%. The FSQ codes are near-ties, so a −51 dB
-  difference flips a third of them. Any future "our tokens don't match" report
-  must first ask *which 16 kHz signal*.
-- **The talker had no minimum length.** Upstream masks the stop token while
-  `i < min_len = (target text tokens) × 2`. Without it one unlucky step-0
-  sample ends the decode ("AR decode produced 0 tokens", no audio); short of
-  that the model spends fewer than 2 frames per text token, which is the
-  reporter's chipmunk. Ported + gated `CRISPASR_COSYVOICE3_NO_MIN_LEN=1`.
-- **The actual trigger is a `--ref-text` that doesn't transcribe the clip.**
-  17.7 s of audio labelled with one sentence → collapse. Now warned against
-  the same 2..20 speech-tokens-per-text-token band the decode uses.
-- **The clone front-end re-ran per sentence chunk.** s3tok + CAMPPlus + prompt
-  mel on every `synthesize()`; cached per (path, size, mtime, transcript).
-  3-sentence `--tts` 66.0 s → 45.7 s, byte-identical.
-- **`resample_polyphase` truncated its filter on every downsample** — the
-  input window was `±num_zeros` where the filter spans `half_len/L` input
-  samples. The pre-existing DC test had a 5e-4 margin over a 5.4e-4 defect.
-- **RL talker published + wired**: `cosyvoice3-llm-rl-{f16,q4_k}.gguf` on
-  `cstr/cosyvoice3-0.5b-2512-GGUF`, `--backend cosyvoice3-tts-rl`.
-
-### OPEN follow-ups
-
-1. ~~Auto-transcribe the reference when `--ref-text` is missing.~~ **DONE.**
-   `examples/cli/crispasr_tts_ref_text.h` hoists f5-tts's transcriber + the
-   ref-text cache; cosyvoice3 now auto-transcribes instead of hard-erroring
-   (cached as `<voice>.cv3reftext`). Measured on a 17.7 s reference: a
-   one-sentence guess lost the requested line entirely, auto-transcribed it
-   came out in full. **Still CLI/server only** — `crispasr_session_set_voice`
-   keeps returning -2 for a WAV with no transcript, because the session C-ABI
-   cannot construct a second `CrispasrBackend` for ASR. That is the same
-   limit f5-tts has always had, so bindings callers must still pass a
-   transcript; lifting it means giving the library its own ASR entry point.
-2. ~~The clone front-end is a harness-blind zone.~~ **DONE, and it found a
-   real bug.** `clone_{spk_emb,prompt_feat_24k,speech_tokens}` stages now
-   exist on both sides and give the three `cosyvoice3_tts_extract_*` APIs
-   their first caller. First run: prompt mel 0.999948, speech tokens
-   1.000000 — and **spk_emb 0.737** against `campplus.onnx`.
-   Cause: CAMPPlus ends `transit3.linear(Conv1d, bias=False) →
-   out_nonlinear(BN+ReLU) → StatsPool`, and the ONNX exporter FOLDED that
-   trailing BN into the conv — the graph has a bare
-   `/xvector/out_nonlinear/relu/Relu` with no BN parameters, while
-   `/xvector/transit3/linear/Conv` gained a fused weight and a fused BIAS
-   (transit1/2 keep bias-free named weights, no BN follows them).
-   `bn_relu_conv1d` never applied a conv bias, so the fold was silently
-   dropped. Zeroing that bias in the ONNX reference reproduces the old C++
-   output at cos 0.999998 — that is what pins it. Fixed → 0.999997.
-   ⚠ Every WAV clone had been conditioned on the wrong timbre while the baked
-   voice bank was fine (its embeddings come from the ONNX model in Python) —
-   which is why this read as "cloning quality" rather than as a bug.
-   The bias is applied only when the checkpoint carries one.
-   **Cross-backend blast radius — VERIFIED, not assumed** (the first commit
-   message claimed "their converters emit no transit bias", which was
-   reasoning, not a check; chatterbox's GGUF is not even produced by an
-   in-tree converter). Listing the tensor names in each published GGUF over a
-   ranged HTTP read of the header:
-   | GGUF | transit tensors | transit `linear.bias` | out_nonlinear BN |
-   |---|---|---|---|
-   | chatterbox / -turbo s3gen | 15 | none | `s3.se.xv.out_nl.bn.*` present |
-   | dots.tts spk | 18 | none | `…out_nonlinear.batchnorm.*` present |
-   | cosyvoice3 campplus | — | **transit3 present** | **absent (folded)** |
-   So chatterbox and dots.tts are bit-identical, and cosyvoice3 is the only
-   folded export. The C++ was written against the un-folded shape and had
-   never met the other one.
-3. **Re-validation after the CAMPPlus fix — DONE.** Every #334 measurement
-   before it was taken through a cos-0.737 speaker embedding, so the
-   clone-quality claims needed re-running. Same reference at 8/16/22.05/24/
-   32/44.1/48 kHz, matching `--ref-text`: all seven ASR-round-trip to the
-   identical transcript, durations 7.62–8.94 s, and speaker similarity to the
-   reference (Resemblyzer) is 0.744–0.776, spread **0.032**, mean 0.762.
-   Timbre is now rate-invariant as well as content — the earlier conclusions
-   hold, and the direct 24 kHz comparison moved 0.7245 → 0.7537. (Absolute
-   values are dragged down in every arm by the prepended spoken disclaimer,
-   which is in a different voice; the spread and the delta are the signal.)
-4. **The 10 s prompt-mel cap is ours, not upstream's.** `compute_prompt_feat_24k`
-   is called with `max_samples = 10 * 24000`, so a longer reference gives the
-   flow a 10 s prompt while the LM keeps the full token set (deliberate, see
-   the #310 comment). A 17.7 s reference round-trips fine, so this is not a
-   bug — but it is an untested divergence worth an A/B.
-
-## #333 madlad400 — DONE 2026-08-05 (F16 + Q8_0 published, port validated)
-
-Reporter: only `q4_k` was on `cstr/madlad400-3b-mt-GGUF`, though the README
-listed F16 and Q8_0 — and the card's own quickstart told you to download
-`…-q8_0.gguf`, which 404'd. Both files are now published, and madlad went from
-having **no diff-harness coverage at all** to a full per-stage table.
-
-**Per-stage cosine vs the PyTorch blueprint** (`crispasr-diff madlad <gguf>
-<ref>`; 14 stages, encoder → cross-attention → decoder → step-0 logits):
-
-| | worst cosine | step-0 argmax |
-|---|---|---|
-| F16 | **1.000000** (every stage) | MATCH |
-| Q8_0 | 0.999894 | MATCH |
-| Q4_K | 0.993328 | MATCH |
-
-F16 at 1.000000 on all 14 says the T5 port is faithful to HF's semantics; the
-quants then degrade exactly in the expected order, and all three still pick the
-same first token. `enc_pos_bias` is bit-exact (max_abs 0.00000) at every
-precision, which is the relative-position-bucket logic — encoder-bidirectional
-vs decoder-causal — confirming itself.
-
-Shipped: `tools/reference_backends/madlad.py` (lazy per-tensor walk of the
-11.76 GB fp32 checkpoint), `t5_translate_diff()` in `src/t5_translate.cpp`, the
-`madlad`/`t5` arm in `crispasr-diff`, and `tools/kaggle/madlad-quants/` which
-produced and validated everything. Reference archive:
-`cstr/madlad400-3b-mt-GGUF/madlad400-3b-mt-ref.gguf` (1.5 MB).
-
-**Follow-ups this left open:**
-
-- ⚠ **The reference archive is in the MODEL repo, not
-  `cstr/crispasr-regression-fixtures`**, which is where the convention puts them
-  (`tests/regression/README.md`). It works where it is and the kernel points at
-  it, but it should be moved or mirrored, and pinned by `fixture_ref_path` so CI
-  can use it.
-- ~~Greedy decode does not always terminate cleanly~~ **RESOLVED, and it was
-  NOT a port bug.** The hypothesis was that the runaway pointed at the runtime,
-  since the blueprint presumably stopped. Measured instead of assumed, and the
-  answer is the opposite: **the PyTorch reference runs away identically** —
-  60 tokens, no EOS, byte-identical string
-  (`'Hello world! – 100000000000…'`). Ruled out along the way, each with its own
-  arm: quantization (reproduces at F16, where parity is 1.000000), the KV cache
-  (`CRISPASR_T5_NO_KV_REUSE=1` full re-forward gives the identical string), the
-  tokenizer (runtime independently emits the same 11 ids ending in EOS=2, and
-  `enc_embed` is cos=1.000000), the EOS id (config, GGUF and runtime all say 2),
-  and the graph (14/14 stages, argmax MATCH). The port reproduces the model
-  faithfully **including its failure mode**, which is itself evidence of
-  fidelity.
-  Shipped anyway as a decode-policy improvement: `core_repeat::tail_is_repetition`
-  in the greedy loop, which trims the repeated tail and stops
-  ("Hello world! – 10" instead of "…– 100000000000…"). **Gated
-  `CRISPASR_T5_REPEAT_BREAK=0`, because it deliberately DEVIATES from the
-  blueprint** — anyone diffing against HF needs the old behaviour back. Both
-  sentences the reference terminates cleanly on are byte-identical with it on
-  and off.
-- **`t5` quantizer rule: written, MEASURED, and defaulted OFF because it loses.**
-  The port pipeline's step 3 asks for a per-arch rule, so I added one keeping
-  `shared.embed.weight` and `lm_head.weight` at source precision — reasoning
-  that Q4_K's worst stages (`enc_embed` 0.9974, `enc_out` 0.9937) were
-  embedding-driven. **That reasoning was wrong.** Re-quantized from the F16 and
-  diffed against the reference archive:
-
-  | | size | worst cosine |
-  |---|---|---|
-  | q8_0 | 3.38 → 3.62 GB | 0.999922 → 0.999920 |
-  | q4_k | 2.04 → 2.41 GB | 0.992929 → 0.992606 |
-
-  Bigger and no better, so neither was published — the kernel's
-  "upload only if parity improves" gate held. The new worst stages say why:
-  `cross_v_blk0`, `enc_out`, `cross_k_blk0`, i.e. the error is what ACCUMULATES
-  through 32 encoder blocks, not what the embedding lookup rounds off. A wide
-  embedding cannot repair a stack that has already drifted.
-  Kept and inverted rather than deleted (`CRISPASR_T5_KEEP_EMBED=1`): a
-  different T5 checkpoint — tied embeddings, smaller vocabulary, or an imatrix
-  run — could land differently, and the lever costs nothing switched off.
-  **The published q4_k/q8_0 are the generic-path files and remain the
-  measured-best.**
+Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`
+(branch `fix/344-moss-valid-frame-metadata`).
+Additive MOSS encoder/tap/adapter valid-frame metadata for the downstream
+MOSS-Music-8B-Thinking feature pipeline: `moss_audio_plan_chunks`,
+`moss_audio_compute_mel_meta` (preserves pre-pad `T_mel_actual` — never inferred
+from padded zeros/floor), and `moss_audio_run_encoder_meta` (existing chunk loop
+reused, caller-allocated per-chunk valid counts, adapter output dim reported from
+GGUF weights, fail-closed llm_hidden vs adapter-row check). Existing
+`moss_audio_*` symbols unchanged. Hermetic CPU test + live differential test.
 
 ## OPEN 2026-08-05 — miotts writes a 24 kHz WAV header for 44.1 kHz audio
 
@@ -850,6 +1139,19 @@ done. Nothing clean+validatable-locally remains — do NOT keep sprinkling std::
   tiny for most consumers (kokoro=20, cosyvoice3=16) so the per-frame IRFFT is
   already cheap. Poor risk/reward — SKIP (would need per-thread out buffers + merge
   or a stride-coloring scheme for a marginal win).
+  **2026-08-30 re-audit:** the "miocodec has a scalar FFT" line below was
+  misattributed — `src/miocodec.cpp` contains no FFT of its own; its one
+  `core_istft::istft` call sits behind `miocodec_extract_stage`, whose only
+  caller is the diff harness (decode is a stub; `miotts.cpp:1770` calls
+  core_istft directly). Measured miotts share: iSTFT ≈ 2.0% of synthesis CPU
+  (n_fft=392/hop=98/T=1332 — 3.5 s of 176.6 s) — under the 5% gate, so still
+  SKIP. For the record, a BIT-IDENTICAL parallel design DOES exist if a heavy
+  consumer ever appears: parallelize only `irfft_hermitian` into a T×n_fft
+  frame buffer (each frame self-contained, ~2 MB scratch at miotts sizes,
+  ~99% of the stage) and keep the overlap-add strictly serial — the naive
+  frame-parallel OLA is both a race and FP-non-associative, and per-thread
+  buffers + ordered merge does NOT restore bit-identity, but the irfft split
+  does by construction. Gate as `CRISPASR_ISTFT_SERIAL=1` if ever done.
 - Own-mel backends NOT on core_mel (f5_tts, gemma4_e2b, titanet, chatterbox_s3gen,
   outetts_wavtok, ecapa_lid): their FFT runs ONCE on the reference clip or on TTS
   output where the DiT/decoder dominates — marginal fractions, not the
@@ -966,8 +1268,11 @@ effort estimate. Completed items have been moved to `HISTORY.md`.
 > independent sequences and numbers may collide. When in doubt, PLAN
 > items are always written as `§N` and GitHub issues as `#N`.
 
-**Latest release: v0.8.20** (tag `v0.8.20`, + pub.dev `crispasr 0.8.20`). Release
-notes live on each tag; per-version `RELEASE_NOTES_v0.8.*.md` at repo root.
+**Latest release: v0.8.32** (tag `v0.8.32`, + pub.dev `crispasr 0.8.32`). Release
+notes live on each tag. Only the CURRENT version's `RELEASE_NOTES_v*.md` is kept
+at the repo root — older ones are removed when the next is written, since each
+tag carries its own copy and the GitHub release carries the published body.
+`release.yml` hard-fails if the file for the tag being cut is absent.
 The v0.8.18 → v0.8.20 train shipped in one session (2026-07-21): each patch was
 a genuine fix that only surfaced on a real tag run — see "Recent completions"
 and `LEARNINGS.md` "a green release job is not a shipped artifact".
@@ -1056,6 +1361,45 @@ _Completed work archived to HISTORY.md (PLAN compaction 2026-07-17)._
 
 **Still open:** Upstream the ggml empty-key fix to ggml-org (outbound public PR, left for a human)
 
+**FIXED 2026-08-10 — the stb_vorbis SEGV `linux-fuzz-smoke` found.**
+`vorbis_deinit` walked `comment_list_length` entries of a NULL `comment_list`.
+`comment_list_length` is read straight from the file at
+`examples/stb_vorbis.c:3660` and set BEFORE the array is allocated, so the
+allocation-failure return one line later (an attacker-sized count makes
+`setup_malloc` return NULL) left the two out of step. Reachable from the public
+`crispasr_audio_load` on untrusted input.
+
+⚠ An earlier CrispASR patch had already hardened the SIBLING path here — the
+partially-filled array whose unassigned slots were freed as if valid — by
+zeroing the allocation. It could not help when the allocation never happened.
+Fixing the case you can see and leaving its neighbour is the recurring shape:
+the guard now lives in `vorbis_deinit` (defends every path in, present and
+future) rather than at the Nth caller, plus the length is reset on the error
+path so the struct's invariant holds.
+
+**Reproduced deterministically rather than waiting for the fuzzer.** The crash
+input is 102 hand-crafted bytes — an Ogg page carrying a Vorbis ident header
+and a comment header declaring `comment_list_length = 0x3FFFFFFF`. Kept as
+`tests/fuzz/regressions/ogg-huge-comment-count.ogg`, and the smoke-fuzz job now
+copies `tests/fuzz/regressions/` into its corpus, so every fixed crash becomes a
+deterministic gate instead of a coin flip. Before/after on matching builds: 2
+SEGV lines → 0.
+
+⚠ `libcrispasr` is a SHARED library — the fuzz harness picks it up by rpath, so
+"rebuild the harness" tests the new code with an old-looking binary. Rebuild the
+dylib when doing a before/after, or the control silently becomes a second copy
+of the experiment. (Cost me one invalid control here.)
+
+The job also now uploads the crashing input on failure. It previously kept only
+the stack trace, which for a stochastic job means the reproduction is gone.
+
+**Noted, not fixed:** on macOS the same input flows past stb_vorbis into the
+AudioToolbox fallback (`crispasr_at_decode` → `ExtAudioFileOpenURL`) and
+libFuzzer reports an out-of-memory there. That is a resource limit inside
+Apple's decoder on malformed input, not memory corruption, and that path does
+not exist on the Linux CI. Worth a size sanity-check before handing a file to
+AudioToolbox if anyone wants it.
+
 ## Diff-harness extensions (detail for "Ready to take" #5 and #6)
 
 Both validate the TTS port against the Python reference. Neither is claimed.
@@ -1065,6 +1409,92 @@ Both validate the TTS port against the Python reference. Neither is claimed.
 **What:** Dump talker LLM logits at each generation step in both Python reference and C++ runtime, compare — validates the text-decoder input so the sampler is a faithful port over verified logits.
 
 **How:** (a) add `talker_logits_step_N` capture to the Python reference dumper (`tools/reference_backends/qwen3_tts.py`) via a `generate`-time hook; (b) add matching C++ stage to `crispasr_diff_main.cpp`; (c) run on the TTS diff harness.
+
+**C++ SIDE DONE 2026-08-10 (#337), and it settled the report.** Three levers,
+which only work together:
+`CRISPASR_QWEN3_TTS_GREEDY=1` (argmax), `CRISPASR_QWEN3_TTS_REPLAY_CODES=<file>`
+(16 codec ids per frame — teacher forcing), and
+`CRISPASR_QWEN3_TTS_DUMP_LOGITS=<dir>` (raw per-frame logits, before the
+repetition penalty and suppress mask).
+
+**Result: CPU vs Metal, fully pinned, worst cos 0.999870, mean 0.999940,
+0/49 argmax disagreements.** Given identical history the backends agree at
+every step, so the free-running divergence is entirely trajectory divergence
+seeded by ~1e-4 arithmetic. That is the rigorous version of the #337 verdict;
+the earlier free-running comparison suggested it but could not separate the two.
+
+⚠ **Partial teacher forcing is a trap.** Replaying codebook 0 alone leaves the
+15 residual codebooks sampled (`code_pred_generate_15` MUST sample — greedy
+there is documented to produce silent output), so the per-frame input embedding
+still diverges and the "teacher-forced" diff bottoms out at cos 0.849 — pure
+artefact. Pin all 16 or measure nothing.
+
+⚠ **Every per-synthesis dump must be tagged.** One `--tts` run generates twice
+(the utterance, then the spoken AI disclaimer). `talker_%04d.f32` and
+`generated_codes` were both frame-only names, so the disclaimer OVERWROTE the
+utterance's dumps and a directory held two utterances with no way to tell.
+Both now carry `_s%02d`. This produced one entirely bogus cross-backend table
+before it was spotted — the tell was `argmax_gpu[k] == argmax_cpu[k-2]`.
+
+**Python reference side DONE 2026-08-10.** `_hooks.capture_per_call()` written
+(the module referenced an `_iter_capture` that never existed) — one capture per
+call instead of first-call-only. `tools/reference_backends/qwen3_tts.py` now
+emits `talker_logits_step0..15` and, at last, `generated_codes`: that stage had
+been in DEFAULT_STAGES since the backend was written and was NEVER produced,
+because the ids only exist inside `generate_voice_clone` (the outer call returns
+audio). Captured by wrapping `tts.model.generate`.
+
+Verified by running it: 17 tensors, `generated_codes (19, 16) int32` — exactly
+the layout `CRISPASR_QWEN3_TTS_REPLAY_CODES` consumes — and
+`talker_logits_step0 (1, 147, 3072)` = the PREFILL, with steps 1+ the AR steps
+at `(1, 1, 3072)`. Note that indexing when diffing: step0 is not frame 0.
+
+⚠ **Env:** the shared conda base has transformers 5.x; upstream Qwen3-TTS pins
+4.57.3 and importing `qwen_tts` against 5.x dies on `check_model_inputs()`.
+Do NOT downgrade the base. `tools/reference_envs/qwen3-tts/requirements.txt`
+now scaffolds it; a `--system-site-packages` venv inherits torch and shadows
+only transformers. `qwen_tts` comes from the clone at `~/code/Qwen3-TTS` via
+PYTHONPATH, not pip.
+
+**Prep landed 2026-08-10:** `qwen3_tts_sum_frame_embed()` factors the 16-codebook
+embedding sum out of the AR loop so a harness entry point can build the SAME
+per-step talker input without a second copy — duplicating it is how a harness
+drifts from the runtime it checks, which is what #338 was. Verified
+output-neutral: PCM byte-identical before/after (the WAV bytes differ only in
+the C2PA/watermark metadata, which carries a per-run id — compare PCM, not the
+container, when checking a refactor here).
+
+**Still open, and here is the actual blocker.** A per-step talker input is
+NOT just the codec-embedding sum:
+
+    next_emb[step] = sum_{cb=0..15} embed_cb(frame[cb]) + trailing_text_hidden[step]
+
+The `trailing` term is prompt-derived state computed from the synth text inside
+the generate path. So a harness stage cannot simply prefill from the
+reference's `talker_inputs_embeds` and then step — it also needs `trailing`,
+which the reference does not currently dump and the runtime does not expose.
+That dependency is why this stage does not exist yet; it is not just wiring.
+
+Two ways forward, pick one before writing code:
+1. Dump `trailing_text_hidden` as a reference stage too, and pass it into a
+   `qwen3_tts_talker_logits_replay(embeds, n_tokens, codes16, n_frames,
+   trailing, n_trail)` entry point. Most faithful, and it makes the
+   dependency explicit in the archive.
+2. Have the runtime construct the whole prompt itself from the same text +
+   voice wav the reference used, and use the reference's
+   `talker_inputs_embeds` ONLY as a structural gate (cos ≈ 1 before trusting
+   any logits — the guide's input-alignment rule). Less plumbing, but it
+   assumes the two prompt builders agree, which is the thing being tested.
+
+Option 2's gate is worth having either way.
+
+The superseded note: `CRISPASR_QWEN3_TTS_DUMP_LOGITS=<dir>`
+writes raw per-frame talker logits (f32), dumped BEFORE the repetition penalty
+and the suppress mask so a diff isolates the forward from the sampling policy.
+It already paid for itself — it is what proved the reported "GPU miscompute"
+was cos 0.99992 at frame 0, i.e. ordinary backend arithmetic amplified by the
+AR loop. What remains is (a): the Python reference hook, which turns a
+cross-BACKEND comparison into a cross-IMPLEMENTATION one against the blueprint.
 
 **Test:** needs a TTS model (qwen3-tts or tada). 0.6B Q8_0 (941 MB) fits on VPS; TTS gen slow on CPU (~105x RTF) — use short "Hi." input, 2-3 frames.
 
@@ -1453,19 +1883,50 @@ x86 CPU-only Linux validation of moss-transcribe / higgs-stt / ark-asr passed at
 Follow-ups (LOW, not blocking):
 - [ ] Fix handover to `cmake --build build` (all targets) before `ctest -L unit` —
   VPS run only built `crispasr`/`crispasr-diff`, ran 2 unit tests. Or have VPS build all.
-- [ ] Install Go toolchain on VPS (`root@168.119.190.252`) to close the one SKIPPED
-  Go link check, or leave to CI.
+- [x] Install Go toolchain on VPS — DONE 2026-09-02: go1.23.4 at
+  `/mnt/volume1/go-toolchain/go`, symlinked as `~/.local/bin/go` (on PATH).
 - [ ] Optional: promote to a standing post-push Linux smoke (Routine/cron).
+- [x] Orphaned ctest-label audit (2026-09-02, follow-up to the dead-`cli` find):
+  cross-checked every `LABELS` in tests/CMakeLists.txt against every `-L` filter
+  in .github/workflows + ci/. ONE real orphan found and fixed: `ci/run.sh` ran
+  `ctest -L main` (upstream whisper.cpp's label — nothing here carries it), so
+  both build.yml CPU jobs tested NOTHING while green; now `-L unit`, which also
+  gives the unit suite its only Debug-build run. Labels that exist but are
+  deliberately not CI-run (model-gated, local/live only): `live`, `base`,
+  `small`, `medium`, `large`, `tiny;en`, `benchmark`, `integration`,
+  `espeak;piper;tts` — do not "fix" these.
 
 Multilingual + beam spot-checks (LOW, either machine):
-- [ ] moss-transcribe is zh/en but only English (jfk) validated — run one German +
-  one Chinese clip (de fixtures under `audio_samples/`).
-- [ ] Run higgs/ark `-bs 4` on a noisy/accented clip to see if beam improves WER
-  (only proven no-regression == greedy on easy JFK).
+- [ ] **#421 arm64 HiFT SIMDCONV failures** — the `-L unit` fix's first full-ci
+  dispatch ran 1782 tests on arm64 (previously ZERO) and 4 fail: chatterbox +
+  cosyvoice3 SIMDCONV scalar/SIMD identity (tests/test-*-hift-simdconv.cpp:66/68,
+  instant assert). Possible silent vocoder divergence on arm64 Linux/Android.
+  Unclaimed; details + log pointers on the issue.
+- [x] moss-transcribe multilingual check — RESOLVED 2026-09-02, premise was
+  WRONG: the upstream card says "intended for English automatic speech
+  recognition" (this line had conflated it with the Diarize sibling). Ran the
+  clips anyway (`samples/paraformer_zh.wav` + a bananamind-de synthesized
+  German sentence — `audio_samples/` never existed): both come back as rough
+  ENGLISH translations at rc 0, faithful to the model (prompt mirrors the
+  upstream processor, instruction-less). Actioned: moss-transcribe now
+  declares `sole_language()="en"` on the adapter + the session guard table,
+  so `-l zh` is an explicit pre-dispatch rejection instead of silently wrong
+  output, and `-l auto` short-circuits without an LID download (#227).
+- [x] higgs/ark `-bs 4` noisy-clip beam test — DONE 2026-09-02 on Kaggle T4
+  (`tools/kaggle/beam-noisy-ab/`, chr1s4/crispasr-beam-noisy-ab-higgs-ark v2):
+  jfk + additive white noise at 10 dB and 5 dB SNR (seed 42), both backends,
+  greedy vs `-bs 4`. Result: **WER 0.000 in every cell** — even 5 dB noise
+  doesn't dent either model on this clip, and beam-4 wins nothing while
+  costing ~3x wall (higgs 2s->7s, ark 4s->12s per clip). Greedy stays the
+  right default. Residual (only if someone cares later): white noise is not
+  accent — a FLEURS accented-speech rerun would need new fixtures; the
+  harness takes any wav list.
 
 Backend-wiring coverage gaps (LOW cleanup; re-list via `python tools/check-backend-wiring.py`):
-- [ ] **missing reference dumper**: `fastconformer-ctc`, `wav2vec2`, `m2m100`,
-  `kyutai-stt`, `gemma4-e2b`. Mostly intentional (m2m100 text-only MT, gemma4-e2b
+- [x] **missing reference dumper** — RESOLVED by 2026-09-02: all five now exist
+  in `tools/reference_backends/` (`fastconformer_ctc.py`, `wav2vec2.py`,
+  `m2m100.py`, `kyutai_stt.py`, `gemma4_e2b.py`). Original caveat kept for
+  the record (m2m100 text-only MT, gemma4-e2b
   shares gemma path, encoder components diff via host backends) — confirm per-backend
   before adding, not a blanket gap.
 
@@ -1788,15 +2249,33 @@ Port ships with `ggml_flash_attn_ext` on encoder+adaptor (`FUNASR_NO_FA=1` to op
 out), fused QKV (DONE), and single-token embed fast path (`CRISPASR_FUNASR_EMBED_FAST`,
 default ON, DONE §180). None affect correctness — pure throughput. Remaining:
 
-- [ ] **Per-step LLM decode graph cache.** JFK decode runs ~37.6 ms/tok vs ~6 ms/tok
-  memory-bound floor (F16 Qwen3-0.6B on M1) → ~30 ms is graph-build/sched overhead.
-  Build the step graph once at `funasr_kv_init` with `kv_indices` runtime input
-  (K/V via `ggml_set_rows` to runtime slot, not static-offset `ggml_cpy`) and
-  `fixed_kv_len = kv_max_ctx`; each step only writes positions/kv_indices/mask/inputs.
-  Expected 5–10 ms/tok (15–25% decode). qwen3_asr could adopt same. Effort: ~1 bench session.
-- [ ] **Encoder graph cache by T_lfr bucket.** Bucket to {128,256,512,1024,2048}
-  (voxcpm2 TSLM pattern), pad inputs + static mask dropping trailing rows; first call
-  per bucket pays build, rest reuse. Expected 10–20 ms/call warm. Effort: ~1 bench session.
+- [x] **Per-step LLM decode graph cache — DONE 2026-09-02, but NOT as recorded
+  here.** The literal design (`fixed_kv_len = kv_max_ctx`, one graph) was
+  already scaffolded default-OFF in the file with an M1 3× regression note,
+  and re-measured on x86 as **+69% decode CPU** — one wasted KV key costs
+  ~0.28 ms/tok through the GQA repeat+cont, so a fixed-Lk graph loses far
+  more to KV bandwidth than it saves in graph prep (~2.1 ms/tok). Shipped
+  instead: **bucketed Lk, width 16** (`CRISPASR_FUNASR_STEP_BUCKET`, measured
+  optimum; break-even w≈15), FIFO of 4 live graphs, padded slots masked to
+  -inf (flash-attn skips fully masked positions → bit-identical by
+  construction), default ON with `CRISPASR_FUNASR_STEP_CACHE=0` opt-out.
+  Byte-identical 18/18 (3 clips × f16/q4_k × pre-change/off/on, re-verified
+  independently), quant-bcast audit clean (0 hits, q4_k+q8_0, both arms).
+  Net on x86: neutral within ±8% noise (decode is weight-bandwidth-bound;
+  step prep was only 2–3.8 ms/tok here, not the ~30 ms the M1 note implied)
+  while removing 93% of per-step graph prep — the win lives on platforms
+  where graph construction is expensive (M1). qwen3_asr adoption: only with
+  the bucketed variant, never fixed-Lk.
+- [x] **Encoder graph cache — exact-T_lfr half DONE 2026-09-02** (default ON,
+  `CRISPASR_FUNASR_ENC_CACHE=0` opt-out): repeat-length calls skip the
+  7.5–23.9 ms graph build (cache hit = 0 ms; sched_alloc 2.4–6.2 ms still
+  paid). The padded-bucket half is **dropped as designed**: the SANM FSMN
+  branch is a width-11 depthwise conv over TIME (`core/sanm.h:128`), so a
+  padded frame leaks into the last 5 real frames of all 70 blocks and
+  zero-padding doesn't save it (LayerNorm of a zero row = bias ≠ 0) — a
+  bit-identical version needs a time mask on V inside `core_sanm` — and the
+  economics are upside down anyway (build is ~10–24 ms against a 2.3–6.1 s
+  encoder; padding T_lfr 183→256 would spend seconds to save milliseconds).
 - [ ] **Two-pass: CTC fast pass → Fun-ASR-Nano LLM rescore.** Upstream checkpoint has
   0 CTC tensors (LLM-style by choice); the only public trained CTC head is
   `csukuangfj/funasr-nano-with-ctc` (Apache-2.0, encoder+adaptor+CTC, no LLM, frozen
@@ -1832,8 +2311,10 @@ a handful of genuine CUDA-path bugs. Most resolved (vibevoice/lfm2-audio §206/k
 fastpitch+speecht5 §204/chatterbox §205 — all in HISTORY). Remaining open:
 
 TODO (open):
-- [ ] **f5-tts** — runs once given a reference voice but TIMEOUT at 120 s in re-test. Bump smoke
-  timeout (≥240 s) and re-run to settle pass-vs-stuck; passes on M1 Metal locally.
+- [ ] **f5-tts** — runs once given a reference voice but TIMEOUT at 120 s in re-test.
+  Timeout half DONE (registry already carries `timeout_s=600` for f5-tts,
+  `tools/test-all-backends.py` — ≥240 satisfied); the Kaggle re-run to settle
+  pass-vs-stuck is still pending; passes on M1 Metal locally.
 - [ ] **orpheus** (TTS) — fixed §215 (Metal + CPU bucket both ASR-roundtrip verbatim on M1), stays
   opt-in `CRISPASR_ORPHEUS_BUCKET=1` (~30% slower on M1 unified memory, may win on CUDA).
   **CUDA cross-check still pending** (Kaggle `chr1str/crispasr-orpheus-talker-cuda` end-to-end
@@ -3063,38 +3544,20 @@ non-gaps; detail in HISTORY.)
 
 ---
 
-## §246 issue #81 endgame — close the remaining ~1.4× CUDA gap to onnx-asr (OPEN)
+## §246 issue #81 endgame — CUDA comparison (DONE for TDT; CTC residual measured)
 
-Current: parakeet-ctc q8_0 CUDA manual-attn = 153× RT warm (jfk×5 55 s,
-in-process) vs onnx-asr CUDA fp32 = 207× (134 s varied). ~0.36 s/55 s left to
-find. **Gate: measure before building** — the handover's bottleneck theory was
-wrong; profile first.
+The Q4 P100 stage split found a concrete TDT bottleneck outside the encoder:
+the scalar CPU encoder-to-joint projection. Moving it into one backend graph
+improved the honest 134 s varied run from 52.4× to 116.1×, within about 4% of
+the historical 121× onnx-asr result. Projection time fell from about 1.40 s to
+4.0 ms and the 301-word transcript remained exact and stable.
 
-**TO DO (ranked by expected value):**
-1. **Per-stage split on CUDA first** (cheap, decides everything below): extend
-   `tools/kaggle/fc-unified-graph-ab` to run `CANARY_CTC_BENCH=1` +
-   `CRISPASR_FC_PROFILE=1` on P100 — mel vs encoder+ctc vs readout. Mel is
-   host-side single-threaded FFT (`cc_fft_r2c`); may be a triple-digit-ms
-   constant onnx doesn't pay. If so: parallelize `core_mel` (unused
-   `mel_parallel` flag already in mel.cpp) or overlap mel with previous graph's
-   compute.
-2. **F16 vs Q8_0 on GPU**: P100 has 2:1 fp16, no tensor cores; onnx runs fp32
-   cuBLAS. Our q8_0 mmq may lose to plain f16/f32 GEMM at these shapes — one
-   kernel arm with the F16 GGUF answers it.
-3. **CUDA-graph replay**: verify ggml-cuda graph capture engages across our
-   rebuild-per-call graphs (same topology → should). If not, `CRISPASR_FC_BUCKET`
-   gives stable topology; retry small buckets (100 mel frames ≈ 1 s; smaller
-   pads waste less).
-4. **Upstream flash fix (structural)**: teach `fattn.cu` to accept per-head masks
-   (`mask->ne[2] != 1` guard) so flash works for Shaw rel-pos models on CUDA —
-   reclaims fused-attention traffic manual attn re-materializes ((T,T,H) ×24).
-   Upstream PR to ggml-org/llama.cpp per repo convention (mechanical-AI
-   disclosure only).
-5. **Honest re-run**: canonical number is the 134 s-varied load-excluded
-   methodology (issue81-onnx-bench), not jfk×5.
-
-**Also OPEN:** VPS 4-core x86 re-bench with shipped defaults (pre-fix 2.1× vs
-onnx-CPU 3.1×; handover synced at `handover-prompts/issue81-fc-perf.md`).
+CTC is 158.6× on the same Q4 method versus the historical 214× onnx-asr fp32
+run. Its profile is encoder-bound. The remaining candidate tested here,
+25/50/100-frame stable graph buckets, all lost on varied audio despite winning
+on the short JFK clip, so no bucket default shipped. The residual ~1.35× CTC
+gap requires a structural encoder/kernel improvement rather than another
+unmeasured scheduling switch.
 
 ## §247 roll #81 techniques out to the other runtimes (OPEN)
 
@@ -3110,9 +3573,11 @@ canary, canary_ctc, canary_qwen, lfm2_audio, nemotron); roll each out where it a
   side, not storage). Fix: quantizer carve-out (+Q8_0 floor + idempotency) + load-time
   repack via `core_conformer::repack_conv_pw_q8` + fleet requant kernel
   (`tools/kaggle/fc-pw-requant`).
-- [ ] **(2) Generalize the per-node profiler**: move `cc_prof_cb` (sched eval callback,
+- [x] **(2) Generalize the per-node profiler**: move `cc_prof_cb` (sched eval callback,
   aggregates by op+src-type+shape, `CRISPASR_FC_PROFILE=1`) to `src/core/sched_prof.h` so
-  every sched-based runtime gets it.
+  the audit targets share it. `CRISPASR_SCHED_PROFILE=1` now covers Canary CTC,
+  Cohere, FireRed-ASR, Granite Speech, Moonshine, Moonshine Streaming and Paraformer;
+  the callback reports relative shares because forcing one split per node adds dispatch overhead.
 - [ ] **(3) Fused QKV** (`core_conformer::fuse_qkv` is tensor-generic): bit-identical ~free
   win wherever Q/K/V share an input. Already deployed on ~10 backends
   (parakeet/canary/canary_qwen/canary_ctc/lfm2_audio via `core_conformer::fuse_qkv`
@@ -3291,10 +3756,43 @@ ggml port targets. New category: audio → note events (MIDI).
   (4-layer Conv2d + 2-layer BiGRU) sub-networks (frame/onset/offset/velocity),
   88-key output at 100fps. ~172 MB checkpoint, ~86 MB F16 GGUF. **TAKEN** (VPS
   session, 2026-07-19).
-- [ ] **Basic Pitch** (Spotify, Apache-2.0). Lightweight CNN (~10 MB). Polyphonic
-  audio → MIDI. After piano_transcription.
-- [ ] **MT3** (Google, Apache-2.0). Seq2seq multi-instrument. Large (~1 GB+).
-  Feasibility check first.
+- [x] **Basic Pitch** (Spotify, Apache-2.0). Polyphonic, instrument-agnostic
+  audio → note events. **DONE (2026-08-30, VPS).** The network is tiny (~40k
+  conv weights, 112 KB F16 GGUF) — the model is really its front end.
+  Weights come from the `nmp.onnx` that ships inside the package
+  (`basic_pitch/saved_models/icassp_2022/`, sha256 `2c3c1d14…59a0ec`): the ONNX
+  has the BatchNorms already folded AND carries the nnAudio CQT kernels as
+  initializers, so `models/convert-basic-pitch-to-gguf.py` copies them
+  bit-for-bit instead of reimplementing `scipy.signal.firwin2`.
+  **`src/core/cqt.h` could NOT be reused** — it is the direct-kernel librosa CQT
+  (zero pad, `1+n/hop` frames); Basic Pitch trained on nnAudio **CQT2010v2**
+  (one top-octave kernel bank, 9 octaves of recursive x2 decimation, reflect
+  padding, `sqrt(lengths)` rescale). New `src/core/cqt2010v2.h`; `cqt.h` is
+  untouched so BTC parity is unaffected.
+  Parity vs `tools/reference_backends/basic_pitch.py` (onnxruntime), synthetic
+  polyphonic clip: **every stage cos = 1.000000** — audio window, CQT magnitude,
+  NormalizedLog, harmonic stack, all three heads, and the stitched full-file
+  posteriorgrams. End-to-end note events **27/27 exact** (start, end, MIDI,
+  velocity) at F32; F16 shifts 2 of 27 note ENDS by one frame at a
+  threshold boundary. jfk.wav (16 kHz → resampled, so the resampler differs from
+  librosa's): all stages ≥ 0.9991, note events 11/11 exact at both F16 and F32.
+  Wired: converter + `src/basic_pitch.{h,cpp}` + CLI adapter + `--piano`
+  dispatch (routes on GGUF arch) + arch map + registry row + `crispasr-diff`
+  branch. **GGUF not yet uploaded** — registry row points at
+  `cstr/basic-pitch-GGUF`, build locally until then.
+  Not ported: pitch bends (`get_pitch_bends`) and MIDI file writing — the CLI
+  emits note events, same shape as `piano-transcription`.
+- [ ] **MT3** (Google, Apache-2.0). Seq2seq multi-instrument. Feasibility check
+  DONE 2026-08-30 → **GO**, `docs/music-transcription/mt3-feasibility.md`.
+  Corrections to the old line: the checkpoint is **171.6 MB** (60 M params, ~120
+  MB F16 — verified against the live GCS listing), not "1 GB+", and the T5X/zarr
+  checkpoint decodes with stdlib+numpy (no JAX/t5x/TensorStore). ~80% of
+  `src/t5_translate.cpp` reuses directly; the gotcha is MT3 uses sinusoidal
+  ABSOLUTE positions (`FixedEmbed`, network.py:180/225 — zero
+  relative_attention_bias params in the checkpoint), so the T5 runtime needs a
+  second positional branch. Gate on note-level F1 vs `openmirlab/mt3-infer`
+  (numpy ref dumper required — mt3-infer excludes Magenta MT3 deps), NOT cosine:
+  the risk is the tie-section cross-segment note stitching. ~8 working days.
 
 **New CLI surface:** `--task transcribe-music` / `--backend piano-transcription`
 → MIDI output file.
@@ -3359,7 +3857,9 @@ and Mel-Band RoFormer separation, piano_transcription (§250).
   `cstr/btc-chords-GGUF`. `core/cqt.h` landed and was NOT the last blocker --
   the real bugs were a missing `scale=True` and a chunked-vs-continuous
   front-end mismatch. See `docs/music-transcription/PLAN.md`.
-- [ ] **Basic Pitch** — see §250, claimed there.
+- [x] **Basic Pitch** — see §250. DONE 2026-08-30. Note: it needed a SECOND CQT
+  (`src/core/cqt2010v2.h`, nnAudio CQT2010v2) — `core/cqt.h` stays the librosa
+  direct-kernel one for BTC/TabCNN.
 - [ ] **MT3** — feasibility memo on T5X/JAX checkpoint conversion BEFORE any C++.
 
 ### Phase 2 — surfaces
@@ -3409,3 +3909,19 @@ by the log-mel HiFT vocoder → flow mel cosine(cpu,vk)=0.961 → garbage. The L
   release was never affected (shims are branch-only).
 - Default stays the shipped all-CPU route under Vulkan — correct, and the right
   answer unless the lever above ever pays off.
+
+## (was NOW) — original report, kept for the record
+
+`crispasr_detect_language_pcm(method=Silero)` answers **pa-in** on the JFK
+English sample (jfk.wav, 16 kHz mono) with `silero-lid-lang95-f32.gguf`
+(byte-identical to the HF catalogue copy, sha1 fb24ca95…). The legacy CPU
+path (`CRISPASR_SILERO_LID_LEGACY=1`) answers **fr** on the same input —
+the two paths disagree with each other AND with the truth, which per the
+A/B rule means at least one is miscomputing (and the label table may be
+suspect too: the harness-blind zone). Whisper LID on the same clip: en
+0.977. Reproduce from the CrisperWeaver repo:
+`tools/run_live_tests.sh test/silero_lid_live_test.dart` (remove the
+known-upstream skip in that test first). Suggested first steps: diff the
+ggml vs legacy logits on the same 30 s slice; verify the index→label
+table against the ONNX blueprint's ordering; check the mel/frontend
+scale columns, not just cosine.

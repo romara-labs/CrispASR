@@ -92,6 +92,10 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    # Dolphin (DataoceanAI) E-Branchformer + Transformer decoder + CTC (#436).
+    # model_dir holds <name>.pt + train.yaml + units.txt + global_cmvn;
+    # DOLPHIN_MODEL_NAME picks the registry name (default small.cn.streaming).
+    "dolphin":    "reference_backends.dolphin",
     # dots.tts (rednote-hilab/dots.tts-soar) TTS: Qwen2.5-1.5B LLM +
     # 18L DiT flow-matching head + 24L VAESemanticEncoder (PatchEncoder)
     # + BigVGAN vocoder. The C++ diff branch ("dots-tts") validates the
@@ -108,8 +112,15 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # fp32 checkpoint ONE TENSOR AT A TIME, so it fits a ~13 GB box.
     "madlad":     "reference_backends.madlad",
     "miotts":     "reference_backends.miotts",
+    "breeze-tts-2": "reference_backends.breeze_tts_2",
+    "bt2-tts":    "reference_backends.breeze_tts_2",
     "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
+    "raon-speech": "reference_backends.raon_speech",  # #455 Raon-Speech-9B STT
+    "nemotron3-diar": "reference_backends.nemotron3_diar",  # #466 Nemotron-3-Diarization
+    # X-ASR (#436): icefall streaming Zipformer2 transducer, driven chunk by chunk
+    # like sherpa-onnx. Needs XASR_ICEFALL_DIR (icefall zipformer/ sources).
+    "xasr":       "reference_backends.xasr",
     "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
@@ -130,6 +141,13 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # audio arg is a real multi-speaker clip.
     "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
+    # transformers-format ParakeetForTDT (#454: moondream parakeet-ultra / -redux);
+    # same stage names as the NeMo "parakeet" dumper.
+    "parakeet-hf": "reference_backends.parakeet_hf",
+    # Supertonic-3 (#434): ONNX-only distribution — the reference IS the
+    # onnxruntime pipeline (standalone script; run it directly, not via this
+    # dispatcher). Kept here for discoverability.
+    "supertonic-tts": "reference_backends.supertonic_tts",
     # WeSpeaker ResNet34-LM speaker embedder (#324). model_dir is a snapshot of
     # Wespeaker/wespeaker-voxceleb-resnet34-LM (containing `avg_model`), or the
     # checkpoint path itself. Needs the upstream package importable — either
@@ -273,6 +291,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
     # Audio arg is unused (the per-block test vector is seeded random).
     "cosyvoice3-tts": "reference_backends.cosyvoice3_tts",
+    # FireRedTTS3 (#377): Qwen3-1.7B LLM + PatchEncoder + DiT flow head
+    # over continuous RedAE latents. Runs the full upstream pipeline on
+    # CPU (Kaggle-only: ~13 GB of fp32 weights).
+    "fireredtts3": "reference_backends.fireredtts3_tts",
     # F5-TTS v1 Base: DiT-based flow-matching TTS with Vocos vocoder.
     # model_dir = /mnt/storage/f5-tts (containing F5TTS_v1_Base/ + vocos/).
     # Audio arg is a reference voice WAV for cloning (16 kHz); synth text
@@ -293,6 +315,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Qwen3-1.7B LM. Ships modeling+processing code (no GitHub clone needed).
     # model_dir = OpenMOSS-Team/MOSS-Transcribe-preview-2B HF id or local dir.
     "moss-transcribe": "reference_backends.moss_transcribe",
+    # Hojo-ASR-Multi-V1: Qwen3-Omni audio tower + 2-block WeNet Conformer
+    # adapter + Qwen3-4B LM. Drives the upstream `hojo-asr` PyPI package
+    # (pip install hojo-asr) rather than re-implementing the forward pass.
+    # model_dir = HojoAI/Hojo-ASR-Multi-V1 HF id or local snapshot.
+    "hojo-asr": "reference_backends.hojo_asr",
     # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
@@ -373,6 +400,17 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # waveform, not from replayed features, or the front end is never tested
     # (the BTC/piano blind spot).
     "tabcnn": "reference_backends.tabcnn",
+    # Basic Pitch (Spotify, ICASSP 2022, Apache-2.0, §250): polyphonic,
+    # instrument-agnostic audio → note events. `model_dir` is the ONNX FILE
+    # (nmp.onnx), which ships inside the basic-pitch package/repo at
+    # basic_pitch/saved_models/icassp_2022/. Runs on onnxruntime — do NOT
+    # install tensorflow for this. Audio arg = any file librosa can read; it is
+    # loaded at 22050 Hz mono.
+    # ⚠️ The CQT lives INSIDE the ONNX, so this dumper exposes the graph's own
+    # intermediate tensors (cqt_magnitude, normalized_log, harmonic_stack) as
+    # extra outputs and emits `audio_window0` too. Diff from the waveform, not
+    # from replayed features — the front end is most of this model.
+    "basic_pitch": "reference_backends.basic_pitch",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -549,6 +587,14 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
     )
 
+    # Captures are owned copies (reference_backends/_safe_capture.py); list any
+    # whose source tensor changed after capture — each would have been a
+    # corrupted reference under the old view-returning .numpy() — and record
+    # the verdict in the archive's metadata.
+    from reference_backends import _safe_capture
+    alias_hits = _safe_capture.report()
+    alias_note = "none" if not alias_hits else "; ".join(f"{w} x{n}" for w, (n, _) in alias_hits)
+
     # Always include raw audio so C++ tests can feed it in without
     # re-reading the WAV.
     if "raw_audio" in stages:
@@ -567,6 +613,7 @@ def main() -> None:
 
     # Serialize
     meta = {
+        "aliasing_after_capture": alias_note,
         "backend":  args.backend,
         "model_dir": str(args.model_dir.resolve()),
         "audio":    str(args.audio.resolve()),
@@ -584,6 +631,11 @@ def main() -> None:
     # harnesses on the C++ side can replay the exact synthesis context.
     for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
                     "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED", "CHATTERBOX_SYN_TEXT",
+                    "CHATTERBOX_LANG",
+                    "CHATTERBOX_SEED",
+                    "FIREREDTTS3_SYN_TEXT", "FIREREDTTS3_PROMPT_TEXT", "FIREREDTTS3_LANG",
+                    "FIREREDTTS3_SEED",
+                    "CHATTERBOX_DEVICE",
                     "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
                     "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
                     "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",

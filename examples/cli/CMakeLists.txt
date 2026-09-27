@@ -11,12 +11,25 @@
 
 set(TARGET crispasr-cli)
 
+# The CLI records consent hashes even when C2PA signing is disabled.  Its
+# header therefore uses the shared SHA-256 shim independently of
+# crispasr_enable_c2pa(), which only configures the optional signing library.
+set(_crispasr_c2pa_audio_include "${CMAKE_SOURCE_DIR}/third_party/c2pa-audio/src")
+if (NOT EXISTS "${_crispasr_c2pa_audio_include}/sha256.h")
+    message(FATAL_ERROR
+        "The c2pa-audio submodule is required by the CLI consent record "
+        "(missing ${_crispasr_c2pa_audio_include}/sha256.h). Initialize submodules with: "
+        "git submodule update --init --recursive")
+endif()
+
 add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
     crispasr_backend_nemotron.cpp
     crispasr_backend_gigaam.cpp
+    crispasr_backend_dolphin.cpp
+    crispasr_backend_xasr.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
     crispasr_backend_canary_qwen.cpp
@@ -42,6 +55,7 @@ add_executable(${TARGET}
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
     crispasr_backend_irodori_tts.cpp
+    crispasr_backend_supertonic.cpp
     crispasr_backend_pocket_tts.cpp
     crispasr_backend_csm.cpp
     crispasr_backend_parler.cpp
@@ -50,6 +64,8 @@ add_executable(${TARGET}
     crispasr_backend_bark.cpp
     crispasr_backend_dia.cpp
     crispasr_backend_dots_tts.cpp
+    crispasr_backend_fireredtts3.cpp
+    crispasr_backend_confucius4_tts.cpp
     crispasr_backend_voxcpm2_tts.cpp
     crispasr_backend_voxcpm2_vae.cpp
     crispasr_backend_cosyvoice3.cpp
@@ -75,10 +91,16 @@ add_executable(${TARGET}
     crispasr_backend_mimo_asr.cpp
     crispasr_backend_ark_asr.cpp
     crispasr_backend_miotts.cpp
+    crispasr_backend_bt2_tts.cpp
     crispasr_backend_piano_transcription.cpp
+    crispasr_backend_basic_pitch.cpp
+    crispasr_backend_onsets_and_frames.cpp
+    crispasr_backend_hft_transformer.cpp
+    crispasr_backend_mt3.cpp
     crispasr_backend_moss_audio.cpp
     crispasr_backend_moss_tts.cpp
     crispasr_backend_moss_tts_local.cpp
+    crispasr_backend_hojo_asr.cpp
     crispasr_backend_moss_transcribe.cpp
     crispasr_backend_moss_transcribe_diarize.cpp
     crispasr_backend_funasr.cpp
@@ -133,6 +155,16 @@ target_compile_definitions(${TARGET} PRIVATE
     CRISPASR_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
 )
 if (GGML_CUDA)
+    # ggml discovers CUDA in its own add_subdirectory() scope. CMake's
+    # CUDAToolkit_VERSION normal variable does not propagate back up to this
+    # sibling directory, so diagnostics previously compiled an empty version
+    # string even in the shipped CUDA packages (#400). Discover it in the CLI
+    # scope too and fail the build rather than ship an unidentifiable binary.
+    find_package(CUDAToolkit REQUIRED)
+    if (NOT CUDAToolkit_VERSION)
+        message(FATAL_ERROR "CUDA is enabled but CUDAToolkit_VERSION is unavailable")
+    endif()
+    string(REGEX MATCH "^[0-9]+" CRISPASR_CUDA_RUNTIME_MAJOR "${CUDAToolkit_VERSION}")
     # CMAKE_CUDA_ARCHITECTURES is a CMake list ("75-real;86-real;..."). When
     # fed into target_compile_definitions, CMake's command-line generator
     # treats list items as SEPARATE arguments — the cl.exe line ends up as
@@ -145,6 +177,7 @@ if (GGML_CUDA)
     target_compile_definitions(${TARGET} PRIVATE
         CRISPASR_HAVE_CUDA=1
         CRISPASR_CUDA_VERSION="${CUDAToolkit_VERSION}"
+        CRISPASR_CUDA_RUNTIME_MAJOR="${CRISPASR_CUDA_RUNTIME_MAJOR}"
         CRISPASR_CUDA_ARCHS="${CRISPASR_CUDA_ARCHS_STR}"
     )
 endif()
@@ -211,6 +244,8 @@ target_link_libraries(crispasr-diff PRIVATE
     parakeet
     wespeaker
     gigaam
+    dolphin
+    xasr
     canary
     cohere
     granite_speech
@@ -236,6 +271,7 @@ target_link_libraries(crispasr-diff PRIVATE
     moss_audio
     moss_tts
     moss_tts_local
+    hojo_asr
     moss_transcribe
     moss_transcribe_diarize
     voxcpm2_tts
@@ -248,8 +284,12 @@ target_link_libraries(crispasr-diff PRIVATE
     parler-tts
     mini-omni2
     dots-tts
+    supertonic-tts
+    fireredtts3
+    confucius4-tts
     miotts
     miocodec
+    breeze_tts_2
     crepe
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
@@ -319,7 +359,10 @@ endif()
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 # httplib.h is in the server example directory
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
+target_include_directories(${TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/examples/server
+    ${_crispasr_c2pa_audio_include}
+)
 
 include(DefaultTargetOptions)
 
@@ -329,6 +372,8 @@ target_link_libraries(${TARGET} PRIVATE
     parakeet
     wespeaker
     gigaam
+    dolphin
+    xasr
     canary
     cohere
     granite_speech
@@ -353,7 +398,10 @@ target_link_libraries(${TARGET} PRIVATE
     bark-tts
     dia-tts
     dots-tts
+    fireredtts3
+    confucius4-tts
     irodori-tts
+    supertonic-tts
     pocket-tts
     csm-tts
     voxcpm2_tts
@@ -372,9 +420,11 @@ target_link_libraries(${TARGET} PRIVATE
     moss_audio
     moss_tts
     moss_tts_local
+    hojo_asr
     moss_transcribe
     moss_transcribe_diarize
     miotts
+    breeze_tts_2
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
@@ -462,3 +512,15 @@ install(TARGETS crispasr-chat RUNTIME BUNDLE DESTINATION bin)
 add_executable(crispasr-f0-eval crispasr_f0_eval.cpp)
 target_link_libraries(crispasr-f0-eval PRIVATE crispasr-lib crepe beatrice-pitch)
 target_include_directories(crispasr-f0-eval PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# crispasr-repack-probe — does ggml's CPU repack extra buffer type make
+# quantised MUL_MAT faster on this host? See docs/ggml-optimisation-playbook.md
+# §4. Links ggml directly (no crispasr-lib) so it stays cheap to build and
+# runnable anywhere ggml builds, including a Kaggle worker.
+# Under GGML_BACKEND_DL ggml-cpu is a loadable MODULE, which CMake refuses to
+# link, and the probe calls the CPU backend directly — so it is not built there.
+if (NOT GGML_BACKEND_DL)
+    add_executable(crispasr-repack-probe crispasr_repack_probe.cpp)
+    target_link_libraries(crispasr-repack-probe PRIVATE ggml ggml-base ggml-cpu)
+endif()
+include(DefaultTargetOptions)

@@ -32,11 +32,15 @@
 
 #include "cosyvoice3_prompt_policy.h" // #334 min/max token-per-text laws
 
+#include "core/quant_bcast.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
+#include "core/cpu_ops.h"     // core_cpu::to_f32 (SIMDCONV load-time pack)
+#include "core/cosyvoice3_hift_simdconv.h"
+#include "core/hift_simdconv.h"
 #include "core/audio_resample.h"
 #include "core/fft.h"
 #include "core/mel.h"
@@ -66,6 +70,7 @@
 #include <sys/stat.h> // #334 clone-voice cache key (size + mtime)
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -312,6 +317,12 @@ struct cv3_hift_resblock {
     ggml_tensor* c2_b[3] = {nullptr, nullptr, nullptr};
     ggml_tensor* a1_alpha[3] = {nullptr, nullptr, nullptr};
     ggml_tensor* a2_alpha[3] = {nullptr, nullptr, nullptr};
+
+    // SIMDCONV: CPU-only, load-time packed output-channel SIMD kernels.
+    // c1[j] carries dilation {1,3,5}; c2[j] is always dilation 1. The
+    // original ggml tensors stay bound above for the default/GPU fallback.
+    core_cv3_hift_simdconv::PackedConv c1_simd[3];
+    core_cv3_hift_simdconv::PackedConv c2_simd[3];
 };
 
 // Qwen2 BPE vocab loaded from the LLM GGUF's
@@ -382,6 +393,11 @@ struct cv3_hift {
     // FASTCONV: baked F32 copies of the F16 hift conv kernels (cast-kill).
     // Owns its own ctx+buffer; freed in cosyvoice3_tts_free before the backend.
     core_dac::fastconv_cache hift_fc;
+
+    // SIMDCONV is deliberately opt-in: it changes the reduction tree versus
+    // ggml_conv_1d, so PCM is expected to be numerically close but not hash-equal.
+    // Enabled only when HiFT itself is resident/dispatched on the CPU.
+    bool simdconv_enabled = false;
 };
 
 } // namespace
@@ -518,6 +534,7 @@ inline bool cv3_sched_alloc(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
                                 : ggml_backend_sched_alloc_graph(ctx->sched, gf);
 }
 inline ggml_status cv3_sched_compute(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
+    core_quant_bcast::audit(gf, "cosyvoice3");
     if (ctx->dispatch_cpu) // §304 hybrid: compute HiFT on the CPU backend
         return ggml_backend_graph_compute(ctx->backend_cpu, gf);
     return ctx->use_gpu_gallocr ? ggml_backend_graph_compute(ctx->backend, gf)
@@ -572,14 +589,17 @@ bool cv3_kv_init(cosyvoice3_tts_context* ctx, int max_ctx) {
     const size_t kbytes = ggml_nbytes(ctx->kv_k);
     const size_t vbytes = ggml_nbytes(ctx->kv_v);
     ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "cosyvoice3_tts");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+    // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+    // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+    // and these KV rows are head_dim wide (128), so each q8_0 tensor needs
+    // 408 bytes more than nbytes — the hand-sized buffer came up short and
+    // ggml_backend_tensor_alloc aborted. f16 is not quantized, so this only
+    // ever fired with CRISPASR_KV_QUANT set, and only on CUDA.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         fprintf(stderr, "cosyvoice3_tts: failed to alloc KV buffer (%zu bytes)\n", kbytes + vbytes);
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
     ctx->kv_max_ctx = max_ctx;
     if (ctx->params.verbosity >= 1) {
@@ -1053,13 +1073,13 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
     gguf_free(gctx);
 
     // ---- Backend init ----
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "cosyvoice3_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     // The original diff-validation implementation pinned every CosyVoice3
     // stage to CPU even when the caller requested GPU execution.  Besides the
     // AR LLM, the flow estimator runs 22 transformer blocks twice for every
@@ -1097,12 +1117,12 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
             ctx->backend = ctx->backend_cpu;
         }
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (params.verbosity >= 1) {
-        fprintf(stderr, "cosyvoice3_tts: using %s backend: %s\n", ggml_backend_is_cpu(ctx->backend) ? "CPU" : "GPU",
-                ggml_backend_name(ctx->backend));
+        fprintf(stderr, "cosyvoice3_tts: using %s backend: %s\n",
+                core_cpu_backend::is_cpu(ctx->backend) ? "CPU" : "GPU", ggml_backend_name(ctx->backend));
     }
 
     // ---- Weight pass ----
@@ -1249,26 +1269,26 @@ extern "C" void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx) {
     if (ctx->cpu_gallocr)
         ggml_gallocr_free(ctx->cpu_gallocr);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->buf_w_cpu)
-        ggml_backend_buffer_free(ctx->buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_w_cpu);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->flow.buf_w)
-        ggml_backend_buffer_free(ctx->flow.buf_w);
+        core_gguf::release_weight_buffer(ctx->flow.buf_w);
     if (ctx->flow.ctx_w)
         ggml_free(ctx->flow.ctx_w);
     ctx->hift.hift_fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->hift.buf_w)
-        ggml_backend_buffer_free(ctx->hift.buf_w);
+        core_gguf::release_weight_buffer(ctx->hift.buf_w);
     if (ctx->hift.ctx_w)
         ggml_free(ctx->hift.ctx_w);
     if (ctx->s3tok.buf_w)
-        ggml_backend_buffer_free(ctx->s3tok.buf_w);
+        core_gguf::release_weight_buffer(ctx->s3tok.buf_w);
     if (ctx->s3tok.ctx_w)
         ggml_free(ctx->s3tok.ctx_w);
     if (ctx->campplus.buf_w)
-        ggml_backend_buffer_free(ctx->campplus.buf_w);
+        core_gguf::release_weight_buffer(ctx->campplus.buf_w);
     if (ctx->campplus.ctx_w)
         ggml_free(ctx->campplus.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1283,7 +1303,7 @@ extern "C" void cosyvoice3_tts_set_n_threads(struct cosyvoice3_tts_context* ctx,
         return;
     ctx->n_threads = n_threads > 0 ? n_threads : 4;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 }
 
 extern "C" void cosyvoice3_tts_set_seed(struct cosyvoice3_tts_context* ctx, uint64_t seed) {
@@ -3096,6 +3116,61 @@ ggml_tensor* cv3_dit_block_apply(ggml_context* ctx0, ggml_tensor* x, ggml_tensor
 // Batch-aware variant used by the CFM classifier-free-guidance path. x is
 // [d,T,B]; modulation is shared across the batch because both CFG branches
 // use the same Euler timestep.
+// #416: in the CFG-batched DiT block every activation carries B in ne2 (B=2 by
+// default), so each quantized weight below is a BROADCASTING mul_mat src0. The
+// runtime detector counts 133 per graph — q/k/v/o and both FFN layers across all
+// 22 blocks — far more than reading the source suggested. Gated; the fold is an
+// exact restatement (a linear is per-token independent). See core/quant_bcast.h.
+// #431-adj: which CAM++ tail divisor THIS backend uses, selectable.
+//
+// cosyvoice3's upstream is campplus.onnx and the question is genuinely open:
+// two onnxruntime builds disagree on AveragePool(ceil_mode=1) for the same
+// clip, while the eight embeddings baked into the shipped cosyvoice3-voices.gguf
+// match the LEGACY divisor exactly (cos 1.000000, |x| 14.1197 on zero_shot).
+//
+// Both paths synthesise correctly — the end-to-end roundtrip is 8/8 on each —
+// so this is not a correctness switch, it is a CONSISTENCY one:
+//
+//   default (fixed)  matches the other four CAM++ backends and the torch
+//                    reference; `--voice ref.wav` differs from the baked bank
+//                    by cos ~0.998 for the same voice.
+//   legacy           matches the baked voice bank, so a voice cloned from a WAV
+//                    and the same voice taken from the bank agree.
+//
+// CRISPASR_COSYVOICE3_CAMPP_TAIL=legacy selects the second. Backend-specific on
+// purpose: CRISPASR_CAMPP_LEGACY_SEGPOOL exists too, but it is global and would
+// drag chatterbox, confucius4, dots-tts and fireredtts3 away from their own
+// (settled) PyTorch references to fix a cosyvoice3-only question.
+static campplus_segpool::tail_divisor cosyvoice3_campp_tail() {
+    const char* e = crispasr_env::get("CRISPASR_COSYVOICE3_CAMPP_TAIL");
+    if (e && (std::strcmp(e, "legacy") == 0 || std::strcmp(e, "kernel") == 0))
+        return campplus_segpool::tail_divisor::kernel_size;
+    return campplus_segpool::tail_divisor::window_width;
+}
+
+static inline ggml_tensor* CV3MM(ggml_context* c, ggml_tensor* w, ggml_tensor* x) {
+    // Default ON: verified on the shipped q4_k LLM + q8_0 flow — the detector
+    // reports 133 broadcasting quantized matmuls per graph without the fold and
+    // 0 with it, and the synthesized PCM is BIT-IDENTICAL either way — the fold
+    // is an exact restatement, so this is equality, not approximate agreement.
+    // (An earlier note here claimed "not byte-identical, a flow-matching ODE
+    // amplifies reduction-order differences". That was wrong, and wrong in an
+    // instructive way: the comparison was `cmp` over the whole FILE, and the
+    // only differing bytes start at offset 117411 — past the 117164-byte PCM
+    // payload, in the trailing C2PA/AI-disclosure chunk, which carries a
+    // timestamp. The instrument reported a difference that was not in the thing
+    // being compared, and a plausible-sounding explanation was invented for it.)
+    // CRISPASR_COSYVOICE3_FOLD_BCAST=0 restores the legacy path.
+    // Read per call, NOT cached in a function-local static. A cached static is
+    // immutable for the process, so any in-process A/B of this gate silently
+    // compares one path against ITSELF and passes by construction — the exact
+    // bug found in the sidon RPE test, where parse_rpe_mode() ran once at init
+    // while the test flipped the env per iteration. This is a getenv on a
+    // graph-build path, not a hot loop, so the cost is not worth the hazard.
+    const bool fold = core_quant_bcast::fold_enabled("CRISPASR_COSYVOICE3_FOLD_BCAST", true);
+    return fold ? core_quant_bcast::mul_mat_fold_batch(c, w, x) : ggml_mul_mat(c, w, x);
+}
+
 ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* t_silu,
                                          ggml_tensor* positions, const cv3_dit_block& b, int d, int n_h, int hd,
                                          float rope_theta) {
@@ -3118,9 +3193,9 @@ ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggm
     ggml_tensor* h_a = ggml_add(ctx0, lnx_a, ggml_mul(ctx0, lnx_a, scale_msa));
     h_a = ggml_add(ctx0, h_a, shift_msa);
 
-    ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_q_w, h_a), b.attn_q_b);
-    ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_k_w, h_a), b.attn_k_b);
-    ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_v_w, h_a), b.attn_v_b);
+    ggml_tensor* Q = ggml_add(ctx0, CV3MM(ctx0, b.attn_q_w, h_a), b.attn_q_b);
+    ggml_tensor* K = ggml_add(ctx0, CV3MM(ctx0, b.attn_k_w, h_a), b.attn_k_b);
+    ggml_tensor* V = ggml_add(ctx0, CV3MM(ctx0, b.attn_v_w, h_a), b.attn_v_b);
     Q = ggml_reshape_4d(ctx0, Q, d, 1, T, B);
     K = ggml_reshape_4d(ctx0, K, d, 1, T, B);
     Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
@@ -3135,15 +3210,19 @@ ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggm
     V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
     ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
     attn = ggml_reshape_3d(ctx0, attn, d, T, B);
-    attn = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_o_w, attn), b.attn_o_b);
+    // #416: attn_o_w is quantized and `attn` carries B in ne2 — B=2 whenever CFG
+    // batching is on, which is the default. This is the only one of the four
+    // attn_o_w sites with a 3-D src1; the others reshape to 2-D and are
+    // unaffected. Gated OFF — see src/core/quant_bcast.h.
+    attn = ggml_add(ctx0, CV3MM(ctx0, b.attn_o_w, attn), b.attn_o_b);
     ggml_tensor* x_after_attn = ggml_add(ctx0, x, ggml_mul(ctx0, attn, gate_msa));
 
     ggml_tensor* lnx_f = ggml_norm(ctx0, x_after_attn, ln_eps);
     ggml_tensor* h_f = ggml_add(ctx0, lnx_f, ggml_mul(ctx0, lnx_f, scale_mlp));
     h_f = ggml_add(ctx0, h_f, shift_mlp);
-    ggml_tensor* ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l1_w, h_f), b.ffn_l1_b);
+    ggml_tensor* ff = ggml_add(ctx0, CV3MM(ctx0, b.ffn_l1_w, h_f), b.ffn_l1_b);
     ff = ggml_gelu(ctx0, ff);
-    ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l2_w, ff), b.ffn_l2_b);
+    ff = ggml_add(ctx0, CV3MM(ctx0, b.ffn_l2_w, ff), b.ffn_l2_b);
     return ggml_add(ctx0, x_after_attn, ggml_mul(ctx0, ff, gate_mlp));
 }
 
@@ -3194,7 +3273,7 @@ ggml_cgraph* cv3_build_dit_full_graph(cosyvoice3_tts_context* ctx, int T_mel) {
     ggml_set_output(normed);
 
     // proj_out: Linear(dit_dim, mel_dim).
-    ggml_tensor* mel_out = ggml_mul_mat(ctx0, f.dit_proj_out_w, normed); // (mel_dim, T_mel)
+    ggml_tensor* mel_out = CV3MM(ctx0, f.dit_proj_out_w, normed); // (mel_dim, T_mel)
     mel_out = ggml_add(ctx0, mel_out, f.dit_proj_out_b);
     ggml_set_name(mel_out, "dit_full_out");
     ggml_set_output(mel_out);
@@ -3415,7 +3494,7 @@ ggml_cgraph* cv3_build_estimator_full_graph(cosyvoice3_tts_context* ctx, int T_m
     normed = ggml_add(ctx0, normed, nshift);
 
     // ---- proj_out: Linear(dit_dim, mel_dim) ----
-    ggml_tensor* dphi = ggml_mul_mat(ctx0, f.dit_proj_out_w, normed); // (mel, T_mel)
+    ggml_tensor* dphi = CV3MM(ctx0, f.dit_proj_out_w, normed); // (mel, T_mel)
     dphi = ggml_add(ctx0, dphi, f.dit_proj_out_b);
     ggml_set_name(dphi, "est_dphi");
     ggml_set_output(dphi);
@@ -3499,7 +3578,7 @@ ggml_cgraph* cv3_build_estimator_cfg_graph(cosyvoice3_tts_context* ctx, int T_me
     ggml_tensor* lnx = ggml_norm(ctx0, h, ln_eps);
     ggml_tensor* normed = ggml_add(ctx0, lnx, ggml_mul(ctx0, lnx, nscale));
     normed = ggml_add(ctx0, normed, nshift);
-    ggml_tensor* dphi = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_proj_out_w, normed), f.dit_proj_out_b);
+    ggml_tensor* dphi = ggml_add(ctx0, CV3MM(ctx0, f.dit_proj_out_w, normed), f.dit_proj_out_b);
     ggml_set_name(dphi, "cfg_dphi");
     ggml_set_output(dphi);
     ggml_build_forward_expand(gf, dphi);
@@ -3974,8 +4053,44 @@ ggml_tensor* cv3_nearest_upsample_t(ggml_context* ctx, ggml_tensor* x, int scale
     return ggml_reshape_2d(ctx, y, T * scale, C);
 }
 
-// HiFT main ResBlock forward. 3 sub-blocks (snake1 → c1@dil → snake2 → c2 → residual).
-// x (T, C). Returns (T, C). c1 uses per-sub-block dilation; c2 always dilation=1.
+// Model-specific ResBlock logic; layout conversion + custom Conv1d execution
+// live in core_hift_simdconv and are shared with Chatterbox S3Gen.
+ggml_tensor* cv3_hift_simd_to_tm(ggml_context* ctx, ggml_tensor* x) {
+    return core_hift_simdconv::to_time_major(ctx, x);
+}
+
+ggml_tensor* cv3_hift_simd_from_tm(ggml_context* ctx, ggml_tensor* x_tm) {
+    return core_hift_simdconv::from_time_major(ctx, x_tm);
+}
+
+// Snake on ne=(C,T): alpha is (C,1), broadcast over time. Keeping Snake in
+// the island avoids four extra layout conversions per sub-block.
+ggml_tensor* cv3_snake_tm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
+    ggml_tensor* a = ggml_reshape_2d(ctx, alpha, (int)alpha->ne[0], 1);
+    ggml_tensor* ax = ggml_mul(ctx, x, a);
+    ggml_tensor* s = ggml_sin(ctx, ax);
+    ggml_tensor* s2 = ggml_mul(ctx, s, s);
+    ggml_tensor* a_safe = ggml_scale_bias(ctx, a, 1.0f, 1e-9f);
+    return ggml_add(ctx, x, ggml_div(ctx, s2, a_safe));
+}
+
+// SIMDCONV ResBlock consumes/returns the time-major island ne=(C,T). Dilation
+// is part of each load-time PackedConv, so the custom op has no ephemeral
+// userdata and the graph may safely outlive this builder call.
+ggml_tensor* cv3_hift_resblock_fwd_simd_tm(ggml_context* ctx, ggml_tensor* x, const cv3_hift_resblock& rb,
+                                           int n_threads) {
+    for (int j = 0; j < 3; j++) {
+        ggml_tensor* xt = cv3_snake_tm(ctx, x, rb.a1_alpha[j]);
+        xt = core_hift_simdconv::conv_tm(ctx, xt, rb.c1_simd[j], n_threads);
+        xt = cv3_snake_tm(ctx, xt, rb.a2_alpha[j]);
+        xt = core_hift_simdconv::conv_tm(ctx, xt, rb.c2_simd[j], n_threads);
+        x = ggml_add(ctx, x, xt);
+    }
+    return x;
+}
+
+// Default/GPU fallback ResBlock. 3 sub-blocks
+// (snake1 → c1@dil → snake2 → c2 → residual). x (T,C), T contiguous.
 ggml_tensor* cv3_hift_resblock_fwd(ggml_context* ctx, ggml_tensor* x, const cv3_hift_resblock& rb,
                                    const int dilations[3]) {
     for (int j = 0; j < 3; j++) {
@@ -4376,8 +4491,16 @@ ggml_cgraph* cv3_build_hift_decode_graph(cosyvoice3_tts_context* ctx, int T_mel)
             // CausalConv1d k=1 left-pad 0 — degenerate, no padding needed.
             si = cv3_causal_conv1d(ctx0, s_stft, h.src_down_w[i], h.src_down_b[i]);
         }
-        // Source resblock (single ResBlock per stage).
-        si = cv3_hift_resblock_fwd(ctx0, si, h.src_resblocks[i], dilations);
+        // Source resblock (single ResBlock per stage). SIMDCONV pays one
+        // channel-major -> time-major -> channel-major island per stage, not
+        // one conversion per convolution.
+        if (h.simdconv_enabled) {
+            ggml_tensor* si_tm = cv3_hift_simd_to_tm(ctx0, si);
+            si_tm = cv3_hift_resblock_fwd_simd_tm(ctx0, si_tm, h.src_resblocks[i], ctx->n_threads);
+            si = cv3_hift_simd_from_tm(ctx0, si_tm);
+        } else {
+            si = cv3_hift_resblock_fwd(ctx0, si, h.src_resblocks[i], dilations);
+        }
         (void)src_rb_kernels; // kernels are baked into the loaded weights
         // Align T (defensive — the dim math should already match).
         {
@@ -4393,17 +4516,29 @@ ggml_cgraph* cv3_build_hift_decode_graph(cosyvoice3_tts_context* ctx, int T_mel)
         }
         x = ggml_add(ctx0, x, si);
 
-        // Main resblock fusion: 3 ResBlocks (kernel ∈ {3,7,11}), each applied
-        // INDEPENDENTLY to the same x, outputs averaged: x = mean_j rb_j(x).
-        ggml_tensor* xs = nullptr;
-        ggml_tensor* rb_in = x;
-        for (int j = 0; j < 3; j++) {
-            const int K = rb_kernels[j];
-            (void)K; // kernel baked into weights via cv3_causal_conv1d_dil
-            ggml_tensor* rj = cv3_hift_resblock_fwd(ctx0, rb_in, h.resblocks[i * 3 + j], dilations);
-            xs = xs ? ggml_add(ctx0, xs, rj) : rj;
+        // Main resblock fusion: 3 independent ResBlocks share ONE time-major
+        // island under SIMDCONV, then the averaged result is converted back
+        // for the next upsample/source-fusion stage.
+        if (h.simdconv_enabled) {
+            ggml_tensor* rb_in_tm = cv3_hift_simd_to_tm(ctx0, x);
+            ggml_tensor* xs_tm = nullptr;
+            for (int j = 0; j < 3; j++) {
+                ggml_tensor* rj_tm =
+                    cv3_hift_resblock_fwd_simd_tm(ctx0, rb_in_tm, h.resblocks[i * 3 + j], ctx->n_threads);
+                xs_tm = xs_tm ? ggml_add(ctx0, xs_tm, rj_tm) : rj_tm;
+            }
+            x = cv3_hift_simd_from_tm(ctx0, ggml_scale(ctx0, xs_tm, 1.0f / 3.0f));
+        } else {
+            ggml_tensor* xs = nullptr;
+            ggml_tensor* rb_in = x;
+            for (int j = 0; j < 3; j++) {
+                const int K = rb_kernels[j];
+                (void)K; // kernel baked into weights via cv3_causal_conv1d_dil
+                ggml_tensor* rj = cv3_hift_resblock_fwd(ctx0, rb_in, h.resblocks[i * 3 + j], dilations);
+                xs = xs ? ggml_add(ctx0, xs, rj) : rj;
+            }
+            x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
         }
-        x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
 
         {
             ggml_tensor* dump = ggml_cont(ctx0, x);
@@ -4823,6 +4958,45 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     hf.f0_classifier_w = require_t("cosyvoice3.hift.f0.classifier.w");
     hf.f0_classifier_b = require_t("cosyvoice3.hift.f0.classifier.b");
 
+    // ---- SIMDCONV: direct CPU ResBlock Conv1d, load-time packed ---------
+    // Shared core_hift_simdconv handles validation, tensor dequantization and
+    // rollback; this model adapter contributes only the bound tensors + causal padding.
+    {
+        // DEFAULT ON since the quiet-box A/B (chr1str/crispasr-simdconv-cpu-ab,
+        // Xeon avx512f, packed 72/72): hift_vocoder median 4400→4114 ms
+        // (1.07x), on top of the contributor's 1.34x on Zen 4 — wins on every
+        // platform measured, output within 1 int16 LSB, roundtrip exact.
+        // Set =0 to restore the ggml path. (Chatterbox's sibling gate stays
+        // OPT-IN: the same kernel REGRESSED s3gen 5.4 % on this Xeon.)
+        const char* env2 = crispasr_env::get("CRISPASR_COSYVOICE3_SIMDCONV");
+        const bool requested = !env2 || !*env2 || *env2 != '0';
+        const bool cpu_hift = core_cpu_backend::is_cpu(hift_backend);
+        core_hift_simdconv::Packer pack(requested && cpu_hift);
+        const int dilations[3] = {1, 3, 5};
+
+        for (auto& rb : hf.resblocks)
+            for (int j = 0; j < 3; j++) {
+                pack.add(rb.c1_simd[j], rb.c1_w[j], rb.c1_b[j], dilations[j]);
+                pack.add(rb.c2_simd[j], rb.c2_w[j], rb.c2_b[j], 1);
+            }
+        for (auto& rb : hf.src_resblocks)
+            for (int j = 0; j < 3; j++) {
+                pack.add(rb.c1_simd[j], rb.c1_w[j], rb.c1_b[j], dilations[j]);
+                pack.add(rb.c2_simd[j], rb.c2_w[j], rb.c2_b[j], 1);
+            }
+
+        const int expected = (int)(hf.resblocks.size() + hf.src_resblocks.size()) * 6;
+        hf.simdconv_enabled = pack.finish(expected);
+        const int packed = pack.count();
+        if (crispasr_env::get("CRISPASR_COSYVOICE3_SIMDCONV_DEBUG") || (requested && ctx->params.verbosity >= 1)) {
+            const char* isa =
+                hf.simdconv_enabled ? core_cv3_hift_simdconv::isa_name(hf.resblocks[0].c1_simd[0].isa) : "fallback";
+            fprintf(stderr, "cosyvoice3_tts:hift SIMDCONV %s: packed %d/%d ResBlock convs, isa=%s, backend=%s%s\n",
+                    hf.simdconv_enabled ? "ON" : "OFF", packed, expected, isa, ggml_backend_name(hift_backend),
+                    requested && !cpu_hift ? " (GPU HiFT -> ggml fallback)" : "");
+        }
+    }
+
     // ---- FASTCONV: bake one F32 copy of each F16 hift conv kernel at load,
     // then re-point the named fields to the baked copies. The fork's
     // ggml_conv_1d casts an F16 kernel → F32 inside EVERY graph when the
@@ -4844,18 +5018,22 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
         fields.push_back(&hf.conv_post_w);
         for (int i = 0; i < 3; i++)
             fields.push_back(&hf.ups_w[i]);
-        for (auto& rb : hf.resblocks)
-            for (int j = 0; j < 3; j++) {
-                fields.push_back(&rb.c1_w[j]);
-                fields.push_back(&rb.c2_w[j]);
-            }
+        // SIMDCONV never calls ggml_conv_1d for the 72 ResBlock kernels, so
+        // do not also allocate redundant baked-F32 copies of those weights.
+        if (!hf.simdconv_enabled)
+            for (auto& rb : hf.resblocks)
+                for (int j = 0; j < 3; j++) {
+                    fields.push_back(&rb.c1_w[j]);
+                    fields.push_back(&rb.c2_w[j]);
+                }
         for (int i = 0; i < 3; i++)
             fields.push_back(&hf.src_down_w[i]);
-        for (auto& rb : hf.src_resblocks)
-            for (int j = 0; j < 3; j++) {
-                fields.push_back(&rb.c1_w[j]);
-                fields.push_back(&rb.c2_w[j]);
-            }
+        if (!hf.simdconv_enabled)
+            for (auto& rb : hf.src_resblocks)
+                for (int j = 0; j < 3; j++) {
+                    fields.push_back(&rb.c1_w[j]);
+                    fields.push_back(&rb.c2_w[j]);
+                }
         for (int i = 0; i < 5; i++)
             fields.push_back(&hf.f0_condnet_w[i]);
 
@@ -5321,7 +5499,16 @@ bool cv3_bake_runtime_voice_bundle(const char* wav_path, const char* ref_text, s
     if (manifest_path.empty() || gguf_path.empty())
         return false;
 
-    const std::string upstream_base = "/Volumes/backups/code/cosyvoice3-stash/CosyVoice-upstream";
+    // Path to a CosyVoice upstream checkout, for the Python cross-check only.
+    // No hardcoded default: this was a maintainer path, so the cross-check
+    // could only ever run on one machine and silently failed everywhere else.
+    const char* upstream_env = crispasr_env::get("CRISPASR_COSYVOICE3_UPSTREAM_DIR");
+    if (!upstream_env || !*upstream_env) {
+        fprintf(stderr, "cosyvoice3: set CRISPASR_COSYVOICE3_UPSTREAM_DIR to a CosyVoice checkout "
+                        "to run the Python cross-check\n");
+        return false;
+    }
+    const std::string upstream_base = upstream_env;
     std::ostringstream manifest;
     manifest << "[{\"name\":\"runtime\",\"wav\":\"" << cv3_json_escape(wav_path ? wav_path : "")
              << "\",\"prompt_text\":\"" << cv3_json_escape(ref_text ? ref_text : "") << "\"}]";
@@ -5380,7 +5567,7 @@ bool cv3_load_voice_bundle_from_file(const char* path, std::vector<cv3_voice>& v
     }
     gguf_free(gctx);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = core_cpu_backend::init();
     if (!backend)
         return false;
     core_gguf::WeightLoad wl;
@@ -5460,7 +5647,8 @@ bool cv3_extract_native_runtime_voice(cosyvoice3_tts_context* ctx, const char* w
         return false;
 
     std::vector<float> native_spk =
-        chatterbox_campplus::embed_speaker(ctx->campplus.model, ctx->campplus.cache, pcm16.data(), (int)pcm16.size());
+        chatterbox_campplus::embed_speaker(ctx->campplus.model, ctx->campplus.cache, pcm16.data(), (int)pcm16.size(),
+                                           /*stats_var_floor=*/0.0f, cosyvoice3_campp_tail());
     if (native_spk.size() != 192)
         return false;
 
@@ -6193,7 +6381,8 @@ extern "C" int cosyvoice3_tts_extract_spk_emb(struct cosyvoice3_tts_context* ctx
         if (sr != 16000)
             pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
         auto emb =
-            chatterbox_campplus::embed_speaker(ctx->campplus.model, ctx->campplus.cache, pcm.data(), (int)pcm.size());
+            chatterbox_campplus::embed_speaker(ctx->campplus.model, ctx->campplus.cache, pcm.data(), (int)pcm.size(),
+                                               /*stats_var_floor=*/0.0f, cosyvoice3_campp_tail());
         if (emb.size() != 192)
             return -1;
         std::memcpy(out_spk_emb, emb.data(), 192 * sizeof(float));

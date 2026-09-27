@@ -112,6 +112,9 @@ option(CRISPASR_ALL_WARNINGS_3RD_PARTY "crispasr: enable all compiler warnings i
 # build
 option(CRISPASR_FATAL_WARNINGS  "crispasr: enable -Werror flag"               OFF)
 option(CRISPASR_USE_SYSTEM_GGML "crispasr: use system-installed GGML library" OFF)
+option(CRISPASR_PORTABLE_CPU
+       "crispasr: compile bundled ggml-cpu for generic x86-64 (no optional ISA)"
+       OFF)
 
 # sanitizers
 option(CRISPASR_SANITIZE_THREAD    "crispasr: enable thread sanitizer"    OFF)
@@ -206,6 +209,45 @@ set(GGML_SANITIZE_UNDEFINED ${CRISPASR_SANITIZE_UNDEFINED})
 set(GGML_ALL_WARNINGS       ${CRISPASR_ALL_WARNINGS})
 set(GGML_FATAL_WARNINGS     ${CRISPASR_FATAL_WARNINGS})
 
+# #261/#302: GPU inference still enumerates and initializes ggml-cpu before it
+# selects CUDA/Vulkan. A GPU artifact whose CPU helper was compiled for AVX2 or
+# BMI2 therefore raises SIGILL at model startup on older workstations, before
+# the server's runtime ISA diagnostic can run. `GGML_NATIVE=OFF` is NOT enough:
+# in a normal build it makes ggml's INS_ENB default true, silently enabling
+# SSE4.2/AVX/AVX2/BMI2 and friends. Keep the portable contract in one CMake
+# option so release jobs cannot omit one of the growing set of ggml ISA knobs.
+# This is the generic x86-64/SSE2 floor; non-x86 builds simply leave irrelevant
+# cache entries disabled.
+if (CRISPASR_PORTABLE_CPU)
+    if (CRISPASR_USE_SYSTEM_GGML)
+        message(FATAL_ERROR
+            "CRISPASR_PORTABLE_CPU cannot control a system-installed ggml; "
+            "use the bundled submodule or provide a baseline-built ggml")
+    endif()
+
+    foreach(_ggml_isa
+            NATIVE
+            SSE42
+            AVX
+            AVX_VNNI
+            AVX2
+            FMA
+            F16C
+            BMI2
+            AVX512
+            AVX512_VBMI
+            AVX512_VNNI
+            AVX512_BF16
+            AMX_TILE
+            AMX_INT8
+            AMX_BF16)
+        set(GGML_${_ggml_isa} OFF CACHE BOOL
+            "Disabled by CRISPASR_PORTABLE_CPU" FORCE)
+    endforeach()
+    message(STATUS
+        "CRISPASR_PORTABLE_CPU=ON: ggml-cpu uses the generic x86-64 baseline")
+endif()
+
 # §232: Enable tinyBLAS/llamafile GEMM by default — ~15-29% faster CPU encoder
 # matmuls across all backends. transcribe.cpp forces this ON; ggml defaults OFF.
 # No risk: tinyBLAS is a drop-in SIMD-optimized GEMM replacement.
@@ -261,7 +303,52 @@ if (NOT TARGET ggml)
                 "or re-clone with:\n"
                 "    git clone --recursive https://github.com/CrispStrobe/CrispASR")
         endif()
+
+        # A submodule at the WRONG commit is nastier than a missing one: it
+        # compiles far enough to fail deep in an unrelated translation unit, and
+        # the error names a ggml API rather than the checkout. That is exactly
+        # how a worktree left on plain upstream ggml (v0.10.2-12, no `K` in
+        # ggml_gated_delta_net) instead of the pinned fork (v0.10.2-463) got
+        # "fixed" by editing talk-llama's caller to match — the code was right
+        # and the checkout was wrong. Warn (never fail: a deliberate local ggml
+        # bump is a normal thing to be doing) and say which way to reconcile.
+        find_package(Git QUIET)
+        if (GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+            execute_process(COMMAND "${GIT_EXECUTABLE}" ls-tree HEAD ggml
+                            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                            OUTPUT_VARIABLE _crispasr_ggml_pin_line
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+                            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ggml"
+                            OUTPUT_VARIABLE _crispasr_ggml_head
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            if (_crispasr_ggml_pin_line MATCHES "commit ([0-9a-f]+)")
+                set(_crispasr_ggml_pin "${CMAKE_MATCH_1}")
+                if (_crispasr_ggml_head AND NOT _crispasr_ggml_head STREQUAL _crispasr_ggml_pin)
+                    message(WARNING
+                        "The 'ggml' submodule is NOT at the commit this tree pins.\n"
+                        "  pinned  : ${_crispasr_ggml_pin}\n"
+                        "  checked out: ${_crispasr_ggml_head}\n"
+                        "A build failure naming a ggml function is then the CHECKOUT, not the "
+                        "caller — do not 'fix' the caller to match. Reconcile with:\n"
+                        "    git submodule update --init --recursive ggml   # adopt the pin\n"
+                        "or, if the new ggml is intended, commit the bump:\n"
+                        "    git add ggml && git commit")
+                endif()
+            endif()
+        endif()
+
         add_subdirectory(ggml)
+        if(WIN32 AND MSVC AND GGML_CUDA AND TARGET ggml-cuda AND NOT GGML_CUDA_NO_VMM)
+            # CUDA 12's CUDA::cuda_driver target normally gives ggml-cuda.dll a
+            # process-start import of nvcuda.dll. That prevents even --version
+            # (and CPU fallback) from running on a driverless Windows host.
+            # Delay-load the driver API: cudaGetDeviceCount can reject the
+            # unavailable backend cleanly, while VMM's cuMem* entry points load
+            # nvcuda.dll on first use when an NVIDIA device is actually present.
+            target_link_options(ggml-cuda PRIVATE "/DELAYLOAD:nvcuda.dll")
+            target_link_libraries(ggml-cuda PRIVATE delayimp)
+        endif()
         if(WIN32)
             # The following adds a _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR macro and is a workaround for
             # the Windows C++ standard library which does not support constexpr mutexes.
@@ -289,6 +376,45 @@ endif()
 # with "install FILES given no DESTINATION" (#298). Including it here is
 # idempotent with the later include in the install section.
 include(GNUInstallDirs)
+# ---------------------------------------------------------------------------
+# Backend link shims (#355)
+#
+# Every per-model library links `ggml-cuda` / `ggml-metal` under `if(GGML_CUDA)`
+# / `if(GGML_METAL)`. Nothing in this tree calls ggml_backend_cuda_init() or its
+# Metal twin directly — the link exists so a STATIC build keeps the backend's
+# object files, since backends register themselves from static initialisers and
+# a linker that sees no referenced symbol drops them (#316).
+#
+# It is also why the shipped CUDA binary carries libcuda.so.1 as a hard
+# DT_NEEDED and exits 127 on a host without the NVIDIA driver, before
+# ggml_backend_init_best() can fall back to CPU (#355).
+#
+# With GGML_BACKEND_DL the backends are MODULE libraries, dlopen'd at runtime by
+# ggml_backend_load_all() — which this tree already calls. CMake refuses a
+# MODULE_LIBRARY as a link target, and it must not be linked anyway: the whole
+# point is that a missing backend is a runtime no-op rather than a load-time
+# abort. So route the link sites through interface targets that are empty in a
+# DL build and the real backend otherwise.
+add_library(crispasr_link_ggml_metal INTERFACE)
+add_library(crispasr_link_ggml_cuda INTERFACE)
+add_library(crispasr_link_ggml_vulkan INTERFACE)
+# ggml-cpu is a MODULE under DL too — the CPU backend is dlopen'd like any
+# other, which is what makes the fallback work when CUDA is absent. The call
+# sites go through src/core/ggml_cpu_backend.h.
+add_library(crispasr_link_ggml_cpu INTERFACE)
+if(NOT GGML_BACKEND_DL)
+    if(GGML_METAL)
+        target_link_libraries(crispasr_link_ggml_metal INTERFACE ggml-metal)
+    endif()
+    if(GGML_CUDA)
+        target_link_libraries(crispasr_link_ggml_cuda INTERFACE ggml-cuda)
+    endif()
+    if(GGML_VULKAN)
+        target_link_libraries(crispasr_link_ggml_vulkan INTERFACE ggml-vulkan)
+    endif()
+    target_link_libraries(crispasr_link_ggml_cpu INTERFACE ggml-cpu)
+endif()
+
 add_subdirectory(src)
 
 # ---------------------------------------------------------------------------

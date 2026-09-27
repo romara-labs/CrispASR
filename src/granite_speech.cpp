@@ -374,6 +374,8 @@ struct granite_speech_context {
 
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -648,7 +650,16 @@ extern "C" int32_t* granite_speech_tokenize(struct granite_speech_context* ctx, 
         if (end <= plain_start)
             return;
         std::string seg = input.substr(plain_start, end - plain_start);
-        auto ids = core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, seg);
+        // granite-4.x (audio token >= 50000) uses the Llama-3 pre-tokenizer
+        // (\p{N}{1,3}, punctuation keeps its trailing newlines: "?\n" is ONE
+        // token). tokenize_simple split on whitespace and dropped the "\n"
+        // entirely, so every non-default prompt (-l, --hotwords, --ask,
+        // translate) differed from transformers' apply_chat_template ids.
+        // Verified id-for-id against the HF tokenizer on the backend's prompt
+        // shapes. granite-3.x keeps its GPT-2 path (different regex; unverified).
+        auto ids = ctx->model.hparams.audio_token_index >= 50000
+                       ? core_bpe::tokenize_qwen(ctx->token_to_id, ctx->merge_rank, seg, 3)
+                       : core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, seg);
         out_ids.insert(out_ids.end(), ids.begin(), ids.end());
     };
 
@@ -691,17 +702,17 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!granite_speech_load_model(ctx->model, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        granite_speech_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -876,9 +887,9 @@ extern "C" void granite_speech_free(struct granite_speech_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -1547,7 +1558,7 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
         }
     }
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "granite_encoder_graph: compute failed\n");
         return nullptr;
     }
@@ -1606,7 +1617,7 @@ static bool run_matmul_pair(granite_speech_context* ctx, float* out_a, ggml_tens
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return false;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mm_pair_in"), x, 0, (size_t)d_in * T * sizeof(float));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
         return false;
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_pair_out_a"), out_a, 0, (size_t)d_out_a * T * sizeof(float));
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_pair_out_b"), out_b, 0, (size_t)d_out_b * T * sizeof(float));
@@ -2091,7 +2102,7 @@ extern "C" float* granite_speech_run_projector(struct granite_speech_context* ct
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "proj_enc_input"), window_data, 0,
                                 (size_t)window_size * d * sizeof(float));
 
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+        if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
             return nullptr;
 
         ggml_tensor* out = ggml_graph_get_tensor(gf, "proj_output");
@@ -2287,7 +2298,7 @@ extern "C" float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, 
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                                 mask.size() * sizeof(ggml_fp16_t));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
         return nullptr;
 
     // Debug: dump per-layer values during prefill
@@ -2540,8 +2551,8 @@ static float* granite_run_bucket_decode(granite_speech_context* ctx, const float
         pmask[k] = (k <= n_past) ? zero : neg_inf;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), pmask, 0, ctx->dec_mask_buf.size());
 
-    const ggml_status st =
-        use_ga ? ggml_backend_graph_compute(ctx->backend, gf) : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    const ggml_status st = use_ga ? ggml_backend_graph_compute(ctx->backend, gf)
+                                  : core_sched_prof::compute(ctx->sched, gf, "granite-speech");
     if (st != GGML_STATUS_SUCCESS)
         return nullptr;
 
@@ -2690,8 +2701,8 @@ static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), pmask, 0, ctx->dec_mask_buf.size());
 
     const int64_t t_comp0 = ggml_time_us();
-    const ggml_status st =
-        use_ga ? ggml_backend_graph_compute(ctx->backend, gf) : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    const ggml_status st = use_ga ? ggml_backend_graph_compute(ctx->backend, gf)
+                                  : core_sched_prof::compute(ctx->sched, gf, "granite-speech");
     ctx->dec_prof_compute_us += ggml_time_us() - t_comp0;
     if (st != GGML_STATUS_SUCCESS)
         return -1;
@@ -2801,7 +2812,7 @@ extern "C" float* granite_speech_embed_tokens(struct granite_speech_context* ctx
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), input_ids, 0, (size_t)n_tokens * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (core_sched_prof::compute(ctx->sched, gf, "granite-speech") != GGML_STATUS_SUCCESS)
         return nullptr;
     ggml_tensor* emb = ggml_graph_get_tensor(gf, "embeds");
     float* result = (float*)malloc((size_t)n_tokens * d * sizeof(float));

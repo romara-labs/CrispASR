@@ -45,6 +45,7 @@ extern const char* crispasr_session_get_speaker_name(struct CrispasrSession* s, 
 extern int crispasr_session_set_instruct(struct CrispasrSession* s, const char* instruct);
 /* #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise). */
 extern int crispasr_session_set_tts_phonemes(struct CrispasrSession* s, const char* phonemes);
+extern void crispasr_session_set_tts_pad_silence_ms(struct CrispasrSession* s, int ms);
 extern int crispasr_session_is_custom_voice(struct CrispasrSession* s);
 extern int crispasr_session_is_voice_design(struct CrispasrSession* s);
 extern float* crispasr_session_synthesize(struct CrispasrSession* s, const char* text, int* out_n_samples);
@@ -83,6 +84,7 @@ extern int crispasr_session_set_cfg_weight(struct CrispasrSession* s, float cfg_
 extern int crispasr_session_set_tts_noise_temp(struct CrispasrSession* s, float noise_temp);
 extern int crispasr_session_set_exaggeration(struct CrispasrSession* s, float exaggeration);
 extern int crispasr_session_set_max_speech_tokens(struct CrispasrSession* s, int n);
+extern int crispasr_session_set_min_speech_tokens(struct CrispasrSession* s, int n);
 extern int crispasr_session_set_length_scale(struct CrispasrSession* s, float scale);
 extern int crispasr_session_set_best_of(struct CrispasrSession* s, int n);
 extern int crispasr_session_set_beam_size(struct CrispasrSession* s, int n);
@@ -549,6 +551,14 @@ static VALUE rb_session_set_max_speech_tokens(VALUE self, VALUE handle, VALUE n)
     return Qnil;
 }
 
+static VALUE rb_session_set_min_speech_tokens(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_min_speech_tokens(s, NUM2INT(n));
+    if (rc != 0 && rc != -2)
+        rb_raise(rb_eRuntimeError, "set_min_speech_tokens failed (rc=%d)", rc);
+    return Qnil;
+}
+
 static VALUE rb_session_set_length_scale(VALUE self, VALUE handle, VALUE scale) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_set_length_scale(s, (float)NUM2DBL(scale));
@@ -759,6 +769,12 @@ static VALUE rb_session_set_tts_phonemes(VALUE self, VALUE handle, VALUE phoneme
                  "backend has no phonemes-in entry point; set_tts_phonemes applies to kokoro and piper");
     if (rc != 0)
         rb_raise(rb_eRuntimeError, "set_tts_phonemes failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_tts_pad_silence_ms(VALUE self, VALUE handle, VALUE ms) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    crispasr_session_set_tts_pad_silence_ms(s, NUM2INT(ms));
     return Qnil;
 }
 
@@ -1870,6 +1886,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "speakers", rb_session_speakers, 1);
     rb_define_singleton_method(mSession, "set_instruct", rb_session_set_instruct, 2);
     rb_define_singleton_method(mSession, "set_tts_phonemes", rb_session_set_tts_phonemes, 2);
+    rb_define_singleton_method(mSession, "set_tts_pad_silence_ms", rb_session_set_tts_pad_silence_ms, 2);
     rb_define_singleton_method(mSession, "is_custom_voice", rb_session_is_custom_voice, 1);
     rb_define_singleton_method(mSession, "is_voice_design", rb_session_is_voice_design, 1);
     rb_define_singleton_method(mSession, "synthesize", rb_session_synthesize, 2);
@@ -1908,6 +1925,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_tts_noise_temp", rb_session_set_tts_noise_temp, 2);
     rb_define_singleton_method(mSession, "set_exaggeration", rb_session_set_exaggeration, 2);
     rb_define_singleton_method(mSession, "set_max_speech_tokens", rb_session_set_max_speech_tokens, 2);
+    rb_define_singleton_method(mSession, "set_min_speech_tokens", rb_session_set_min_speech_tokens, 2);
     rb_define_singleton_method(mSession, "set_length_scale", rb_session_set_length_scale, 2);
     rb_define_singleton_method(mSession, "set_best_of", rb_session_set_best_of, 2);
     rb_define_singleton_method(mSession, "set_beam_size", rb_session_set_beam_size, 2);
