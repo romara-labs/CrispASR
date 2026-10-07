@@ -90,6 +90,9 @@ public:
         if (!p.language.empty() && p.language != "auto") {
             std::strncpy(cp.espeak_lang, p.language.c_str(), sizeof(cp.espeak_lang) - 1);
             cp.espeak_lang[sizeof(cp.espeak_lang) - 1] = '\0';
+            init_espeak_lang_ = p.language;
+        } else {
+            init_espeak_lang_ = "en-us";
         }
         std::string resolved_model = kokoro_resolve_model(p.language, p.model);
         is_german_backbone_ = (resolved_model != p.model);
@@ -198,6 +201,16 @@ public:
         const float length_scale = (params.tts_speed > 0.0f) ? (1.0f / params.tts_speed) : 1.0f;
         kokoro_set_length_scale(ctx_, length_scale);
 
+        // Apply per-request G2P language with the same anti-leakage rule.
+        // The server forwards the request's "language" field in rp.language;
+        // without this the espeak voice stayed fixed at whatever --language
+        // the process started with, so a pt request on an en-us process came
+        // out phonemized as English. Empty/"auto" resets to the init
+        // language so consecutive requests never inherit each other's voice.
+        const std::string request_lang =
+            (!params.language.empty() && params.language != "auto") ? params.language : init_espeak_lang_;
+        kokoro_set_language(ctx_, request_lang.c_str());
+
         // #316: --tts-phonemes drives the acoustic model directly, skipping the
         // G2P. This is the seam a pronunciation bug lives on — feeding another
         // implementation's phoneme string through our model separates "our G2P
@@ -226,6 +239,7 @@ private:
     bool voice_loaded_ = false;
     bool embedded_voice_selected_ = false;
     bool is_german_backbone_ = false;
+    std::string init_espeak_lang_ = "en-us";
 };
 
 } // namespace
