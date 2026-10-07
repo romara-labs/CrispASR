@@ -257,7 +257,7 @@ def _warm_ccache_from_dataset(ccache_dir: Path) -> None:
     kernel and upload the single /kaggle/working/ccache.tar it writes. Attach
     via kernel-metadata.json (SAME account as the kernel — cross-account
     attach is rejected):
-        "dataset_sources": ["chr1str/crispasr-ccache", ...]
+        "dataset_sources": ["${KAGGLE_ACCOUNT}/crispasr-ccache", ...]
     Shaves ~15 min off incremental CUDA builds.
 
     Kaggle AUTO-EXTRACTS archives uploaded to a dataset, so the ccache.tar you
@@ -349,7 +349,7 @@ def export_ccache_tar(dest: str | os.PathLike = "/kaggle/working/ccache.tar") ->
     """Tar CCACHE_DIR into a SINGLE file for refreshing the ccache dataset.
 
     Call at the end of a kernel that did a real build, then upload `dest` as
-    chr1str/crispasr-ccache (and the chr1s4 copy — cross-account attach is
+    ${KAGGLE_ACCOUNT}/crispasr-ccache (and the $KAGGLE_ACCOUNT copy — cross-account attach is
     blocked, so each account needs its own).
 
     One file is the whole point: `kaggle kernels output` stops at 500 files
@@ -419,8 +419,8 @@ def install_build_toolchain() -> dict:
         # the cache shared across local git worktrees.
         os.environ["CCACHE_NOHASHDIR"] = "1"
         os.environ["CCACHE_BASEDIR"] = str(_scratch)
-        # Warm ccache from attached dataset (chr1s4/crispasr-ccache or
-        # chr1str/crispasr-ccache). Shaves ~15 min off incremental builds.
+        # Warm ccache from attached dataset (${KAGGLE_ACCOUNT}/crispasr-ccache or
+        # ${KAGGLE_ACCOUNT}/crispasr-ccache). Shaves ~15 min off incremental builds.
         _warm_ccache_from_dataset(ccache_dir)
         if _HAS_CCACHE:
             subprocess.run("ccache -M 5G && ccache -z", shell=True,
@@ -446,7 +446,7 @@ def crispasr_cmake_flags() -> list[str]:
     C2PA provenance signing is irrelevant to a benchmark / conversion / A-B
     kernel, and disabling it skips the target entirely — cheaper than fetching
     another submodule. Kernels that DO want C2PA should clone `--recursive`
-    instead. (Confirmed fix on chr1str/crispasr-issue81-onnx-bench, 2026-07-18.)
+    instead. (Confirmed fix on ${KAGGLE_ACCOUNT}/crispasr-issue81-onnx-bench, 2026-07-18.)
     """
     return ["-DCRISPASR_NO_C2PA_NATIVE=ON"]
 
@@ -584,7 +584,7 @@ def _kaggle_input_root() -> Path:
 
 def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     """Read an HF token from a private Kaggle Dataset mounted via
-    kernel-metadata.json `dataset_sources` (e.g. chr1str/crispasr-hf-token
+    kernel-metadata.json `dataset_sources` (e.g. ${KAGGLE_ACCOUNT}/crispasr-hf-token
     → /kaggle/input/crispasr-hf-token/hf_token.txt). Bypasses the flaky
     Secrets API; datasets are filesystem-mounted before the script runs.
 
@@ -613,8 +613,8 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     # Owner-agnostic scan: probe <filename> in EVERY mounted dataset dir, at
     # both the classic depth (<root>/<slug>/) and the newer nested depth
     # (<root>/datasets/<owner>/<slug>/). The old code only matched owner
-    # names containing "hf-token" and hard-coded chr1str, so a chr1s4 kernel on
-    # the newer mount path (/kaggle/input/datasets/chr1s4/crispasr-hf-token/)
+    # names containing "hf-token" and hard-coded $KAGGLE_ACCOUNT, so a $KAGGLE_ACCOUNT kernel on
+    # the newer mount path (/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/)
     # never had its token file scanned → token silently unresolved (the
     # 2026-06-20 v2/v3 full-sweep runs). Don't filter by dir name — probe the file.
     # Deterministic precedence (matches the t19 driver's sorted short-then-long

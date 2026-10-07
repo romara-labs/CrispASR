@@ -720,6 +720,53 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                __func__);
     }
 
+    // Marian / Opus-MT: everything is quantized by default, and that is a
+    // measured choice. `shared.embed.weight` is the input embedding of the
+    // encoder AND the decoder AND the output projection (tied), scaled by
+    // sqrt(d_model) on the way in — the obvious suspect when a quant's greedy
+    // output stops matching f16. Holding it at source precision
+    // (CRISPASR_MARIAN_KEEP=embed) and counting sentences whose greedy output
+    // equals the reference implementation (opus-mt-de-en /14, en-de /8):
+    //
+    //             all quantized            embedding kept
+    //     q8_0    84 MB   12/14   8/8      111 MB   12/14   8/8
+    //     q6_k    66 MB   11/14   7/8      101 MB   12/14   8/8
+    //     q5_k    56 MB   10/14   5/8       95 MB    9/14   6/8
+    //     q4_k    47 MB    8/14   3/8       89 MB   10/14   4/8
+    //
+    // Nearly double the file for one or two sentences, and nothing at q8_0:
+    // the flips come from the 12 blocks, not the embedding (same finding as
+    // t5 above). And the "mismatches" are not damage — "departs" / "leaves",
+    // "reduce taxes" / "lower taxes", "on 3 October in Berlin" / "in Berlin on
+    // 3 October". Translation has near-tied continuations where recognition
+    // does not, so exact-match against f16 is the wrong bar for this family.
+    // CRISPASR_MARIAN_KEEP stays as the lever: "embed", or a comma list of
+    // name fragments to hold at source precision.
+    const bool is_marian = (arch == "marian");
+    std::vector<std::string> marian_keep;
+    if (is_marian) {
+        const char* e = std::getenv("CRISPASR_MARIAN_KEEP");
+        std::string spec = e && *e ? e : "none";
+        if (spec == "embed")
+            spec = "shared.embed";
+        if (spec != "none") {
+            size_t b = 0;
+            while (b <= spec.size()) {
+                const size_t c = spec.find(',', b);
+                const std::string item = spec.substr(b, c == std::string::npos ? std::string::npos : c - b);
+                if (!item.empty())
+                    marian_keep.push_back(item);
+                if (c == std::string::npos)
+                    break;
+                b = c + 1;
+            }
+        }
+        printf("%s: marian — keeping at source precision:", __func__);
+        for (const auto& k : marian_keep)
+            printf(" %s*", k.c_str());
+        printf("%s\n", marian_keep.empty() ? " (nothing)" : "");
+    }
+
     const bool is_parakeet = (arch == "parakeet");
     bool parakeet_is_rnnt = false;
     if (is_parakeet) {
@@ -943,10 +990,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // across persistent decoder state. Kaggle parity decides whether
             // the published Q4 needs these encoder tensors retained at F16.
             !(vibevoice_asr_frontend_f16 && (sname.find("at_enc.") == 0 || sname.find("st_enc.") == 0)) &&
-            !(is_breeze && (sname == "backbone.audio_embd.weight" || sname == "backbone.codebook0_head.weight" ||
-                            sname.rfind("depth.cb_head.", 0) == 0 || sname == "te_proj.weight" ||
-                            sname == "depth.projection.weight" ||
-                            (!breeze_quant_text_embd && sname == "te.token_embd.weight"))) &&
+            !(is_breeze &&
+              (sname == "backbone.audio_embd.weight" || sname == "backbone.codebook0_head.weight" ||
+               sname.rfind("depth.cb_head.", 0) == 0 || sname == "te_proj.weight" ||
+               sname == "depth.projection.weight" || (!breeze_quant_text_embd && sname == "te.token_embd.weight"))) &&
             !(is_zonos && (sname.find("heads.") == 0 || sname.find("embeddings.") == 0 ||
                            sname.find("prefix_conditioner.") == 0)) &&
             !(is_bark &&
@@ -987,6 +1034,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
               (sname.find("joint.") == 0 || sname.find("decoder.") == 0 || sname.find("head.ctc.") == 0 ||
                sname.find("encoder.pre.") == 0 || sname.find("preprocessor.") == 0)) &&
             !(t5_keep_embed && (sname.find("shared.embed") == 0 || sname.find("lm_head") == 0)) &&
+            !(is_marian && std::any_of(marian_keep.begin(), marian_keep.end(),
+                                       [&](const std::string& k) { return sname.find(k) != std::string::npos; })) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&
             ([&]() {
                 if (!is_tada || tada_quant_all || (tada_keep_head == 0 && tada_keep_tail == 0))
@@ -1116,17 +1165,21 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         }
 
         // User per-tensor override (--tensor-type <regex>=<type>). First match
-        // wins; overrides the arch guards above. A quant override on a <2-D or
-        // ill-tiled row is skipped (with a note) rather than corrupting output.
+        // wins; overrides the arch guards above. An override that would LOWER a
+        // <2-D tensor (bias, norm weight) below F32 is skipped, with a note:
+        // graphs add those as F32, and ggml's CPU add aborts on F32 + F16
+        // (#461: '^locdit\.=f16' turned the LocDiT biases F16 and CPU
+        // synthesis crashed; Vulkan happened to tolerate it). An ill-tiled row
+        // under a quant override is skipped the same way.
         for (size_t r = 0; r < g_type_overrides.size(); r++) {
             if (!std::regex_search(sname, g_type_overrides[r].first))
                 continue;
             ggml_type ov = g_type_overrides[r].second;
+            if (ggml_n_dims(t) < 2 && ov != GGML_TYPE_F32) { // raising a norm to F32 is fine
+                override_skips[r]++;
+                break;
+            }
             if (ggml_is_quantized(ov)) {
-                if (ggml_n_dims(t) < 2) {
-                    override_skips[r]++;
-                    break;
-                }
                 ggml_type fit = crispasr_row_fit(ov, ncols);
                 if (fit == GGML_TYPE_COUNT) {
                     override_skips[r]++;

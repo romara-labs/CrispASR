@@ -23,8 +23,8 @@ Two readouts that can actually report failure
    cosine + magnitude. A tiling bug shows up here even if it happens to leave
    the transcript readable.
 
-Push (chr1s4):
-  export KAGGLE_API_TOKEN=<chr1s4 token>
+Push ($KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/hojo-asr-438
 """
 

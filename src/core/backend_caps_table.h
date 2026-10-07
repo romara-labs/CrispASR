@@ -85,6 +85,9 @@ static const BackendCaps k_backend_caps[] = {
     {"hojo-asr", 270864u, "language-detect,beam-search,punctuation-native,auto-download"},
     {"htdemucs", 5251072u, "auto-download,separate"},
     {"hubert", 548938u, "timestamps-ctc,token-confidence,diarize,auto-download,parallel-processors"},
+    {"index-echo", 1324337u,
+     "timestamps-native,language-detect,translate,temperature,flash-attn,punctuation-native,src-tgt-language,auto-"
+     "download"},
     {"indextts", 206080u, "temperature,flash-attn,auto-download,tts,voice-cloning"},
     {"irodori-tts", 204800u, "auto-download,tts,voice-cloning"},
     {"kartoffel-orpheus-de-natural", 75008u, "temperature,flash-attn,auto-download,tts"},
@@ -101,15 +104,17 @@ static const BackendCaps k_backend_caps[] = {
     {"m2m100", 12832u, "translate,beam-search,src-tgt-language,auto-download"},
     {"m2m100-wmt21", 12832u, "translate,beam-search,src-tgt-language,auto-download"},
     {"madlad", 12832u, "translate,beam-search,src-tgt-language,auto-download"},
+    {"marian", 4640u, "translate,beam-search,src-tgt-language"},
     {"mega-asr", 32618u,
      "timestamps-ctc,token-confidence,translate,diarize,temperature,beam-search,flash-attn,punctuation-toggle,src-tgt-"
      "language,auto-download,parallel-processors"},
     {"mel-band-roformer", 5251072u, "auto-download,separate"},
     {"melotts", 65536u, "tts"},
-    {"mimo-asr", 272202u,
-     "timestamps-ctc,token-confidence,diarize,temperature,beam-search,flash-attn,punctuation-native,auto-download"},
+    {"mimo-asr", 272218u,
+     "timestamps-ctc,token-confidence,language-detect,diarize,temperature,beam-search,flash-attn,punctuation-native,"
+     "auto-download"},
     {"mini-omni2", 2171136u, "temperature,auto-download,tts,s2s"},
-    {"miotts", 65536u, "tts"},
+    {"miotts", 73984u, "temperature,auto-download,tts"},
     {"moonshine", 12106u,
      "timestamps-ctc,token-confidence,diarize,temperature,beam-search,flash-attn,punctuation-toggle,auto-download"},
     {"moonshine-streaming", 272202u,
@@ -139,6 +144,9 @@ static const BackendCaps k_backend_caps[] = {
      "timestamps-native,word-timestamps,token-confidence,diarize,temperature,beam-search,flash-attn,punctuation-toggle,"
      "auto-download,parallel-processors"},
     {"parler-tts", 73984u, "temperature,auto-download,tts"},
+    {"phonon2", 1863501u,
+     "timestamps-native,word-timestamps,token-confidence,diarize,temperature,beam-search,flash-attn,punctuation-toggle,"
+     "punctuation-native,auto-download,parallel-processors"},
     {"piano-transcription", 134225921u, "timestamps-native,auto-download,piano"},
     {"piper", 65536u, "tts"},
     {"pocket-tts", 205056u, "temperature,auto-download,tts,voice-cloning"},
@@ -195,7 +203,7 @@ static const BackendCaps k_backend_caps[] = {
      "timestamps-ctc,token-confidence,diarize,temperature,beam-search,flash-attn,punctuation-toggle,auto-download,"
      "parallel-processors"},
     {"wav2vec2", 548938u, "timestamps-ctc,token-confidence,diarize,auto-download,parallel-processors"},
-    {"whisper", 321533u,
+    {"whisper", 1370109u,
      "timestamps-native,word-timestamps,token-confidence,language-detect,translate,diarize,grammar,temperature,beam-"
      "search,flash-attn,punctuation-native,auto-download,parallel-processors,vad-internal"},
     {"xasr", 270336u, "punctuation-native,auto-download"},

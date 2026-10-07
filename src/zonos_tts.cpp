@@ -1072,7 +1072,7 @@ static const char* g2p_mode_name(g2p_mode m) {
 
 // Languages where the BUILT-IN G2P is the default ahead of espeak.
 //
-// Only what was measured, per language, on chr1s4/crispasr-zonos-g2p-435 with
+// Only what was measured, per language, on ${KAGGLE_ACCOUNT}/crispasr-zonos-g2p-435 with
 // espeak physically removed and the removal verified:
 //
 //     en   ASR word-F1 1.00 vs espeak 1.00, 0 dropped symbols
@@ -1115,7 +1115,7 @@ static bool builtin_is_default_for(const std::string& lang) {
 // words; the conversion takes it to 88.0%.
 //
 // Which one is better for the AUDIO was a question for a measurement, and the
-// measurement came back against the espeak spelling: chr1s4/crispasr-zonos-g2p-ru
+// measurement came back against the espeak spelling: ${KAGGLE_ACCOUNT}/crispasr-zonos-g2p-ru
 // v2 raised phoneme-ID agreement with the espeak arm on all three sentences
 // (0.773/0.759/0.627 -> 0.818/0.852/0.847) and took the ASR roundtrip from
 // 0.293 to 0.000 on every one of them, in both the with-espeak and the

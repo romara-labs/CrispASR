@@ -1142,6 +1142,16 @@ if(WIN32)
     target_compile_definitions(crispasr-llama-core PRIVATE _WIN32_WINNT=0x0602)
 endif()
 
+# Index-Echo combines the shared AuT tower and a private Qwen3.5 decoder.
+add_library(index_echo STATIC index_echo.cpp index_echo.h)
+target_include_directories(index_echo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(index_echo PRIVATE ${CMAKE_SOURCE_DIR}/crisp_audio/include)
+target_compile_features(index_echo PUBLIC cxx_std_17)
+target_link_libraries(index_echo PUBLIC crispasr-core ggml ggml-base Threads::Threads
+                      PRIVATE crisp_audio crispasr-llama-core)
+set_target_properties(index_echo PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(crispasr-lib PUBLIC index_echo)
+
 # ---------------------------------------------------------------------------
 # Nemotron — nvidia/nemotron-3.5-asr-streaming-0.6b (Cache-Aware FastConformer + RNNT)
 # ---------------------------------------------------------------------------
@@ -1288,7 +1298,18 @@ if(APPLE)
         find_library(ACCELERATE_LIB Accelerate REQUIRED)
     endif()
     target_link_libraries(parakeet PUBLIC ${ACCELERATE_LIB})
-    target_compile_definitions(parakeet PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+    target_compile_definitions(parakeet PRIVATE HAVE_ACCELERATE HAVE_PARAKEET_BLAS ACCELERATE_NEW_LAPACK)
+elseif(CRISPASR_MEL_BLAS AND NOT MSVC)
+    # Reuse the existing external-BLAS opt-out used by static bindings/WASM.
+    # Enable only OpenBLAS: reference Netlib cblas has no performance benefit.
+    find_library(PARAKEET_OPENBLAS NAMES openblas openblasp openblaso QUIET)
+    find_path(PARAKEET_CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas)
+    if(PARAKEET_OPENBLAS AND PARAKEET_CBLAS_INCLUDE_DIR)
+        target_link_libraries(parakeet PUBLIC ${PARAKEET_OPENBLAS})
+        target_include_directories(parakeet PRIVATE ${PARAKEET_CBLAS_INCLUDE_DIR})
+        target_compile_definitions(parakeet PRIVATE HAVE_PARAKEET_BLAS)
+        message(STATUS "parakeet: OpenBLAS decoder available (CRISPASR_PARAKEET_CPU_BLAS)")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1989,6 +2010,18 @@ target_compile_features   (m2m100 PUBLIC cxx_std_17)
 target_link_libraries     (m2m100 PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 if(NOT MSVC)
     target_compile_options(m2m100 PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# hikari — sbintuitions/hikari-medium simultaneous speech translation
+# ---------------------------------------------------------------------------
+add_library(hikari STATIC hikari.h hikari.cpp)
+set_target_properties(hikari PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(hikari PUBLIC .)
+target_compile_features   (hikari PUBLIC cxx_std_17)
+target_link_libraries     (hikari PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(hikari PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -3161,6 +3194,9 @@ if (TARGET indextts)
 endif()
 if (TARGET m2m100)
     target_link_libraries(crispasr-lib PUBLIC m2m100)
+endif()
+if (TARGET hikari)
+    target_link_libraries(crispasr-lib PUBLIC hikari)
 endif()
 if (TARGET t5_translate)
     target_link_libraries(crispasr-lib PUBLIC t5_translate)

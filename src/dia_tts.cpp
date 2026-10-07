@@ -29,6 +29,7 @@
 //    the shared core_dac implementation from dac_decoder.h.
 
 #include "dia_tts.h"
+#include "dia_sampling.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -303,87 +304,6 @@ static std::vector<uint32_t> dia_tokenize(const std::string& text, uint32_t max_
 // -----------------------------------------------------------------------
 // Sampling
 // -----------------------------------------------------------------------
-
-static uint32_t dia_sample_token(const float* logits, uint32_t vocab_size, float temperature, float top_p, int top_k,
-                                 std::mt19937& rng) {
-    if (temperature <= 0.0f) {
-        // Greedy
-        return (uint32_t)(std::max_element(logits, logits + vocab_size) - logits);
-    }
-
-    // Apply temperature
-    std::vector<float> probs(vocab_size);
-    float max_logit = *std::max_element(logits, logits + vocab_size);
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] = (logits[i] - max_logit) / temperature;
-    }
-
-    // Softmax
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] = std::exp(probs[i]);
-        sum += probs[i];
-    }
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] /= sum;
-    }
-
-    // Top-k filter
-    if (top_k > 0 && top_k < (int)vocab_size) {
-        std::vector<std::pair<float, uint32_t>> sorted_probs(vocab_size);
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            sorted_probs[i] = {probs[i], i};
-        }
-        std::partial_sort(sorted_probs.begin(), sorted_probs.begin() + top_k, sorted_probs.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-        float threshold = sorted_probs[top_k - 1].first;
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            if (probs[i] < threshold) {
-                probs[i] = 0.0f;
-            }
-        }
-        // Re-normalize
-        sum = 0.0f;
-        for (uint32_t i = 0; i < vocab_size; i++)
-            sum += probs[i];
-        if (sum > 0.0f) {
-            for (uint32_t i = 0; i < vocab_size; i++)
-                probs[i] /= sum;
-        }
-    }
-
-    // Top-p (nucleus) filter
-    if (top_p > 0.0f && top_p < 1.0f) {
-        std::vector<std::pair<float, uint32_t>> sorted_probs(vocab_size);
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            sorted_probs[i] = {probs[i], i};
-        }
-        std::sort(sorted_probs.begin(), sorted_probs.end(),
-                  [](const auto& a, const auto& b) { return a.first > b.first; });
-        float cumsum = 0.0f;
-        for (auto& [p, idx] : sorted_probs) {
-            cumsum += p;
-            if (cumsum > top_p) {
-                p = 0.0f;
-            }
-        }
-        for (auto& [p, idx] : sorted_probs) {
-            probs[idx] = p;
-        }
-        // Re-normalize
-        sum = 0.0f;
-        for (uint32_t i = 0; i < vocab_size; i++)
-            sum += probs[i];
-        if (sum > 0.0f) {
-            for (uint32_t i = 0; i < vocab_size; i++)
-                probs[i] /= sum;
-        }
-    }
-
-    // Sample
-    std::discrete_distribution<uint32_t> dist(probs.begin(), probs.end());
-    return dist(rng);
-}
 
 // -----------------------------------------------------------------------
 // Weight loading
@@ -712,12 +632,11 @@ static ggml_tensor* build_dia_decoder_embedding(ggml_context* ctx, dia_model& m,
 // Delay pattern logic
 // -----------------------------------------------------------------------
 
-static bool dia_check_stopping(dia_tts_context& ctx) {
+static bool dia_check_stopping(dia_tts_context& ctx, uint32_t max_steps) {
     auto& m = ctx.model;
     auto& tokens = ctx.current_audio_tokens;
 
-    if (ctx.delay_steps == -1 &&
-        (tokens[0] == m.eos_token_id || ctx.current_position >= m.max_generation_size - m.max_delay)) {
+    if (ctx.delay_steps == -1 && (tokens[0] == m.eos_token_id || ctx.current_position >= max_steps - m.max_delay - 1)) {
         ctx.delay_steps = (int)m.max_delay;
     }
 
@@ -792,6 +711,7 @@ struct dia_tts_context* dia_tts_init_from_file(const char* path_model, struct di
     if (!ctx)
         return nullptr;
     ctx->params = params;
+    ctx->params.n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
     // Initialize RNG
     if (params.seed != 0) {
@@ -843,6 +763,7 @@ struct dia_tts_context* dia_tts_init_from_file(const char* path_model, struct di
     //     Kaggle CUDA re-run confirms the fix. Mirrors LEARNING 34's
     //     ggml_backend_is_metal gate (here Metal is the *validated* one).
     ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->params.n_threads);
     const char* gpu_env = crispasr_env::get("CRISPASR_DIA_TTS_GPU");
     const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
     const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
@@ -1318,14 +1239,21 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         ctx->current_audio_tokens[i] = m.bos_token_id;
     }
 
-    uint32_t max_gen = (p.max_tokens > (int)m.max_delay) ? (uint32_t)p.max_tokens : m.max_generation_size;
-    // TEMP: limit for CPU testing (full 3072 steps impractical on this CPU).
-    // Override with DIA_MAX_STEPS for longer prompts on faster backends.
-    uint32_t step_cap = 200;
-    if (const char* ms = crispasr_env::get("CRISPASR_DIA_MAX_STEPS"))
-        step_cap = (uint32_t)atoi(ms);
-    if (max_gen > step_cap)
-        max_gen = step_cap;
+    // Match the checkpoint's generation capacity; explicit limits can shorten
+    // it but cannot overrun the model's KV allocation. There is no CPU-only cap.
+    uint32_t max_gen = m.max_generation_size;
+    if (p.max_tokens > 0)
+        max_gen = std::min(max_gen, (uint32_t)p.max_tokens);
+    if (const char* ms = crispasr_env::get("CRISPASR_DIA_MAX_STEPS")) {
+        char* end = nullptr;
+        const long requested = std::strtol(ms, &end, 10);
+        if (end != ms && *end == '\0' && requested > (long)m.max_delay)
+            max_gen = (uint32_t)std::min((long)max_gen, requested);
+    }
+    if (max_gen <= m.max_delay) {
+        fprintf(stderr, "dia_tts: generation capacity must exceed audio delay\n");
+        return nullptr;
+    }
 
     // --- diff/debug hooks (env-gated; output paths come from the env value, never hardcoded) ---
     // DIA_GREEDY=1         : temperature=0 (argmax) for deterministic diffing
@@ -1350,9 +1278,26 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                 dia_forced.size() / m.n_output_heads);
     }
     const bool dia_force = !dia_forced.empty();
+    // Force sampled outputs while preserving the real delay/BOS feedback loop.
+    // Unlike FORCE_TOKENS, this also audits generation bookkeeping itself.
+    std::vector<int32_t> dia_forced_outputs;
+    if (const char* fp = crispasr_env::get("CRISPASR_DIA_FORCE_OUTPUT_TOKENS")) {
+        if (FILE* f = fopen(fp, "rb")) {
+            int32_t v;
+            while (fread(&v, sizeof(v), 1, f) == 1)
+                dia_forced_outputs.push_back(v);
+            fclose(f);
+        }
+    }
+    const bool dia_force_outputs = !dia_forced_outputs.empty();
+    if (dia_force_outputs)
+        max_gen = (uint32_t)std::min((size_t)m.max_generation_size, dia_forced_outputs.size() / m.n_output_heads);
+    const char* dia_input_path = crispasr_env::get("CRISPASR_DIA_DUMP_INPUT_TOKENS");
+    if (dia_input_path)
+        remove(dia_input_path);
     const char* dia_steplogits_path = crispasr_env::get("CRISPASR_DIA_DUMP_STEPLOGITS");
     if (dia_force)
-        max_gen = (uint32_t)(dia_forced.size() / m.n_output_heads);
+        max_gen = (uint32_t)std::min((size_t)m.max_generation_size, dia_forced.size() / m.n_output_heads);
     if (dia_steplogits_path)
         remove(dia_steplogits_path); // truncate; we append per step
 
@@ -1512,11 +1457,20 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         ggml_set_name(enc_in, "enc_in");
         ggml_set_input(enc_in);
 
+        // The official checkpoint rotates cached cross-attention keys at
+        // encoder positions, and decoder queries at the current audio step.
+        ggml_tensor* cross_positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_enc);
+        ggml_set_name(cross_positions, "cross_positions");
+        ggml_set_input(cross_positions);
+
         // Project cross K/V for each layer
         std::vector<ggml_tensor*> outputs;
         for (int l = 0; l < (int)m.n_decoder_layers; l++) {
             auto& layer = m.decoder.layers[l];
             ggml_tensor* ck = ggml_mul_mat(ctx0, layer.cross_k_proj, enc_in);
+            ck = ggml_rope(ctx0, ggml_cont(ctx0, ggml_reshape_4d(ctx0, ck, head_dim, n_heads, T_enc, B)),
+                           cross_positions, head_dim, DIA_ROPE_MODE);
+            ck = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ck), cross_kv_dim, T_enc, B);
             ggml_tensor* cv = ggml_mul_mat(ctx0, layer.cross_v_proj, enc_in);
             std::string kname = "cross_k_" + std::to_string(l);
             std::string vname = "cross_v_" + std::to_string(l);
@@ -1541,6 +1495,8 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
 
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_in"), encoder_output.data(), 0,
                                 encoder_output.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cross_positions"), positions.data(), 0,
+                                positions.size() * sizeof(int32_t));
 
         ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
         if (st != GGML_STATUS_SUCCESS) {
@@ -1618,6 +1574,13 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                 for (uint32_t h = 0; h < m.n_output_heads; h++) {
                     int32_t g = gen[step][h];
                     ctx->current_audio_tokens[h] = (g >= 0) ? (uint32_t)g : m.bos_token_id;
+                }
+            }
+
+            if (dia_input_path) {
+                if (FILE* f = fopen(dia_input_path, "ab")) {
+                    fwrite(ctx->current_audio_tokens.data(), sizeof(uint32_t), m.n_output_heads, f);
+                    fclose(f);
                 }
             }
 
@@ -1790,7 +1753,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                     // Q from decoder hidden state
                     ggml_tensor* Q = ggml_mul_mat(ctx0, layer.cross_q_proj, cur); // (dec_hidden, 1, B)
                     Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
-                    // No RoPE on cross-attention Q (cross-attn uses absolute position from encoder)
+                    Q = ggml_rope(ctx0, ggml_cont(ctx0, Q), dec_pos, head_dim, DIA_ROPE_MODE);
 
                     // K/V from precomputed cross-attention cache
                     // cross_k: (cross_kv_dim=2048, T_enc, B) -> (hd, n_heads, T_enc, B)
@@ -2067,8 +2030,13 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
 
             ggml_free(ctx0);
 
-            // EOS/delay override on the sampled tokens (end-of-sequence delay) + stop check.
-            bool stop = dia_check_stopping(*ctx);
+            if (dia_force_outputs) {
+                for (uint32_t h = 0; h < m.n_output_heads; ++h)
+                    ctx->current_audio_tokens[h] = (uint32_t)dia_forced_outputs[(size_t)step * m.n_output_heads + h];
+            }
+            // Forced outputs already include the reference's EOS/PAD overrides.
+            // Free generation performs the checkpoint's delayed stopping rule.
+            bool stop = !dia_force && !dia_force_outputs && dia_check_stopping(*ctx, max_gen);
 
             if (dia_force) {
                 // teacher-forcing: emit sampled directly (output unused for diffing)
@@ -2078,6 +2046,10 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                 // Write sampled (post-override) into the delayed buffer at step+1, with the
                 // start-of-sequence BOS mask (only fill positions still unwritten), mirroring
                 // Python update_one(pred, step+1, apply_mask=bos_countdown>0). Then emit gen[step+1].
+                // Official generate() decrements before update_one(): at the
+                // last delayed BOS position, the sampled token must replace it.
+                if (bos_countdown > 0)
+                    bos_countdown--;
                 const bool apply_mask = (bos_countdown > 0);
                 if (step + 1 < (uint32_t)gen_len) {
                     for (uint32_t c = 0; c < m.n_output_heads; c++)
@@ -2086,8 +2058,6 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                     for (uint32_t c = 0; c < m.n_output_heads; c++)
                         ctx->output_tokens.push_back((uint32_t)gen[step + 1][c]);
                 }
-                if (bos_countdown > 0)
-                    bos_countdown--;
             }
 
             if (stop) {
@@ -2201,8 +2171,10 @@ void dia_tts_free(struct dia_tts_context* ctx) {
 }
 
 void dia_tts_set_n_threads(struct dia_tts_context* ctx, int n_threads) {
-    if (ctx)
-        ctx->params.n_threads = n_threads;
+    if (ctx) {
+        ctx->params.n_threads = n_threads > 0 ? n_threads : 4;
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->params.n_threads);
+    }
 }
 
 void dia_tts_set_temperature(struct dia_tts_context* ctx, float temperature) {
@@ -2225,4 +2197,9 @@ void dia_tts_set_seed(struct dia_tts_context* ctx, uint64_t seed) {
             ctx->rng.seed(rd());
         }
     }
+}
+
+void dia_tts_set_max_tokens(struct dia_tts_context* ctx, int max_tokens) {
+    if (ctx)
+        ctx->params.max_tokens = max_tokens > 0 ? max_tokens : 0;
 }

@@ -12,7 +12,7 @@ is worthless.
 
 CPU-only kernel. Kaggle CPU workers get NO internet (kaggle_usage.md gotcha #3),
 so nothing is cloned: the ggml source and the probe .cpp arrive via
-dataset_sources (chr1str/crispasr-repack-probe-src), which is the only delivery
+dataset_sources (${KAGGLE_ACCOUNT}/crispasr-repack-probe-src), which is the only delivery
 route that survives no internet.
 """
 import json

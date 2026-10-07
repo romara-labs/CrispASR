@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Russian G2P without espeak-ng: is the new built-in good enough to default to?
 
-Direct continuation of chr1s4/crispasr-zonos-g2p-435, which answered the same
+Direct continuation of ${KAGGLE_ACCOUNT}/crispasr-zonos-g2p-435, which answered the same
 question for en/de/fr/es and left Russian as the one language zonos still
 needed espeak-ng (GPL-3.0) for. crispasr-core now ships a Russian G2P:
 a 812,953-entry IPA dictionary with lexical stress already resolved

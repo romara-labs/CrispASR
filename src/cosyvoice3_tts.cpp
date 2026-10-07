@@ -4962,7 +4962,7 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     // Shared core_hift_simdconv handles validation, tensor dequantization and
     // rollback; this model adapter contributes only the bound tensors + causal padding.
     {
-        // DEFAULT ON since the quiet-box A/B (chr1str/crispasr-simdconv-cpu-ab,
+        // DEFAULT ON since the quiet-box A/B (${KAGGLE_ACCOUNT}/crispasr-simdconv-cpu-ab,
         // Xeon avx512f, packed 72/72): hift_vocoder median 4400→4114 ms
         // (1.07x), on top of the contributor's 1.34x on Zen 4 — wins on every
         // platform measured, output within 1 int16 LSB, roundtrip exact.

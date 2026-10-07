@@ -31,8 +31,8 @@ frames), so the kernel skips the accelerator lottery and the CUDA build
 entirely. Internet still works with enable_gpu=false — the convert kernel
 proved that.
 
-Push (chr1str):
-  export KAGGLE_API_TOKEN=<chr1str token>
+Push ($KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/breeze-validate
 """
 

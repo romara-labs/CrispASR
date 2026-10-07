@@ -177,6 +177,21 @@ constexpr Entry k_registry[] = {
     {"granite-4.1-nar", "granite-speech-4.1-2b-nar-q4_k.gguf",
      "https://huggingface.co/cstr/granite-speech-4.1-2b-nar-GGUF/resolve/main/granite-speech-4.1-2b-nar-q4_k.gguf",
      "~3.2 GB", nullptr, nullptr},
+    // Index-Echo S2TT 2B (#485): paired audio tower + hybrid Qwen3.5 decoder.
+    // Q8 passes the independent stage/cache/direct-output checks; Q4 is rejected.
+    {"index-echo", "index-echo-2b-q8_0.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-q8_0.gguf", "~670 MiB",
+     "index-echo-2b-decoder-q8_0.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-decoder-q8_0.gguf", "~1.93 GiB"},
+    {"index-echo", "index-echo-2b-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-f16.gguf", "~1.22 GiB",
+     "index-echo-2b-decoder-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-decoder-f16.gguf", "~3.63 GiB"},
+    {"index-echo", "index-echo-9b-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-9b-GGUF/resolve/main/index-echo-9b-f16.gguf", "~1.22 GiB",
+     "index-echo-9b-decoder-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-9b-GGUF/resolve/main/index-echo-9b-decoder-f16.gguf", "~16.69 GiB"},
+
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
@@ -735,6 +750,11 @@ constexpr Entry k_registry[] = {
     {"parakeet-redux", "parakeet-redux-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-redux-GGUF/resolve/main/parakeet-redux-q4_k.gguf", "~402 MB", nullptr,
      nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/moondream/parakeet-redux)"},
+    // Phonon-2 (#481) — exact five-value/int6 expansion, existing Parakeet TDT
+    // runtime. Q8_0 is the fidelity/size default; Q4_K has more text drift.
+    {"phonon2", "phonon2-q8_0.gguf",
+     "https://huggingface.co/cstr/phonon2-GGUF/resolve/main/phonon2-q8_0.gguf", "~674 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/FermionResearch/Phonon-2)"},
     // orukeet (#445) — oruk/orukeet r3, a fine-tune of parakeet-tdt-0.6b-v3
     // with the architecture unchanged (half of the encoder's depthwise conv
     // kernels replaced by fitted Gabor functions, then re-adapted). Same 25
@@ -822,11 +842,12 @@ constexpr Entry k_registry[] = {
     {"miocodec", "miocodec-v2-44k-q8_0.gguf",
      "https://huggingface.co/cstr/miocodec-v2-44k-GGUF/resolve/main/miocodec-v2-44k-q8_0.gguf",
      "~155 MB"},
-    // MioTTS-0.6B (Qwen3 LLM + MioCodec-25Hz-24kHz, Apache-2.0).
+    // MioTTS-0.6B (Qwen3 LLM + MioCodec-v2, 44.1 kHz, Apache-2.0).
     // Single GGUF, tokenizer.json loaded at runtime.
     {"miotts", "miotts-0.6b-q8_0.gguf",
      "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/miotts-0.6b-q8_0.gguf",
-     "~723 MB"},
+     "~793 MB", "tokenizer.json",
+     "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/tokenizer.json", "~14 MB"},
     // Onsets & Frames (Hawthorne et al. 2018, MIT): piano note events, from
     // the ddPn08/onsets-and-frames checkpoint's ONNX export. q8_0 rather than
     // f16 or q4_0 deliberately — measured on all ten MusicNet test pieces it
@@ -1361,6 +1382,107 @@ constexpr Entry k_registry[] = {
     {"madlad", "madlad400-3b-mt-q4_k.gguf",
      "https://huggingface.co/cstr/madlad400-3b-mt-GGUF/resolve/main/madlad400-3b-mt-q4_k.gguf",
      "~1.9 GB", nullptr, nullptr},
+    // hikari (sbintuitions/hikari-medium, MIT): simultaneous speech translation
+    // EN -> DE/JA/RU + English ASR. f16 is the default: it equals the reference
+    // and gives the same text on CPU and Metal; q8_0 (-m auto:q8_0) changed one
+    // German sentence of a 27 s clip on Metal. Silero rides along (k_extras).
+    {"hikari", "hikari-medium-f16.gguf",
+     "https://huggingface.co/cstr/hikari-medium-GGUF/resolve/main/hikari-medium-f16.gguf", "~1.5 GB", nullptr,
+     nullptr, nullptr, "MIT (https://huggingface.co/sbintuitions/hikari-medium)"},
+    // Opus-MT / MarianMT (Helsinki-NLP, CC-BY-4.0): one ~75M model per language
+    // pair, the fastest translator for live translation. `marian` is the
+    // `-m auto` default (de->en); `--translate-model auto --translate-backend
+    // marian` picks the row for the language pair. q8_0: 84 MB, near-parity
+    // with the reference (12/14 de->en, 8/8 en->de greedy); f16 is exact.
+    {"marian", "opus-mt-de-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-en-GGUF/resolve/main/opus-mt-de-en-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-en", "opus-mt-de-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-en-GGUF/resolve/main/opus-mt-de-en-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-de", "opus-mt-en-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-de-GGUF/resolve/main/opus-mt-en-de-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    // --- generated: further Opus-MT pairs (tools: scratch batch) ---
+    {"opus-mt-ar-de", "opus-mt-ar-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-ar-de-GGUF/resolve/main/opus-mt-ar-de-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-ar-en", "opus-mt-ar-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-ar-en-GGUF/resolve/main/opus-mt-ar-en-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-ar", "opus-mt-de-ar-f16.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-ar-GGUF/resolve/main/opus-mt-de-ar-f16.gguf", "~159 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-es", "opus-mt-de-es-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-es-GGUF/resolve/main/opus-mt-de-es-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-fr", "opus-mt-de-fr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-fr-GGUF/resolve/main/opus-mt-de-fr-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-he", "opus-mt-de-he-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-he-GGUF/resolve/main/opus-mt-de-he-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-it", "opus-mt-de-it-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-it-GGUF/resolve/main/opus-mt-de-it-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-ar", "opus-mt-en-ar-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-ar-GGUF/resolve/main/opus-mt-en-ar-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-es", "opus-mt-en-es-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-es-GGUF/resolve/main/opus-mt-en-es-q8_0.gguf", "~88 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-fr", "opus-mt-en-fr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-fr-GGUF/resolve/main/opus-mt-en-fr-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-he", "opus-mt-en-he-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-he-GGUF/resolve/main/opus-mt-en-he-q8_0.gguf", "~89 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-it", "opus-mt-en-it-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-it-GGUF/resolve/main/opus-mt-en-it-q8_0.gguf", "~97 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-tr", "opus-mt-tc-big-en-tr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tc-big-en-tr-GGUF/resolve/main/opus-mt-tc-big-en-tr-q8_0.gguf", "~262 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-es-de", "opus-mt-es-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-es-de-GGUF/resolve/main/opus-mt-es-de-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-es-en", "opus-mt-es-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-es-en-GGUF/resolve/main/opus-mt-es-en-q8_0.gguf", "~88 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-fr-de", "opus-mt-fr-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-fr-de-GGUF/resolve/main/opus-mt-fr-de-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-fr-en", "opus-mt-fr-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-fr-en-GGUF/resolve/main/opus-mt-fr-en-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-he-de", "opus-mt-he-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-he-de-GGUF/resolve/main/opus-mt-he-de-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-he-en", "opus-mt-tc-big-he-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tc-big-he-en-GGUF/resolve/main/opus-mt-tc-big-he-en-q8_0.gguf", "~265 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-it-de", "opus-mt-it-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-it-de-GGUF/resolve/main/opus-mt-it-de-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-it-en", "opus-mt-it-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-it-en-GGUF/resolve/main/opus-mt-it-en-q8_0.gguf", "~97 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-tr-en", "opus-mt-tr-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tr-en-GGUF/resolve/main/opus-mt-tr-en-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    // --- end generated Opus-MT pairs ---
+    // Translation chat LLMs for live translation (`--translate-model hy-mt2`
+    // / `index-translate`, see docs/streaming.md). NOT backends: they run in
+    // the vendored LLM runtime behind the crispasr_chat_* ABI and are listed
+    // here only so the names resolve and auto-download. Both are the
+    // publishers' own GGUFs, Apache-2.0. Each needs its own instruction
+    // wording — examples/cli/crispasr_run.cpp picks it by these names.
+    {"hy-mt2", "Hy-MT2-1.8B-Q4_K_M.gguf",
+     "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf",
+     "~1.1 GB", nullptr, nullptr},
+    {"index-translate", "Index-Translate-2B.Q4_K_M.gguf",
+     "https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF/resolve/main/Index-Translate-2B.Q4_K_M.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // Kokoro-82M: official baseline + English default voice. The German
     // backbone + German default voice ride along via k_extras (see below)
     // so users running `-m auto --backend kokoro` get a working multilingual
@@ -1649,7 +1771,24 @@ constexpr ExtraCompanion k_confucius4_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// Source full-file recipe requires Silero's speech-boundary windows.
+constexpr ExtraCompanion k_index_echo_extras[] = {
+    {"ggml-silero-v6.2.0.bin",
+     "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"},
+    {nullptr, nullptr},
+};
+
+// hikari: its streaming policy's wait penalty is driven by Silero's speech
+// probability; without it the model hardly ever emits (jfk 0-4 s: 48/48 WAIT).
+constexpr ExtraCompanion k_hikari_extras[] = {
+    {"ggml-silero-v6.2.0.bin",
+     "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
+    {"index-echo", k_index_echo_extras},
+    {"hikari", k_hikari_extras},
     {"kokoro", k_kokoro_extras},
     {"dots-tts", k_dots_tts_extras},
     {"confucius4-tts", k_confucius4_tts_extras},

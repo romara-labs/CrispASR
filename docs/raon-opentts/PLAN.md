@@ -1,7 +1,7 @@
 # Raon-OpenTTS port (F5-TTS variant) — DRY audit + blueprint findings
 
 ## RESOLUTION (2026-09-02): validated end-to-end, shipped as `--backend raon`.
-- TTS→ASR roundtrip PASSES (Kaggle P100, kernel chr1str/crispasr-raon-roundtrip):
+- TTS→ASR roundtrip PASSES (Kaggle P100, kernel ${KAGGLE_ACCOUNT}/crispasr-raon-roundtrip):
   our full pipeline synthesized the gen_text → whisper-tiny read it back at
   word overlap 0.90. pass=true.
 - Vocoder validated in isolation: cos 0.9979 vs the reference HiFi-GAN output.

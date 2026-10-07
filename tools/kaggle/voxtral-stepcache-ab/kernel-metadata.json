@@ -1,5 +1,5 @@
 {
-  "id": "chr1s4/crispasr-voxtral-stepcache-ab",
+  "id": "${KAGGLE_ACCOUNT}/crispasr-voxtral-stepcache-ab",
   "title": "crispasr-voxtral-stepcache-ab",
   "code_file": "crispasr-voxtral-stepcache-ab.py",
   "language": "python",
@@ -8,8 +8,7 @@
   "enable_gpu": "false",
   "enable_internet": "true",
   "dataset_sources": [
-    "chr1s4/crispasr-hf-token",
-    "chr1s4/crispasr-ccache"
+    "${KAGGLE_ACCOUNT}/crispasr-hf-token"
   ],
   "competition_sources": [],
   "kernel_sources": [],

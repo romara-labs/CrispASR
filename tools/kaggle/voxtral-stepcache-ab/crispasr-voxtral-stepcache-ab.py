@@ -39,7 +39,7 @@
 #
 # CPU-only on purpose: the funasr measurement that motivates the bucket width
 # is a CPU-decode result, and CPU is where graph-prep vs KV-bandwidth trade off
-# in the documented way. Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache.
+# in the documented way. Datasets: ${KAGGLE_ACCOUNT}/crispasr-hf-token, ${KAGGLE_ACCOUNT}/crispasr-ccache.
 
 # ─────────────────────────── cell 1 (code) ───────────────────────────
 import json

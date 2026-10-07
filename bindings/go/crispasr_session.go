@@ -387,7 +387,8 @@ type CrispasrSession struct {
 }
 
 // SessionOpen opens a backend session for the given model file.
-// Detects the backend automatically from the GGUF metadata.
+// Detects the backend automatically from the GGUF metadata. Phonon-2 uses
+// the Parakeet runtime (English-only); renamed GGUF files work unchanged.
 // Returns an error if the model can't be loaded.
 func SessionOpen(modelPath string, nThreads int) (*CrispasrSession, error) {
 	cpath := C.CString(modelPath)
@@ -436,7 +437,9 @@ func (s *CrispasrSession) SetSourceLanguage(lang string) error {
 
 // SetTargetLanguage sets the sticky target-language. When ≠ source on
 // canary/cohere, the backend emits a translation. For whisper, pair with
-// SetTranslate(true).
+// SetTranslate(true). Index-Echo takes en/ja/es and returns bilingual subtitle
+// segments. Open its tower GGUF with the matching decoder beside it; a sibling
+// Silero v6.2 companion enables the released full-file window recipe.
 func (s *CrispasrSession) SetTargetLanguage(lang string) error {
 	cl := C.CString(lang)
 	defer C.free(unsafe.Pointer(cl))
@@ -974,6 +977,7 @@ func (s *CrispasrSession) SetCodecPath(path string) error {
 // `refText` is required for qwen3-tts when `path` is a WAV; pass an empty
 // string otherwise.
 //
+// For MioTTS pass a preset embedding GGUF; save PCM at OutputSampleRate().
 // For orpheus voice selection is BY NAME — use SetSpeakerName instead.
 func (s *CrispasrSession) SetVoice(path, refText string) error {
 	cpath := C.CString(path)

@@ -34,6 +34,7 @@
 #include <cmath>
 
 #include "crispasr_diff.h"
+#include "gguf.h"
 
 #include "voxtral.h"
 #include "voxtral4b.h"
@@ -65,6 +66,7 @@
 #include "dolphin.h"
 #include "canary.h"
 #include "canary_qwen.h"
+#include "index_echo.h"
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
@@ -77,6 +79,11 @@
 #include "lid_cld3.h"
 #include "lid_fasttext.h"
 #include "moonshine.h"
+#include "hikari.h"
+#include "core/silero_context.h"
+#include "omniasr.h"
+#include "canary_ctc.h"
+#include "wav2vec2-ggml.h"
 #include "moonshine_streaming.h"
 #include "glm_asr.h"
 #include "firered_asr.h"
@@ -124,6 +131,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <sys/stat.h>
@@ -1880,7 +1889,202 @@ int main(int argc, char** argv) {
     };
 
     // -------- Dispatch to the right backend runner --------
-    if (backend_name == "voxtral") {
+    if (backend_name == "index-echo") {
+        // Infer precision from actual tensor types, never the model filename.
+        gguf_init_params metadata_params = {true, nullptr};
+        gguf_context* metadata = gguf_init_from_file(model_path.c_str(), metadata_params);
+        if (!metadata)
+            return 4;
+        bool audio_quantized = false;
+        for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i)
+            audio_quantized |= ggml_is_quantized(gguf_get_tensor_type(metadata, i));
+        const int64_t decoder_key = gguf_find_key(metadata, "index_echo.decoder_file");
+        const std::string companion = decoder_key >= 0 && gguf_get_kv_type(metadata, decoder_key) == GGUF_TYPE_STRING
+                                          ? gguf_get_val_str(metadata, decoder_key)
+                                          : "";
+        gguf_free(metadata);
+        if (companion.empty() || std::filesystem::path(companion).is_absolute() ||
+            companion != std::filesystem::path(companion).filename().string())
+            return 4;
+        const auto decoder_path = std::filesystem::path(model_path).parent_path() / companion;
+        metadata = gguf_init_from_file(decoder_path.string().c_str(), metadata_params);
+        if (!metadata)
+            return 4;
+        bool decoder_quantized = false;
+        for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i)
+            decoder_quantized |= ggml_is_quantized(gguf_get_tensor_type(metadata, i));
+        gguf_free(metadata);
+        printf("Index-Echo precision: audio=%s decoder=%s; unquantized stages retain F16 gates\n",
+               audio_quantized ? "quantized" : "F16", decoder_quantized ? "quantized" : "F16");
+        auto cp = index_echo_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        cp.use_gpu = getenv("CRISPASR_DIFF_NO_GPU") == nullptr;
+        std::unique_ptr<index_echo_context, decltype(&index_echo_free)> ctx(
+            index_echo_init_from_file(model_path.c_str(), cp), index_echo_free);
+        if (!ctx)
+            return 4;
+        const std::string target = ref.meta("target_lang");
+        if (!target.empty() && !index_echo_set_target_lang(ctx.get(), target.c_str()))
+            return 4;
+        auto check = [&](const std::string& name, const float* data, size_t count) {
+            auto expected = ref.get_f32(name);
+            if (!data || !expected.first || expected.second != count) {
+                printf("[FAIL] %s missing stage or shape mismatch (%zu vs %zu)\n", name.c_str(), count,
+                       expected.second);
+                ++n_fail;
+                return;
+            }
+            auto report = ref.compare(name, data, count, crispasr_diff::Ref::COS_FIRST_DIM);
+            const bool frontend =
+                name == "mel_spectrogram" || name == "conv1_out" || name == "conv2_out" || name == "conv3_out";
+            const bool decoder_stage =
+                name == "llm_logits" || name == "teacherforced_logits" || name.compare(0, 10, "llm_block_") == 0;
+            // Decoder stages also inherit error from quantized audio inputs.
+            const bool quantized = audio_quantized || (decoder_stage && decoder_quantized);
+            // The guide's F16-vs-F32 range is .998-.999. Cached weak logits
+            // reach .99846 against the released nested-BF16 decoder; all
+            // greedy IDs and complete direct-window decoded cues agree.
+            const float threshold = quantized && !frontend           ? 0.99f
+                                    : name == "teacherforced_logits" ? 0.998f
+                                                                     : COS_THRESHOLD;
+            print_row(name.c_str(), report, threshold);
+            if (report.is_pass(threshold))
+                ++n_pass;
+            else
+                ++n_fail;
+            // Cosine alone accepts a uniformly rescaled tensor. Gate magnitude
+            // as well: <=2% for F16; <=5% for quantized learned stages.
+            // Exact frontend and complete decoded-output gates remain required.
+            double error = 0, power = 0;
+            for (size_t i = 0; i < count; ++i) {
+                double delta = data[i] - expected.first[i];
+                error += delta * delta;
+                power += (double)expected.first[i] * expected.first[i];
+            }
+            double relative = std::sqrt(error / std::max(power, 1e-30));
+            printf("       relative_l2=%.8f\n", relative);
+            if (!std::isfinite(relative) || relative > (quantized && !frontend ? 0.05 : 0.02))
+                ++n_fail;
+        };
+        std::string template_path = (std::filesystem::temp_directory_path() / "index-echo-diff-XXXXXX").string();
+        std::vector<char> template_buffer(template_path.begin(), template_path.end());
+        template_buffer.push_back(0);
+        const char* directory = mkdtemp(template_buffer.data());
+        if (!directory)
+            return 4;
+        // Preserve the caller's diagnostic configuration after this run.
+        const char* old_audio = getenv("CRISP_AUDIO_DUMP_STAGES");
+        const char* old_decoder = getenv("CRISPASR_INDEX_ECHO_DUMP_STAGES");
+        std::string saved_audio = old_audio ? old_audio : "", saved_decoder = old_decoder ? old_decoder : "";
+        setenv("CRISP_AUDIO_DUMP_STAGES", directory, 1);
+        setenv("CRISPASR_INDEX_ECHO_DUMP_STAGES", directory, 1);
+        int mels = 0, frames = 0, rows = 0, dim = 0, vocab = 0;
+        std::unique_ptr<float, decltype(&free)> mel(
+            index_echo_compute_mel(ctx.get(), samples.data(), (int)samples.size(), &mels, &frames), free);
+        check("mel_spectrogram", mel.get(), (size_t)mels * frames);
+        std::unique_ptr<float, decltype(&free)> emb(
+            mel ? index_echo_run_encoder(ctx.get(), mel.get(), mels, frames, &rows, &dim) : nullptr, free);
+        check("connector_output", emb.get(), (size_t)rows * dim);
+        std::vector<std::pair<std::string, std::string>> names = {
+            {"conv1_out", "conv1_out"},         {"conv2_out", "conv2_out"},     {"conv3_out", "conv3_out"},
+            {"encoder_input", "encoder_input"}, {"ln_post_out", "ln_post_out"}, {"proj1_out", "proj1_out"},
+            {"encoder_out", "encoder_output"}};
+        for (int i = 0; i < 32; ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "enc_blk%02d_out", i);
+            names.emplace_back(name, "encoder_layer_" + std::to_string(i));
+        }
+        for (const auto& name : names) {
+            std::ifstream file(std::filesystem::path(directory) / (name.first + ".f32"),
+                               std::ios::binary | std::ios::ate);
+            std::vector<float> buffer;
+            if (file) {
+                auto bytes = file.tellg();
+                if (bytes > 0 && (size_t)bytes % sizeof(float) == 0) {
+                    buffer.resize((size_t)bytes / sizeof(float));
+                    file.seekg(0);
+                    if (!file.read((char*)buffer.data(), bytes))
+                        buffer.clear();
+                }
+            }
+            check(name.second, buffer.empty() ? nullptr : buffer.data(), buffer.size());
+        }
+        std::unique_ptr<float, decltype(&free)> logits(
+            emb ? index_echo_prefill(ctx.get(), emb.get(), rows, dim, &vocab) : nullptr, free);
+        check("llm_logits", logits.get(), vocab);
+        if (logits) {
+            auto argmax = ref.compare_argmax("llm_logits", logits.get(), vocab);
+            printf("[%s] first greedy token parity (%d/%d)\n",
+                   argmax.top1_total > 0 && argmax.top1_match == argmax.top1_total ? "PASS" : "FAIL", argmax.top1_match,
+                   argmax.top1_total);
+            if (argmax.top1_total == 0 || argmax.top1_match != argmax.top1_total)
+                ++n_fail;
+        }
+        int count = 0;
+        const int32_t* ids = index_echo_prompt_ids(ctx.get(), &count);
+        auto expected_ids = ref.get_f32("prompt_ids");
+        bool ids_match = ids && expected_ids.first && expected_ids.second == (size_t)count;
+        if (ids_match)
+            for (int i = 0; i < count; ++i)
+                if (ids[i] != (int32_t)expected_ids.first[i])
+                    ids_match = false;
+        printf("[%s] prompt_ids byte parity (%d tokens)\n", ids_match ? "PASS" : "FAIL", count);
+        if (ids_match)
+            ++n_pass;
+        else
+            ++n_fail;
+        for (int i = 0; i < index_echo_decoder_layers(ctx.get()); ++i) {
+            std::string name = "llm_block_" + std::to_string(i);
+            const float* data = index_echo_stage(ctx.get(), name.c_str(), &count);
+            check(name, data, data ? count : 0);
+        }
+        if (ref.has("teacherforced_logits") && logits) {
+            auto generated = ref.get_f32("generated_ids");
+            auto expected = ref.get_f32("teacherforced_logits");
+            size_t steps = vocab > 0 ? expected.second / vocab : 0;
+            std::vector<float> trace(logits.get(), logits.get() + vocab);
+            for (size_t i = 0; i + 1 < steps && i < generated.second; ++i) {
+                std::unique_ptr<float, decltype(&free)> step(
+                    index_echo_decode_token(ctx.get(), (int32_t)generated.first[i], &vocab), free);
+                if (!step)
+                    break;
+                trace.insert(trace.end(), step.get(), step.get() + vocab);
+            }
+            check("teacherforced_logits", trace.data(), trace.size());
+            if (trace.size() == expected.second) {
+                auto match = ref.compare_argmax("teacherforced_logits", trace.data(), trace.size());
+                printf("[%s] cached greedy token parity (%d/%d)\n",
+                       match.top1_match == match.top1_total ? "PASS" : "FAIL", match.top1_match, match.top1_total);
+                if (match.top1_match != match.top1_total || match.top1_total == 0)
+                    ++n_fail;
+                // Diagnose precision near-ties without weakening the exact-ID
+                // gate: how highly does the oracle rank our selected token?
+                for (size_t row = 0; row < steps; ++row) {
+                    const float* mine = trace.data() + row * vocab;
+                    const float* gold = expected.first + row * vocab;
+                    int chosen = (int)(std::max_element(mine, mine + vocab) - mine);
+                    int oracle = (int)(std::max_element(gold, gold + vocab) - gold);
+                    if (chosen == oracle)
+                        continue;
+                    int rank = 1;
+                    for (int token = 0; token < vocab; ++token)
+                        rank += gold[token] > gold[chosen];
+                    printf("[INFO] cache step %zu: native=%d oracle=%d source_rank=%d source_gap=%.8f\n", row, chosen,
+                           oracle, rank, gold[oracle] - gold[chosen]);
+                }
+            }
+        }
+        if (old_audio)
+            setenv("CRISP_AUDIO_DUMP_STAGES", saved_audio.c_str(), 1);
+        else
+            unsetenv("CRISP_AUDIO_DUMP_STAGES");
+        if (old_decoder)
+            setenv("CRISPASR_INDEX_ECHO_DUMP_STAGES", saved_decoder.c_str(), 1);
+        else
+            unsetenv("CRISPASR_INDEX_ECHO_DUMP_STAGES");
+        std::filesystem::remove_all(directory);
+    } else if (backend_name == "voxtral") {
         auto cp = voxtral_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
@@ -5208,9 +5412,17 @@ int main(int argc, char** argv) {
         }
 
         wespeaker_free(ctx);
-    } else if (backend_name == "parakeet") {
+    } else if (backend_name == "parakeet" || backend_name == "phonon2") {
         auto cp = parakeet_context_default_params();
         cp.n_threads = 4;
+        if (const char* threads = std::getenv("CRISPASR_PARAKEET_DIFF_THREADS")) {
+            const int value = std::atoi(threads);
+            if (value <= 0) {
+                fprintf(stderr, "CRISPASR_PARAKEET_DIFF_THREADS must be positive\n");
+                return 4;
+            }
+            cp.n_threads = value;
+        }
         cp.verbosity = 0;
         parakeet_context* ctx = parakeet_init_from_file(model_path.c_str(), cp);
         if (!ctx) {
@@ -5289,7 +5501,8 @@ int main(int argc, char** argv) {
         // ──── Transducer component diff (MAES §134) ────
         // Validate predictor LSTM, encoder projection, and joint network
         // against PyTorch reference captures from parakeet-maes backend.
-        if (ref.has("encoder_output_projected") || ref.has("decoder_initial") || ref.has("joint_t0")) {
+        if (ref.has("encoder_output_projected") || ref.has("decoder_initial") || ref.has("joint_t0") ||
+            ref.has("decoder_sos")) {
             // Use reference encoder_output so we isolate transducer components
             auto ref_enc_pair = ref.get_f32("encoder_output");
             auto ref_enc_shp = ref.shape("encoder_output");
@@ -5297,15 +5510,19 @@ int main(int argc, char** argv) {
                 const int d_model = (int)ref_enc_shp[0];
                 const int T_enc = (int)ref_enc_shp[1];
 
+                // Share the full-batch projection with the joint probe: this
+                // exercises the same GEMM shape as production greedy decoding.
+                int jh = 0;
+                std::unique_ptr<float, decltype(&std::free)> projected(
+                    parakeet_joint_project_encoder(ctx, ref_enc_pair.first, T_enc, d_model, &jh), &std::free);
+
                 // 1. Encoder projection: joint.project_encoder(enc)
                 if (ref.has("encoder_output_projected")) {
-                    int jh = 0;
-                    float* proj = parakeet_joint_project_encoder(ctx, ref_enc_pair.first, T_enc, d_model, &jh);
+                    float* proj = projected.get();
                     if (proj) {
                         auto rep = ref.compare("encoder_output_projected", proj, (size_t)T_enc * jh);
                         print_row("encoder_output_projected", rep, COS_THRESHOLD);
                         record(rep);
-                        free(proj);
                     } else {
                         printf("[ERR ] encoder_output_projected  project_encoder failed\n");
                         n_fail++;
@@ -5313,12 +5530,16 @@ int main(int argc, char** argv) {
                 }
 
                 // 2. Predictor initial state (feed blank/SOS)
-                if (ref.has("decoder_initial")) {
+                const bool production_sos = ref.has("decoder_sos");
+                const char* pred_stage = production_sos ? "decoder_sos" : "decoder_initial";
+                const char* joint_stage = production_sos ? "joint_sos_t0" : "joint_t0";
+                if (ref.has(pred_stage)) {
                     int ph = 0;
-                    float* pred = parakeet_predictor_initial(ctx, &ph);
+                    float* pred =
+                        production_sos ? parakeet_predictor_sos(ctx, &ph) : parakeet_predictor_initial(ctx, &ph);
                     if (pred) {
-                        auto rep = ref.compare("decoder_initial", pred, (size_t)ph);
-                        print_row("decoder_initial", rep, COS_THRESHOLD);
+                        auto rep = ref.compare(pred_stage, pred, (size_t)ph);
+                        print_row(pred_stage, rep, COS_THRESHOLD);
                         record(rep);
 
                         // 2b. Decoder projection: joint.project_prednet(pred)
@@ -5336,28 +5557,26 @@ int main(int argc, char** argv) {
                         }
 
                         // 3. Joint output at frame 0
-                        if (ref.has("joint_t0")) {
-                            int jh = 0;
-                            float* proj_enc = parakeet_joint_project_encoder(ctx, ref_enc_pair.first, 1, d_model, &jh);
+                        if (ref.has(joint_stage)) {
+                            float* proj_enc = projected.get();
                             if (proj_enc) {
                                 int vt = 0;
                                 float* logits = parakeet_joint_step(ctx, proj_enc, pred, &vt);
                                 if (logits) {
-                                    auto rep = ref.compare("joint_t0", logits, (size_t)vt);
-                                    print_row("joint_t0", rep, COS_THRESHOLD);
+                                    auto rep = ref.compare(joint_stage, logits, (size_t)vt);
+                                    print_row(joint_stage, rep, COS_THRESHOLD);
                                     record(rep);
                                     free(logits);
                                 } else {
-                                    printf("[ERR ] joint_t0              joint_step failed\n");
+                                    printf("[ERR ] %-22s joint_step failed\n", joint_stage);
                                     n_fail++;
                                 }
-                                free(proj_enc);
                             }
                         }
 
                         free(pred);
                     } else {
-                        printf("[ERR ] decoder_initial       predictor_initial failed\n");
+                        printf("[ERR ] %-22s predictor_start failed\n", pred_stage);
                         n_fail++;
                     }
                 }
@@ -6072,6 +6291,239 @@ int main(int argc, char** argv) {
         if (codes)
             free(codes);
         orpheus_free(octx);
+    } else if (backend_name == "wav2vec2" || backend_name == "hubert" || backend_name == "data2vec") {
+        // transformers *ForCTC family (tools/reference_backends/hf_ctc.py):
+        // the CTC grid, frame-major [T x V], vs wav2vec2_compute_logits().
+        wav2vec2_model m;
+        if (!wav2vec2_load(model_path.c_str(), m)) {
+            fprintf(stderr, "failed to load %s model '%s'\n", backend_name.c_str(), model_path.c_str());
+            return 4;
+        }
+        std::vector<float> lg = wav2vec2_compute_logits(m, samples.data(), (int)samples.size(), 4);
+        if (!lg.empty()) {
+            auto rep = ref.compare("ctc_logits", lg.data(), lg.size());
+            print_row("ctc_logits", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] ctc_logits              wav2vec2_compute_logits failed\n");
+            n_fail++;
+        }
+    } else if (backend_name == "fastconformer-ctc") {
+        // NeMo FastConformer CTC on the canary_ctc runtime: the per-frame
+        // log P(v | t) grid vs NeMo's CTC decoder (fastconformer_ctc.py).
+        canary_ctc_context_params cp = canary_ctc_context_default_params();
+        cp.n_threads = 4;
+        canary_ctc_context* ctx = canary_ctc_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load fastconformer-ctc model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        float* lg = nullptr;
+        int T = 0, V = 0;
+        if (canary_ctc_compute_logits(ctx, samples.data(), (int)samples.size(), &lg, &T, &V) == 0 && lg) {
+            // NeMo's CTC decoder emits log_softmax; bring the C++ grid to the
+            // same per-row normalisation (idempotent if it already is). A raw
+            // logit row and its log-softmax differ by a per-row constant, which
+            // cosine is not invariant to: cos -0.19 before (Kaggle 2026-09-28).
+            for (int t = 0; t < T; t++) {
+                float* row = lg + (size_t)t * V;
+                float mx = row[0];
+                for (int v = 1; v < V; v++)
+                    mx = std::max(mx, row[v]);
+                double se = 0.0;
+                for (int v = 0; v < V; v++)
+                    se += std::exp((double)row[v] - mx);
+                const float lse = mx + (float)std::log(se);
+                for (int v = 0; v < V; v++)
+                    row[v] -= lse;
+            }
+            auto rep = ref.compare("ctc_logits", lg, (size_t)T * V);
+            print_row("ctc_logits", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] ctc_logits              canary_ctc_compute_logits failed\n");
+            n_fail++;
+        }
+        free(lg);
+        canary_ctc_free(ctx);
+    } else if (backend_name == "omniasr") {
+        // omniASR CTC (Wav2Vec2ForCTC conversions; hf_ctc.py): one unsplit
+        // forward - the library call does not chunk, the CLI does.
+        omniasr_context_params cp = omniasr_context_default_params();
+        cp.n_threads = 4;
+        cp.use_gpu = false;
+        omniasr_context* ctx = omniasr_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load omniasr model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        if (!omniasr_is_ctc(ctx)) {
+            printf("[ERR ] ctc_logits              not a CTC omniasr model (LLM variant has no dense grid)\n");
+            n_fail++;
+        } else {
+            float* lg = nullptr;
+            int V = 0, T = 0;
+            char* text = omniasr_transcribe_with_logits(ctx, samples.data(), (int)samples.size(), &lg, &V, &T);
+            free(text);
+            if (lg && V > 0 && T > 0) {
+                auto rep = ref.compare("ctc_logits", lg, (size_t)V * T);
+                print_row("ctc_logits", rep, COS_THRESHOLD);
+                record(rep);
+            } else {
+                printf("[ERR ] ctc_logits              omniasr_transcribe_with_logits returned no grid\n");
+                n_fail++;
+            }
+            free(lg);
+        }
+        omniasr_free(ctx);
+    } else if (backend_name == "hikari") {
+        // Hikari (sbintuitions/hikari-medium). The reference
+        // (tools/reference_backends/hikari.py) replays the upstream server's
+        // per-80ms policy; the settings it used ride in the metadata. Run the
+        // same stream (VAD off, as the reference), then compare the per-step
+        // tokens and the stages of the LAST step.
+        std::map<std::string, std::string> kv;
+        {
+            const std::string s = ref.meta("hikari_settings");
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t semi = s.find(';', i);
+                if (semi == std::string::npos)
+                    semi = s.size();
+                const std::string item = s.substr(i, semi - i);
+                const size_t eq = item.find('=');
+                if (eq != std::string::npos)
+                    kv[item.substr(0, eq)] = item.substr(eq + 1);
+                i = semi + 1;
+            }
+        }
+        if (kv.empty()) {
+            fprintf(stderr, "hikari: reference has no hikari_settings metadata\n");
+            return 4;
+        }
+        hikari_context_params hp = hikari_context_default_params();
+        hp.verbosity = 1;
+        hikari_context* ctx = hikari_init_from_file(model_path.c_str(), hp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load hikari model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        hikari_policy pol = hikari_default_policy();
+        pol.decoder_context = std::atoi(kv["ctx"].c_str());
+        pol.baseline_wait_penalty = (float)std::atof(kv["wp_base"].c_str());
+        pol.wait_penalty_boost = (float)std::atof(kv["wp_boost"].c_str());
+        pol.wait_penalty_decay = (float)std::atof(kv["wp_decay"].c_str());
+        pol.repetition_penalty = (float)std::atof(kv["rep"].c_str());
+        hikari_set_policy(ctx, &pol);
+        const bool tr = kv["task"] == "translate";
+        if (hikari_set_task(ctx, tr ? 1 : 0, kv["tgt"].c_str()) != 0) {
+            fprintf(stderr, "hikari: bad task in reference settings\n");
+            hikari_free(ctx);
+            return 4;
+        }
+        // The reference runs upstream's stateful Silero (TorchScript) when
+        // vad=1; mirror it with the Silero GGUF in per-chunk continue mode.
+        whisper_vad_context* vctx = nullptr;
+        if (kv["vad"] == "1") {
+            const char* vp = std::getenv("HIKARI_VAD_MODEL");
+            if (!vp || !*vp) {
+                fprintf(stderr, "hikari: the reference ran with VAD; set HIKARI_VAD_MODEL=<ggml-silero-v6.2.0.bin>\n");
+                hikari_free(ctx);
+                return 4;
+            }
+            whisper_vad_context_params vcp = whisper_vad_default_context_params();
+            vcp.n_threads = 1;
+            vctx = whisper_vad_init_from_file_with_params(vp, vcp);
+            if (!vctx || !crispasr_silero_enable_context(vctx)) {
+                fprintf(stderr, "hikari: cannot load Silero VAD '%s'\n", vp);
+                hikari_free(ctx);
+                return 4;
+            }
+            float z = 0.0f;
+            whisper_vad_detect_speech(vctx, &z, 0); // reset state
+            hikari_set_speech_prob_fn(
+                ctx,
+                [](const float* s, int n, void* u) -> float {
+                    auto* v = static_cast<whisper_vad_context*>(u);
+                    if (!whisper_vad_detect_speech_continue(v, s, n))
+                        return 0.0f;
+                    const int np = whisper_vad_n_probs(v);
+                    return np > 0 ? whisper_vad_probs(v)[np - 1] : 0.0f;
+                },
+                vctx);
+        }
+        std::vector<float> a = samples;
+        a.resize(a.size() + (size_t)std::atoi(kv["tail_ms"].c_str()) * 16, 0.0f);
+        hikari_stream_push(ctx, a.data(), (int)a.size());
+        hikari_stream_flush(ctx);
+        auto rp = ref.get_f32("stream_speech_probs");
+        if (vctx && rp.first) {
+            const int n = std::min<int>(hikari_stream_n_steps(ctx), (int)rp.second);
+            float mx = 0.0f;
+            int flips = 0;
+            for (int i = 0; i < n; i++) {
+                const float o = hikari_stream_step_speech_prob(ctx, i);
+                mx = std::max(mx, std::fabs(o - rp.first[i]));
+                flips += (o > 0.8f) != (rp.first[i] > 0.8f);
+            }
+            printf("[INFO] speech_probs           max|diff|=%.4f  threshold(0.8) flips=%d/%d\n", mx, flips, n);
+        }
+
+        // per-step tokens
+        auto rt = ref.get_f32("stream_tokens");
+        const int n_ours = hikari_stream_n_steps(ctx);
+        if (rt.first) {
+            int same = 0, first_diff = -1;
+            const int n = std::min<int>(n_ours, (int)rt.second);
+            for (int i = 0; i < n; i++) {
+                if (hikari_stream_step_token(ctx, i) == (int32_t)std::lround(rt.first[i]))
+                    same++;
+                else if (first_diff < 0)
+                    first_diff = i;
+            }
+            const bool ok = same == n && n_ours == (int)rt.second;
+            printf("[%s] stream_tokens           steps ours=%d ref=%zu  identical=%d/%d  first_diff=%d\n",
+                   ok ? "PASS" : "FAIL", n_ours, rt.second, same, n, first_diff);
+            ok ? n_pass++ : n_fail++;
+        }
+        char* text = hikari_stream_text(ctx);
+        printf("[INFO] text ours: %s\n[INFO] text ref : %s\n", text ? text : "", ref.meta("generated_text").c_str());
+        std::free(text);
+
+        int nm = 0, nt = 0;
+        if (float* mel = hikari_debug_last_mel(ctx, &nm, &nt)) {
+            auto rep = ref.compare("mel_spectrogram", mel, (size_t)nm * nt);
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+            std::free(mel);
+        }
+        int np = 0, nv = 0;
+        int32_t* ids = nullptr;
+        if (float* lg = hikari_debug_last_logits(ctx, &np, &nv, &ids)) {
+            auto ri = ref.get_f32("decoder_input_ids");
+            bool ids_ok = ri.first && (int)ri.second == np;
+            for (int i = 0; ids_ok && i < np; i++)
+                ids_ok = ids[i] == (int32_t)std::lround(ri.first[i]);
+            printf("[%s] decoder_input_ids       n=%d\n", ids_ok ? "PASS" : "FAIL", np);
+            ids_ok ? n_pass++ : n_fail++;
+            auto rep = ref.compare("decoder_logits", lg, (size_t)np * nv, crispasr_diff::Ref::COS_FIRST_DIM);
+            print_row("decoder_logits", rep, COS_THRESHOLD);
+            record(rep);
+            auto am = ref.compare_argmax("decoder_logits", lg, (size_t)np * nv);
+            printf("[INFO] decoder_logits argmax  %d/%d positions agree\n", am.top1_match, am.top1_total);
+            std::free(lg);
+            std::free(ids);
+        }
+        int nf = 0, dm = 0;
+        if (float* enc = hikari_debug_encoder_full(ctx, &nf, &dm)) {
+            auto rep = ref.compare("encoder_output", enc, (size_t)nf * dm, crispasr_diff::Ref::COS_FIRST_DIM);
+            print_row("encoder_output", rep, COS_THRESHOLD);
+            record(rep);
+            std::free(enc);
+        }
+        hikari_free(ctx);
+        if (vctx)
+            whisper_vad_free(vctx);
     } else if (backend_name == "moonshine") {
         // Moonshine (UsefulSensors tiny/base). Non-streaming variant.
         moonshine_init_params mp{};

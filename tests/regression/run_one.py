@@ -190,13 +190,25 @@ def strip_ai_disclaimer(transcript: str) -> str:
     return transcript
 
 
-def run_transcript(crispasr_bin: Path, gguf: Path, sample: Path) -> str:
+def run_transcript(crispasr_bin: Path, gguf: Path, sample: Path, *, srt: bool = False) -> str:
     """Run `crispasr -m gguf -f sample`, return the transcript line.
 
     The CLI prints the transcript on its own line near the end, after
     the "transcribed N s audio in M s (Kx realtime)" status line.
     Grab the last non-empty non-status line.
     """
+    if srt:
+        # Bilingual backends emit several cues/lines. Checking the final stdout
+        # line would silently discard earlier cues and every source transcript.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="regression-srt-", dir=gguf.parent) as temp:
+            prefix = Path(temp) / "decoded"
+            subprocess.run([str(crispasr_bin), "-m", str(gguf), "-f", str(sample),
+                            "-osrt", "-of", str(prefix)], capture_output=True,
+                           text=True, check=True, timeout=600)
+            cues = prefix.with_suffix(".srt").read_text()
+            return " ".join(line.strip() for line in cues.splitlines()
+                            if line.strip() and not line.strip().isdigit() and "-->" not in line)
     proc = subprocess.run(
         [str(crispasr_bin), "-m", str(gguf), "-f", str(sample)],
         capture_output=True,
@@ -241,14 +253,22 @@ def parse_diff_stdout(stdout: str) -> dict[str, float]:
 
 def evaluate_stage_thresholds(
     stages: dict[str, float], thresholds: dict[str, float],
+    default: float | None = None, advisory: tuple[str, ...] | list[str] = (),
 ) -> tuple[list[tuple[str, float, float]], list[tuple[str, float, float]], list[str], list[tuple[str, float]]]:
     """Apply manifest thresholds to parsed cos_min map.
+
+    `default` (manifest `stage_threshold_default`) gates every captured stage
+    that has no explicit threshold — per-layer / conv-snapshot stages used to be
+    INFO-only and could drift arbitrarily without failing anything. Stages whose
+    name starts with a prefix in `advisory` (manifest `advisory_stages`) stay
+    ungated extras. Without `default`, all unlisted stages are extras (old
+    behaviour).
 
     Returns (passes, fails, missing, extras):
       passes  — [(stage, cos_min, threshold)] above threshold
       fails   — [(stage, cos_min, threshold)] below threshold
       missing — [stage] in thresholds but not in stages
-      extras  — [(stage, cos_min)] in stages but not in thresholds
+      extras  — [(stage, cos_min)] captured but not gated
     """
     passes: list[tuple[str, float, float]] = []
     fails: list[tuple[str, float, float]] = []
@@ -259,10 +279,20 @@ def evaluate_stage_thresholds(
             continue
         v = stages[stage]
         (passes if v >= threshold else fails).append((stage, v, threshold))
-    extras = sorted(
-        (s, stages[s]) for s in set(stages) - set(thresholds)
-    )
+    extras: list[tuple[str, float]] = []
+    for s in sorted(set(stages) - set(thresholds)):
+        v = stages[s]
+        if default is None or s.startswith(tuple(advisory)):
+            extras.append((s, v))
+        else:
+            (passes if v >= default else fails).append((s, v, default))
     return passes, fails, missing, extras
+
+
+def stage_gate_kwargs(entry: dict) -> dict:
+    """Manifest entry -> the default/advisory kwargs of evaluate_stage_thresholds."""
+    d = entry.get("stage_threshold_default")
+    return {"default": None if d is None else float(d), "advisory": tuple(entry.get("advisory_stages", []))}
 
 
 def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Path) -> dict:
@@ -286,6 +316,12 @@ def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Pat
     if proc.returncode < 0:
         die(f"crispasr-diff died from signal {-proc.returncode}\n"
             f"  stderr tail: {proc.stderr[-400:]}")
+    # Index-Echo's harness also gates magnitude, exact prompt IDs and cached
+    # greedy IDs. Those failures have no cosine row; ignoring its exit status
+    # would silently drop the port's required acceptance gates.
+    if backend_id == "index-echo" and proc.returncode != 0:
+        die(f"Index-Echo mandatory diff gate failed (rc={proc.returncode})\n"
+            f"  stdout tail: {proc.stdout[-1600:]}\n  stderr tail: {proc.stderr[-400:]}")
     # crispasr-diff prints summary lines on stdout. Parse the [PASS]/[FAIL]
     # lines; ignore the diff harness's own pass/fail verdict — we apply our
     # own per-stage thresholds from the manifest.
@@ -297,6 +333,39 @@ def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Pat
             f"  stderr tail: {proc.stderr[-400:]}"
         )
     return result
+
+
+def transcript_gate(entry: dict, actual: str) -> tuple[bool, list[str]]:
+    """The transcript pass/fail rule, shared by run_one.py and the Kaggle suite
+    (which used to compare byte-exact and so failed entries GH passes).
+
+    DEFAULT is a zero-tolerance metric gate, not byte-equal: a space-delimited
+    transcript that differs ONLY in punctuation/case has WER=0 and passes, even
+    with no explicit tolerance block — otherwise every byte-equal backend flaps
+    red the moment CI flips a comma (fastconformer / wav2vec2 / mini-omni2 flip
+    run-to-run). An explicit transcript_tolerance widens the bound (e.g. TTS
+    roundtrips). Gating metric by language:
+      * space-delimited: WER (invariant to punctuation/case decode ties); CER
+        is reported as advisory only. The diff-harness stages catch drift.
+      * CJK / no-whitespace: CER (whitespace-split WER is degenerate there).
+    Returns (ok, printable lines).
+    """
+    expected = entry["expected_transcript"]
+    if actual == expected:
+        return True, ["\033[32m  PASS\033[0m  (byte-equal)", f"    {actual!r}"]
+    tol = entry.get("transcript_tolerance") or {"cer_max": 0.0, "wer_max": 0.0}
+    cer, wer = compute_transcript_metrics(expected, actual)
+    cer_max = float(tol.get("cer_max", 0.0))
+    wer_max = float(tol.get("wer_max", 0.0))
+    if " " in expected.strip():
+        ok = wer <= wer_max
+        gate = f"wer={wer:.4f} (max {wer_max}) [gate]  cer={cer:.4f} [advisory]"
+    else:
+        ok = cer <= cer_max
+        gate = f"cer={cer:.4f} (max {cer_max}) [gate, CJK]  wer={wer:.4f} [advisory]"
+    verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
+    suffix = " (within tolerance)" if ok else " (over tolerance)"
+    return ok, [f"{verdict}  {gate}{suffix}", f"    expected: {expected!r}", f"    actual:   {actual!r}"]
 
 
 def regression_for(name: str, manifest: dict, work_dir: Path,
@@ -359,74 +428,45 @@ def regression_for(name: str, manifest: dict, work_dir: Path,
 
     # ----- 1. Transcript -----
     print(f"\n[transcript] {name}")
-    actual = run_transcript(crispasr_bin, gguf_local, sample)
-    expected = entry["expected_transcript"]
-    # DEFAULT to a zero-tolerance metric gate (not immediate byte-equal FAIL):
-    # a space-delimited transcript that differs ONLY in the punctuation/case
-    # decode tie has WER=0 and must pass, even with no explicit tolerance block —
-    # otherwise every byte-equal backend flaps red the moment CI flips a comma
-    # (empirically fastconformer / wav2vec2 / mini-omni2 flip run-to-run). An
-    # explicit transcript_tolerance widens the bound further (e.g. TTS roundtrips);
-    # its absence just means the tight wer_max=0 / cer_max=0 default.
-    tol = entry.get("transcript_tolerance") or {"cer_max": 0.0, "wer_max": 0.0}
-    if actual == expected:
-        print("\033[32m  PASS\033[0m  (byte-equal)")
-        print(f"    {actual!r}")
-    else:
-        # Pass if within tolerance on the language-appropriate metric. Reflects
-        # the ASR-regression contract users care about: meaning preservation, not
-        # byte equality.
-        cer, wer = compute_transcript_metrics(expected, actual)
-        cer_max = float(tol.get("cer_max", 0.0))
-        wer_max = float(tol.get("wer_max", 0.0))
-        # Pick the GATING metric by language:
-        #  * Space-delimited (Latin etc.): gate on WER. WER is invariant to the
-        #    punctuation/case decode ties that flip *non-deterministically between
-        #    CI runs* (empirically the comma after "americans" flips run-to-run for
-        #    mini-omni2 / wav2vec2 at WER=0), so a CER gate flaps red forever while
-        #    the words are identical. WER still catches real word errors, and the
-        #    diff-harness cos stages catch model-weight drift. CER stays advisory.
-        #  * CJK / no-whitespace: WER is degenerate (whitespace split yields one
-        #    token, so any diff → WER≈1), so gate on CER instead.
-        is_space_delimited = " " in expected.strip()
-        if is_space_delimited:
-            ok = wer <= wer_max
-            gate = f"wer={wer:.4f} (max {wer_max}) [gate]  cer={cer:.4f} (max {cer_max}) [advisory]"
-        else:
-            ok = cer <= cer_max
-            gate = f"cer={cer:.4f} (max {cer_max}) [gate, CJK]  wer={wer:.4f} (advisory)"
-        verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
-        suffix = " (within tolerance)" if ok else " (over tolerance)"
-        print(f"{verdict}  {gate}{suffix}")
-        print(f"    expected: {expected!r}")
-        print(f"    actual:   {actual!r}")
-        if not ok:
-            failures += 1
+    actual = run_transcript(crispasr_bin, gguf_local, sample,
+                            srt=entry.get("transcript_format") == "srt")
+    # WER-normalised gate, shared with the Kaggle suite; see transcript_gate.
+    ok, lines = transcript_gate(entry, actual)
+    for ln in lines:
+        print(ln)
+    if not ok:
+        failures += 1
 
     # ----- 2. Diff harness -----
     if skip_diff:
         print(f"\n[diff-harness] {name}  \033[33mSKIP\033[0m (skip_diff=true; no ref dump baked yet)")
         return failures
 
-    print(f"\n[diff-harness] {name}")
-    stages = run_diff(diff_bin, entry["backend_id"], gguf_local, ref_local, sample)
+    # `diff_gguf` (optional): run the stage diff on a full-precision GGUF while
+    # the transcript above stays on the shipped quant. A q4_k encoder sits at
+    # cos ~0.95 against an F32 reference, so a gate on it can only be loose;
+    # the F16 file of the same model matches at >= 0.99999 and can be gated tight.
+    diff_gguf = gguf_local
+    if entry.get("diff_gguf"):
+        dg = entry["diff_gguf"]
+        diff_gguf = hf_download(dg.get("repo", entry["gguf"]["repo"]), dg["file"],
+                                dg.get("revision", entry["gguf"]["revision"]), work_dir)
+    print(f"\n[diff-harness] {name}  ({diff_gguf.name})")
+    stages = run_diff(diff_bin, entry["backend_id"], diff_gguf, ref_local, sample)
     thresholds = entry["diff_thresholds"]
-    for stage, threshold in thresholds.items():
-        if stage not in stages:
-            print(f"\033[33m  SKIP\033[0m {stage}  (not captured by diff harness)")
-            continue
-        cos_min = stages[stage]
-        ok = cos_min >= threshold
-        verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
-        print(f"{verdict} {stage:24s} cos_min={cos_min:.6f}  threshold={threshold}")
-        if not ok:
-            failures += 1
-    # Surface any stages that came back but aren't in thresholds — these
-    # are new captures that should be added to manifest.json.
-    extra = set(stages) - set(thresholds)
-    for stage in sorted(extra):
-        print(f"\033[33m  INFO\033[0m {stage} cos_min={stages[stage]:.6f} "
-              f"(not in manifest thresholds; add it if intentional)")
+    passes, fails, missing, extras = evaluate_stage_thresholds(stages, thresholds, **stage_gate_kwargs(entry))
+    for stage in missing:
+        print(f"\033[33m  SKIP\033[0m {stage}  (not captured by diff harness)")
+    for stage, cos_min, threshold in passes:
+        print(f"\033[32m  PASS\033[0m {stage:24s} cos_min={cos_min:.6f}  threshold={threshold}")
+    for stage, cos_min, threshold in fails:
+        print(f"\033[31m  FAIL\033[0m {stage:24s} cos_min={cos_min:.6f}  threshold={threshold}")
+    failures += len(fails)
+    # Captured but ungated: no stage_threshold_default, or listed in
+    # advisory_stages. Add a threshold (or a default) if the stage is meant to hold.
+    for stage, cos_min in extras:
+        print(f"\033[33m  INFO\033[0m {stage} cos_min={cos_min:.6f} "
+              f"(ungated: not in diff_thresholds / advisory_stages)")
 
     return failures
 
@@ -737,6 +777,19 @@ def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
                   f"{gguf_rev[:8]}::{gguf_file} not found")
             failures += 1
             continue
+
+        dg = entry.get("diff_gguf")
+        if dg and not entry.get("skip_diff", False):
+            dg_repo, dg_rev = dg.get("repo", gguf_repo), dg.get("revision", gguf_rev)
+            try:
+                dg_ok = api.file_exists(repo_id=dg_repo, repo_type="model", revision=dg_rev, filename=dg["file"])
+            except HfHubHTTPError as exc:
+                dg_ok = False
+                print(f"  {exc}")
+            if not dg_ok:
+                print(f"  \033[31mFAIL\033[0m {name}: diff_gguf {dg_repo}@{dg_rev[:8]}::{dg['file']} not found")
+                failures += 1
+                continue
 
         # Fixture ref.gguf — membership check against the listing.
         # Skipped for transcript-only entries (skip_diff: true).

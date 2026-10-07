@@ -3,7 +3,7 @@
 ## NOW — active work
 
 **2026-09-23: F16 parity achieved on the first run** (kernel
-`chr1s4/crispasr-436-dolphin-pipeline`, commit 5776f678). Against the upstream
+`${KAGGLE_ACCOUNT}/crispasr-436-dolphin-pipeline`, commit 5776f678). Against the upstream
 package (dither 0) on paraformer_zh.wav and jfk.wav, every `crispasr-diff` stage
 PASSes: fbank 1.000000, subsample ≥0.999999, all 12 E-Branchformer blocks
 ≥0.999417, encoder output ≥0.999064, CTC log-probs 1.000000 (argmax identical on

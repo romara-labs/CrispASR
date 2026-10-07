@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -180,6 +182,38 @@ class ManifestSchemaTests(unittest.TestCase):
                 )
 
 
+class MandatoryDiffGateTests(unittest.TestCase):
+    def test_index_echo_rejects_scale_failure_despite_perfect_cosine(self):
+        # Cosine divides magnitude out: a uniformly wrong scale can emit only
+        # PASS rows while the separate relative-L2 check makes the process fail.
+        proc = SimpleNamespace(returncode=1, stderr='', stdout=
+            '[PASS] mel_spectrogram shape=[128,100] cos_min=1.000000 cos_mean=1.000000\n'
+            '       relative_l2=151.00000000\n')
+        paths = [Path('unused')] * 4
+        with mock.patch.object(run_one.subprocess, 'run', return_value=proc):
+            with self.assertRaises(SystemExit):
+                run_one.run_diff(paths[0], 'index-echo', *paths[1:])
+            # Other backends keep their manifest-controlled cosine policy.
+            self.assertEqual(run_one.run_diff(paths[0], 'parakeet', *paths[1:]),
+                             {'mel_spectrogram': 1.0})
+
+
+class BilingualTranscriptTests(unittest.TestCase):
+    def test_srt_checks_all_cues_and_both_languages(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            model = Path(temp) / "model.gguf"
+            def emit(command, **kwargs):
+                prefix = Path(command[command.index("-of") + 1])
+                prefix.with_suffix(".srt").write_text(
+                    "1\n00:00:00,430 --> 00:00:04,570\n原文一。\nTranslation one.\n\n"
+                    "2\n00:00:05,230 --> 00:00:07,470\n原文二。\nTranslation two.\n")
+                return SimpleNamespace(stdout="Translation two.", stderr="", returncode=0)
+            with mock.patch.object(run_one.subprocess, "run", side_effect=emit):
+                text = run_one.run_transcript(Path("cli"), model, Path("audio"), srt=True)
+            self.assertEqual(text, "原文一。 Translation one. 原文二。 Translation two.")
+
+
 class DiffParserTests(unittest.TestCase):
     """parse_diff_stdout() — given a captured crispasr-diff stdout,
     pull cos_min per stage. Don't care about [PASS]/[FAIL] verdict
@@ -283,6 +317,49 @@ class ThresholdEvaluationTests(unittest.TestCase):
         }
         p, f, m, e = run_one.evaluate_stage_thresholds(stages, self.THRESHOLDS)
         self.assertEqual(e, [("some_new_stage", 0.42)])
+
+    def test_default_gates_unlisted_stages(self):
+        """stage_threshold_default turns ungated extras into real gates; an
+        advisory_stages prefix keeps a stage INFO-only."""
+        stages = {
+            "encoder_output": 0.9999,
+            "encoder_output_ref_mel": 0.9999,
+            "mel_spectrogram": 0.96,
+            "encoder_layer_3": 0.9999,
+            "encoder_layer_18": 0.2,   # drifted -> must FAIL under the default
+            "pre_enc_c0": -0.16,       # advisory -> extra, not a failure
+        }
+        p, f, m, e = run_one.evaluate_stage_thresholds(
+            stages, self.THRESHOLDS, default=0.998, advisory=("pre_enc_c",))
+        self.assertEqual(f, [("encoder_layer_18", 0.2, 0.998)])
+        self.assertIn(("encoder_layer_3", 0.9999, 0.998), p)
+        self.assertEqual(e, [("pre_enc_c0", -0.16)])
+        # Without a default the same drift is only an extra (old behaviour).
+        p, f, m, e = run_one.evaluate_stage_thresholds(stages, self.THRESHOLDS)
+        self.assertEqual(f, [])
+        self.assertEqual(len(e), 3)
+
+    def test_transcript_gate(self):
+        """Shared by GH and the Kaggle suite: case/punctuation-only diffs pass
+        at the default zero tolerance; a word error fails; CJK gates on CER."""
+        e = {"expected_transcript": "And so, my fellow Americans, ask not."}
+        self.assertTrue(run_one.transcript_gate(e, "and so my fellow americans ask not")[0])
+        self.assertFalse(run_one.transcript_gate(e, "and so my fellow americas ask not")[0])
+        self.assertTrue(run_one.transcript_gate(dict(e, transcript_tolerance={"wer_max": 0.25}),
+                                                "and so my fellow americas ask not")[0])
+        zh = {"expected_transcript": "我们都是好朋友"}
+        self.assertFalse(run_one.transcript_gate(zh, "我们都是好朋")[0])
+
+    def test_manifest_gate_kwargs(self):
+        """Every stage_threshold_default in the manifest is a sane cosine, and
+        stage_gate_kwargs reads it."""
+        manifest = json.loads((Path(run_one.__file__).parent / "manifest.json").read_text())
+        gated = [b for b in manifest["backends"] if "stage_threshold_default" in b]
+        self.assertTrue(gated)
+        for b in gated:
+            kw = run_one.stage_gate_kwargs(b)
+            self.assertTrue(0.9 <= kw["default"] <= 1.0, b["name"])
+        self.assertEqual(run_one.stage_gate_kwargs({}), {"default": None, "advisory": ()})
 
     def test_end_to_end_against_canned_diff_output(self):
         """Wire parse_diff_stdout → evaluate_stage_thresholds against

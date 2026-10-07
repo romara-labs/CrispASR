@@ -32,8 +32,8 @@ the repo name is descriptive attribution and the CrispASR backend key does not
 lead with it. All four are asserted at the end of this run — an obligation
 that is only intended is not discharged.
 
-Push (chr1s4):
-  export KAGGLE_API_TOKEN=<chr1s4 token>
+Push ($KAGGLE_ACCOUNT):
+  export KAGGLE_API_TOKEN=<$KAGGLE_ACCOUNT token>
   python -m kaggle kernels push -p tools/kaggle/breeze-convert
 """
 

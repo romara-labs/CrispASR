@@ -3,7 +3,7 @@
 ## NOW — active work
 
 **Branch** `feat/438-hojo-asr` (pushed; no PR). **Kernel**
-`chr1s4/crispasr-hojo-asr-438` (`tools/kaggle/hojo-asr-438/`).
+`${KAGGLE_ACCOUNT}/crispasr-hojo-asr-438` (`tools/kaggle/hojo-asr-438/`).
 
 ### The two gating questions, answered before any runtime was written
 

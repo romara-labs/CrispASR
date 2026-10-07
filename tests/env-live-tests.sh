@@ -26,6 +26,9 @@ fi
 export CRISPASR_MODEL_WHISPER="${CRISPASR_MODEL_WHISPER:-$_whisper_default}"
 unset _whisper_cache _whisper_default
 
+# hikari: simultaneous speech translation; Silero next to the model (as -m auto puts it).
+export CRISPASR_MODEL_HIKARI="${CRISPASR_MODEL_HIKARI:-$CRISPASR_MODELS_DIR/hikari-medium-f16.gguf}"
+
 # Tiron (#295): Whisper large-v3 + inline <|speakerN|> markers (legacy ggml bin).
 export CRISPASR_MODEL_TIRON="${CRISPASR_MODEL_TIRON:-$CRISPASR_MODELS_DIR/tiron-q4_k.bin}"
 
@@ -55,6 +58,12 @@ export CRISPASR_MODEL_COHERE="${CRISPASR_MODEL_COHERE:-$CRISPASR_MODELS_DIR/cohe
 # the names the script already falls back to.
 export CRISPASR_KOKORO_MODEL="${CRISPASR_KOKORO_MODEL:-$CRISPASR_MODELS_DIR/kokoro-82m-q8_0.gguf}"
 export CRISPASR_KOKORO_VOICE="${CRISPASR_KOKORO_VOICE:-$CRISPASR_MODELS_DIR/kokoro-voice-af_heart.gguf}"
+
+# Phonon-2: explicit/auto C ABI and CLI wiring, repeated-call and English-only LID guards.
+export CRISPASR_MODEL_PHONON2="${CRISPASR_MODEL_PHONON2:-$CRISPASR_MODELS_DIR/phonon2-q8_0.gguf}"
+
+# Index-Echo requires a same-cohort index-echo-2b-decoder companion beside this file.
+export CRISPASR_MODEL_INDEX_ECHO="${CRISPASR_MODEL_INDEX_ECHO:-$CRISPASR_MODELS_DIR/index-echo-2b-f16.gguf}"
 
 # ── Parakeet non-JA long-form guards (issues #350 / #385) ──
 # test-parakeet-longform builds its fixture from samples/jfk.wav; it only needs

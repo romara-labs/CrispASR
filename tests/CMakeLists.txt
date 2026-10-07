@@ -21,6 +21,28 @@ target_include_directories(test-realtime-turn-buffer PRIVATE ${PROJECT_SOURCE_DI
 target_link_libraries(test-realtime-turn-buffer PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test-realtime-turn-buffer PROPERTIES LABELS "unit;realtime")
 
+add_executable(test-index-echo-live test_index_echo_live.cpp)
+target_include_directories(test-index-echo-live PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-index-echo-live PRIVATE Catch2::Catch2WithMain index_echo crispasr-lib)
+catch_discover_tests(test-index-echo-live
+    TEST_SPEC "[index-echo]"
+    PROPERTIES LABELS live SKIP_RETURN_CODE 4 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+add_executable(test-index-echo-windows test-index-echo-windows.cpp)
+target_include_directories(test-index-echo-windows PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-index-echo-windows PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-index-echo-windows PROPERTIES LABELS "unit;index-echo")
+
+add_executable(test-index-echo-batch test-index-echo-batch.cpp)
+target_include_directories(test-index-echo-batch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-index-echo-batch PRIVATE Catch2::Catch2WithMain crispasr-llama-core)
+catch_discover_tests(test-index-echo-batch PROPERTIES LABELS "unit;index-echo")
+
+add_executable(test-index-echo-connector test-index-echo-connector.cpp)
+target_include_directories(test-index-echo-connector PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-index-echo-connector PRIVATE Catch2::Catch2WithMain ggml ggml-cpu)
+catch_discover_tests(test-index-echo-connector PROPERTIES LABELS "unit;index-echo")
+
 if (EMSCRIPTEN)
 #
 #test - crispasr - js
@@ -86,6 +108,15 @@ target_link_libraries(test-campplus-segpool PRIVATE Catch2::Catch2WithMain Threa
 catch_discover_tests(test-campplus-segpool
     TEST_SPEC "[unit][tts][campplus][segpool]"
     PROPERTIES LABELS "unit;tts;campplus")
+
+# ─── test-convt-permute — tiled ConvTranspose1d weight permute == naive loop
+# (shared by 22 backends; hermetic: CPU buffer, synthetic weights).
+add_executable(test-convt-permute test-convt-permute.cpp)
+target_include_directories(test-convt-permute PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-convt-permute PRIVATE Catch2::Catch2WithMain ggml ggml-base crispasr_link_ggml_cpu)
+catch_discover_tests(test-convt-permute
+    TEST_SPEC "[unit][core][convt]"
+    PROPERTIES LABELS "unit;core")
 
 add_executable(test-step-graph-cache test-step-graph-cache.cpp)
 target_include_directories(test-step-graph-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -653,6 +684,18 @@ if(CRISPASR_BUILD_EXAMPLES)
         TIMEOUT 120)
 endif()
 
+# ─── test-quant-override-1d — regression guard for #461 ───────────────────────
+# `--tensor-type <regex>=f16` must not lower 1-D tensors (biases/norms) below F32:
+# ggml's CPU add aborts on F32 + F16. Hermetic: hand-written GGUF, built binary.
+if(CRISPASR_BUILD_EXAMPLES)
+    add_test(NAME test-quant-override-1d
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-quant-override-1d.sh
+            $<TARGET_FILE:crispasr-quantize>)
+    set_tests_properties(test-quant-override-1d PROPERTIES
+        LABELS "unit;gh;regression-461"
+        TIMEOUT 120)
+endif()
+
 # ─── test - stream - finalize — Catch2 unit tests for the streaming
 # `final.text` stitcher used by `--stream-json` finalize_utterance.
 # Header-only target (no crispasr lib needed): the helper is a pure
@@ -730,6 +773,39 @@ target_link_libraries(test-stream-partial-decode PRIVATE
 catch_discover_tests(test-stream-partial-decode
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;stream-json"
+)
+
+# core/pause_split.h: cutting audio at pauses (moonshine-de). Header-only, synthetic tones.
+add_executable(test-pause-split
+    test-pause-split.cpp
+)
+target_include_directories(test-pause-split PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-pause-split PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-pause-split
+    TEST_SPEC "[unit]"
+)
+
+# Live transcribe + translate: the sentence-commit policy and its sink
+# (examples/cli/crispasr_live_translate*.h). Header-only; the translator is a
+# lambda and the partials are scripted, so no model and no audio.
+add_executable(test-live-translate
+    test-live-translate.cpp
+)
+target_include_directories(test-live-translate PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+find_package(Threads REQUIRED)
+target_link_libraries(test-live-translate PRIVATE
+    Catch2::Catch2WithMain
+    Threads::Threads
+)
+catch_discover_tests(test-live-translate
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;live-translate"
 )
 
 # Pyannote-seg → ASR-segment speaker scoring (issue #107). Drives the
@@ -1199,6 +1275,7 @@ endif()
 # ─── test-miotts-live — live integration tests for MioTTS backend
 add_executable(test-miotts-live
     test_miotts_live.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_backend_miotts.cpp
 )
 target_include_directories(test-miotts-live PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -1318,6 +1395,61 @@ catch_discover_tests(test-canary-qwen-live
         LABELS live
         SKIP_RETURN_CODE 4
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-canary-180m-live — Canary 180M Flash Q4 ASR acceptance plus
+# optional Q5+ translation. Needs CRISPASR_MODEL_CANARY_180M; translation is
+# separately gated by CRISPASR_MODEL_CANARY_180M_TRANSLATE.
+add_executable(test-canary-180m-live
+    test_canary_180m_live.cpp
+)
+target_include_directories(test-canary-180m-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-canary-180m-live PRIVATE
+    Catch2::Catch2WithMain
+    canary
+    crispasr-lib
+)
+catch_discover_tests(test-canary-180m-live
+    TEST_SPEC "[canary-180m]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        TIMEOUT 900
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+# hikari through the session C ABI (what the bindings use): English ASR and
+# en->de against the reference text. Skips without CRISPASR_MODEL_HIKARI.
+add_executable(test-hikari-live
+    test_hikari_live.cpp
+)
+target_include_directories(test-hikari-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-hikari-live PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-hikari-live
+    TEST_SPEC "[hikari]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        TIMEOUT 900
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+add_test(NAME test-canary-source-contract
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test_canary_lang_whitelist.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+)
+set_tests_properties(test-canary-source-contract PROPERTIES
+    LABELS "unit;canary;source-contract"
+    TIMEOUT 30
 )
 
 # ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
@@ -2592,6 +2724,31 @@ catch_discover_tests(test-m2m100-params
     PROPERTIES LABELS "unit;m2m100"
 )
 
+# ─── test-marian-tokenizer — core/marian_tokenizer.h (SentencePiece normalizer,
+# unigram Viterbi, vocab.json id mapping) and the Marian branch of the m2m100
+# loader refusing a GGUF without its tokenizer tables. No model files. ─────────
+add_executable(test-marian-tokenizer
+    test-marian-tokenizer.cpp
+)
+target_include_directories(test-marian-tokenizer PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-marian-tokenizer PRIVATE
+    Catch2::Catch2WithMain
+    m2m100
+)
+catch_discover_tests(test-marian-tokenizer
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;marian;m2m100"
+)
+
+# marian-parity — in-process driver for tools/marian_parity.py (token ids,
+# greedy text and warm per-sentence timings against Hugging Face). Needs a
+# model, so it is not a test and is only built when asked for by name.
+add_executable(marian-parity EXCLUDE_FROM_ALL marian-parity.cpp)
+target_include_directories(marian-parity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(marian-parity PRIVATE m2m100)
+
 # ─── test-moonshine-stream-params — Catch2 unit tests for moonshine_streaming_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-moonshine-stream-params
@@ -2953,6 +3110,19 @@ catch_discover_tests(test-issue-353-split-pipeline
     PROPERTIES LABELS "unit;split-pipeline;issue-353"
 )
 
+# GNU linker interception keeps the #486 worker-count probe out of production
+# APIs and also works when the CPU backend is a dynamically loaded module.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-model-cpu-threads test-model-cpu-threads.cpp)
+    target_include_directories(test-model-cpu-threads PRIVATE
+        ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/include)
+    target_link_libraries(test-model-cpu-threads PRIVATE
+        Catch2::Catch2WithMain nemotron paraformer dia-tts)
+    target_link_options(test-model-cpu-threads PRIVATE "LINKER:--wrap=ggml_backend_free")
+    catch_discover_tests(test-model-cpu-threads
+        TEST_SPEC "[issue-486]" PROPERTIES LABELS "unit;model-threads;issue-486")
+endif()
+
 # ─── test-cpu-backend-shim — #355 CPU-backend access shim
 #
 # Pins src/core/ggml_cpu_backend.h. Compiles unchanged with or without
@@ -3073,6 +3243,24 @@ target_link_libraries(test-issue-475-json-utf8 PRIVATE
 catch_discover_tests(test-issue-475-json-utf8
     TEST_SPEC "[issue-475]"
     PROPERTIES LABELS "unit;output;issue-475"
+)
+
+# ─── test-canary-layout — canary loader's pointwise Conv1d layouts (#470 follow-up; hermetic, unit)
+add_executable(test-canary-layout test-canary-layout.cpp)
+target_include_directories(test-canary-layout PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-canary-layout PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-canary-layout
+    TEST_SPEC "[layout]"
+    PROPERTIES LABELS "unit;canary"
+)
+
+# ─── test-fastconformer-snap-layout — diff-harness conv snapshot layout vs the reference dumpers (hermetic, unit)
+add_executable(test-fastconformer-snap-layout test-fastconformer-snap-layout.cpp)
+target_include_directories(test-fastconformer-snap-layout PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-fastconformer-snap-layout PRIVATE Catch2::Catch2WithMain ggml ggml-base crispasr_link_ggml_cpu)
+catch_discover_tests(test-fastconformer-snap-layout
+    TEST_SPEC "[unit][fastconformer]"
+    PROPERTIES LABELS "unit;core"
 )
 
 # ─── test-internal-chunking-gate — CAP_INTERNAL_CHUNKING regression guard
@@ -4222,6 +4410,13 @@ target_link_libraries(test_audioseal PRIVATE
 catch_discover_tests(test_audioseal
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# Keep duration/capacity regressions discoverable by live-test runs. Each test
+# skips when CRISPASR_AUDIOSEAL_GGUF is absent; inference runs serially.
+catch_discover_tests(test_audioseal
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live" TIMEOUT 900 RUN_SERIAL TRUE
 )
 
 # ─── test_audioseal_cosine — standalone cosine comparison against PyTorch ref.
@@ -5970,3 +6165,27 @@ catch_discover_tests(test-torchaudio-resample
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;resample"
 )
+
+# ─── test-ctc-stitch — overlapping-window CTC grid stitching (omniASR CTC chunking; hermetic, unit)
+add_executable(test-ctc-stitch test-ctc-stitch.cpp)
+target_include_directories(test-ctc-stitch PRIVATE ${PROJECT_SOURCE_DIR}/examples/cli)
+target_link_libraries(test-ctc-stitch PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-ctc-stitch TEST_SPEC "[ctc-stitch]" PROPERTIES LABELS "unit;omniasr")
+
+# Phonon-2 reuses Parakeet; exercise its model alias and metadata through real surfaces.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+# examples/cli is added after tests, so its target does not exist yet here.
+if (Python3_Interpreter_FOUND AND CRISPASR_BUILD_EXAMPLES AND BUILD_SHARED_LIBS
+    AND NOT EMSCRIPTEN AND NOT CRISPASR_BUILD_COMMON_ONLY)
+    add_test(NAME phonon2-live
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_phonon2_live.py
+            --lib $<TARGET_FILE:crispasr-lib> --cli $<TARGET_FILE:crispasr-cli>)
+    set_tests_properties(phonon2-live PROPERTIES LABELS live SKIP_RETURN_CODE 77
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" TIMEOUT 600)
+endif()
+
+# Weight-free guards for the prompt contracts used by the ABI and CLI.
+add_executable(test-asr-prompt-contract test-asr-prompt-contract.cpp)
+target_include_directories(test-asr-prompt-contract PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-asr-prompt-contract PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-asr-prompt-contract TEST_SPEC "[unit]" PROPERTIES LABELS "unit;asr-prompt")

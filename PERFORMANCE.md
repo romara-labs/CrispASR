@@ -4,6 +4,322 @@ Test audio: jfk.wav (11.0s), Q4_K quantization, greedy decode (`-bs 1`).
 
 ---
 
+## Index-Echo S2TT 9B CUDA — 2026-10-02 (#485)
+
+On two actual Tesla T4 GPUs (SM75, 15 GiB each), the accepted F16 port is
+1.33× faster on JFK and 1.36× on Chinese than the fully resident original
+Python implementation. Both execution orders pass exact independent decoded
+text and timestamps for every timed call. Each arm runs in an isolated process,
+with model loading and first calls separate from three warm calls per clip.
+The [complete receipt](docs/index-echo-9b-profile-2026-10-02.json) retains all
+iterations, output cues, dtype audits, placement and runtime provenance.
+
+| Clip | Python BF16 warm, AB / BA | Native F16 warm, AB / BA | Speedup, AB / BA |
+|---|---:|---:|---:|
+| JFK, 11.0 s | 16.210 / 16.241 s | 12.197 / 12.243 s | 1.329× / 1.327× |
+| Chinese, 13.052 s | 18.964 / 18.864 s | 13.960 / 13.871 s | 1.358× / 1.360× |
+
+This compares the actual implementations at different activation precision
+and their recorded default layer distributions, rather than isolating an
+algorithmic optimization. Python uses actual BF16 parameters with 12 decoder
+layers on GPU0 and 20 on GPU1; native F16 uses its private llama core's default
+split. Both native arms show real CUDA tensor placement. The F32 source parity
+captures use offload and are not a performance baseline. Native runs here are
+slightly slower than realtime; the smaller 2B Q8 pair remains the default.
+
+First JFK calls are 30.738 / 20.673 s for Python and 12.515 / 12.479 s for native
+(AB / BA). Model loading is 116.036 / 96.650 s and 81.526 / 10.899 s, respectively;
+the large order-dependent native load difference makes a single cold end-to-end
+speedup claim unsuitable. Warm Chinese native stages are approximately 0.14 s
+mel, 0.13 s encoder, 0.003 s connector, 1.65 s decoder prefill and 12.0 s decoder
+generation. Generation accounts for roughly 86% of inference time.
+
+The encoder and connector execute native ggml graphs. The decoder uses batched
+prefill, hybrid KV/recurrent-state caches, Flash Attention and fused GatedDeltaNet
+AR/chunked kernels, confirmed in the validation runtime logs. Its multi-GPU
+pipeline disables graph reuse; CUDA graph capture is not established by these
+T4 measurements. Speed work should start with decoder generation. Rejected
+plain/selective/FFN-only Q8 variants remain private because they change output.
+
+## Index-Echo S2TT 2B CPU — 2026-10-01 (#485)
+
+[Same-host profile](https://github.com/CrispStrobe/CrispASR/actions/runs/36907737439)
+on a four-core ARM Neoverse-N2 hosted VM, four threads, portable build
+(`GGML_NATIVE=OFF`). All timed iterations match the released Python fixture
+text and centisecond timestamps. The Python path requests F32, but
+[effective-dtype audit](https://github.com/CrispStrobe/CrispASR/actions/runs/36911946162)
+shows F32 tower/connector **and BF16 decoder**: Transformers 5.6.0 retains the
+nested text configuration. These are timings against the actual blueprint,
+not a comparison at equal arithmetic precision.
+
+| Clip | Python F32/BF16 warm | Native F16 warm | Native Q8 warm | Q8 speedup |
+|---|---:|---:|---:|---:|
+| JFK, 11 s | 23.52 s | 18.58 s | 17.58 s | 1.34× |
+| Chinese, 13.052 s | 32.91 s | 24.71 s | 22.51 s | 1.46× |
+| Partial-hop JFK, 10.988 s | 23.38 s | 18.59 s | 17.60 s | 1.33× |
+
+Warm figures are medians of two measured iterations after one initial
+iteration, in fixed Python/F16/Q8 order. Python's first JFK call is 30.95 s;
+model load is measured separately (14.52 / 2.12 / 3.04 s). Peak process RSS
+is 7.95 / 5.56 / 4.03 GiB. RSS includes the tokenizer and Python process;
+these three short clips are not an accuracy corpus or a physical-device
+throughput prediction. Native stage timing logs and every timed output are
+in the run artifact; the corrected precision labels and complete metrics
+are retained in [the receipt](docs/index-echo-cpu-2026-10-01.json).
+
+The encoder and connector use ggml graphs/schedulers; the private Qwen3.5
+core batches prefill and caches both full-attention KV and recurrent state.
+Cache is reset per window while prior-output text enters the next prompt.
+There is no Python/ONNX inference fallback.
+
+CUDA proof ran on **two Tesla T4 GPUs (SM75, 15GiB each)**, with the decoder
+using its default layer distribution across both devices. All F16/Q8 stage,
+magnitude and cached-token checks pass against the independent mixed-precision
+CPU source captures. Every GPU SRT is byte-identical to its same-box native CPU
+control (text and timestamps). These are single cold calls, not warm medians.
+
+| Clip | F16 inference | Q8 inference | Q8 including load/process |
+|---|---:|---:|---:|
+| JFK, 11 s | 2.88 s | 2.23 s | 4.68 s |
+| Chinese, 13.052 s | 3.91 s | 2.92 s | 5.38 s |
+| Partial-hop JFK, 10.988 s | 2.89 s | 2.07 s | 4.53 s |
+
+Q8 is 4.5–5.3× realtime excluding load on these clips. The receipt retains
+exact per-stage times and hardware in
+[docs/index-echo-cuda-2026-10-01.json](docs/index-echo-cuda-2026-10-01.json).
+This proves CUDA execution on integer-MMQ-capable hardware; it does not isolate
+MMQ versus cuBLAS performance or establish full-file GPU/VAD parity.
+
+## Intel macOS release ISA — 2026-10-01 (#484)
+
+v0.8.39's Intel CLI used `CRISPASR_PORTABLE_CPU=ON`, which forcibly disables
+AVX2/FMA/F16C. The standard Intel archive now enables these explicitly with
+`GGML_NATIVE=OFF`, Apple Accelerate, and Metal off. The separate
+`crispasr-macos-x86_64-cpu-legacy.tar.gz` retains the SSE2 baseline.
+Runtime/ggml sources were unchanged between the reporter's v0.8.38/v0.8.39
+commits; the build configuration accounts for the observed regression.
+
+[Alternating timing proof](https://github.com/CrispStrobe/CrispASR/actions/runs/36872271289)
+uses the same already-validated binaries on an Intel Core i7-8700B hosted
+macOS VM, four threads, both execution orderings, one warmup then three pairs.
+
+| Q8 fixture | Legacy warm median | SIMD warm median | Warm pair speedups |
+|---|---:|---:|---:|
+| JFK, 11 s | 18.33 s | 8.19 s | 1.38x / 5.03x / 2.24x |
+| JFK repeated six times, 66 s | 95.08 s | 51.07 s | 1.76x / 1.93x / 1.50x |
+
+The host has substantial timing variation. Every warmed pair favors SIMD,
+but these figures do not predict the reporter's 455-second Russian clip or a
+quiet physical Mac. The initial compilation-run Q8 median ratio of 3.36x is
+retained in the receipt and is not a settled speed claim. CLI timers exclude
+model loading; long audio is a repetition fixture, not an accuracy corpus.
+
+[Full quality proof](https://github.com/CrispStrobe/CrispASR/actions/runs/36867331142)
+compares the final encoder state and decoded text from both ISA builds:
+
+| Model | Encoder cosine | SIMD / baseline norm | Relative L2 |
+|---|---:|---:|---:|
+| F16 | 0.999999499 | 1.000050282 | 0.001002134 |
+| Q8_0 | 0.999759738 | 1.000731459 | 0.021941089 |
+| Q4_K | 0.999200258 | 1.002500181 | 0.040121499 |
+
+All short transcripts have the exact normalized golden words. Both Q8 arms
+produce the same 133 normalized words on every 66-second call: the existing
+gap-fill path adds one "and" in the sixth repetition versus the 132-word ideal.
+The candidate adds no transcription error. The comparison explicitly checks
+finite values, shape, cosine, magnitude and real decoded output; ISA rounding
+is not byte-identical, particularly for quantized weights.
+
+Both Intel archive variants passed extracted-bundle architecture, CLI and
+quantizer startup checks with original build/C2PA directories hidden in
+[package run](https://github.com/CrispStrobe/CrispASR/actions/runs/36868274235).
+The legacy job required a focused retry after HTTP 504 errors. C2PA is now
+fetched with bounded retries and required before Intel release compilation.
+No physical pre-AVX2 Mac was available; legacy compile flags and its real
+inference path were checked on the Intel runner.
+
+[Full metrics, provenance and hashes](docs/macos-intel-parakeet-2026-10-01.json).
+
+## Phonon-2 — gated FFN experiments (2026-10-01, #481)
+
+Q4_K FFN CPU_REPACK reduces warmed 11/55 s inference from 1.850/10.189 s to
+1.508/8.401 s (18.5%/17.6% less time) on a four-vCPU EPYC 7763, four threads.
+RSS stays about 1,318 MiB; load increases from 0.077 to 0.508 s. All words on
+21 local clips match baseline, but two punctuation changes and a failed Q4
+stage magnitude gate keep it opt-in. Q8_0 has no x86 repack kernel at our pin.
+
+On a separate EPYC 9V74, cached FFN BLAS at four threads reduces long F16 from
+20.733 to 11.918 s (42.5%), but slows short F16 from 3.966 to 6.157 s and
+regresses both Q8/Q4 shapes. Its 96 F32 matrices add 1,536 MiB of weight storage;
+F16 peak RSS rises from 2,247 to 3,823 MiB and load from 0.178 to 3.880 s.
+One/two-thread alternatives also regress quantized inference. Compare paths
+within each host; these are three-call medians excluding load and profiling,
+and 55 s repeats JFK five times. Defaults and model download sizes are unchanged.
+
+The strict 31-stage F16 gate passes all corrected BLAS configurations. Local
+BLAS1 preserves 61/63 old transcripts, with both differences closer to Python;
+human word errors remain unchanged. Q4 numerical drift is retained explicitly.
+See [full tables, quality scope and controls](docs/phonon2.md#gated-ffn-cpu-experiments-2026-10-01)
+and [raw receipts](docs/phonon2-ffn-cpu-2026-10-01.json). Corrected profile,
+13-job cross-platform CI, lint and cross-ISA probes pass. Both paths remain off.
+
+## Phonon-2 — CPU optimization (2026-10-01, #481)
+
+Native AVX2/F16C Phonon-2 CPU builds use persistent ggml predictor/joint graphs
+and a bulk backend encoder projection. Apple retains Accelerate; other models
+and instruction sets retain their previous defaults. The original scalar path
+and OpenBLAS experiments remain available through documented environment gates.
+Encoder BLAS scheduling stays opt-in; encoder caching stays off.
+
+The first full sweep,
+[CI 36813752349](https://github.com/CrispStrobe/CrispASR/actions/runs/36813752349),
+compares all paths on an AMD EPYC 7763 four-vCPU runner, four inference threads.
+Q8 scalar 2.440/13.010 s becomes OpenBLAS4 1.852/10.007 s on warmed 11/55 s
+shapes (24% less inference time). Persistent ggml decoding is similarly fast;
+the separate decoder trace reveals an 82 ms scalar projection still worth
+removing. Encoder BLAS4 regresses short clips and remains experimental.
+
+The selected default is verified in
+[CI 36818985927](https://github.com/CrispStrobe/CrispASR/actions/runs/36818985927):
+
+| Engine/export | Original 11 s | Default 11 s | Original 55 s | Default 55 s | Default RSS |
+|---|---:|---:|---:|---:|---:|
+| F16 | 4.364 s | 3.704 s | 22.562 s | 19.393 s | 2,258 MiB |
+| Q8_0 | 2.439 s | 1.782 s | 13.000 s | 9.856 s | 1,611 MiB |
+| Q4_K | 2.500 s | 1.860 s | 13.287 s | 10.252 s | 1,315 MiB |
+| Independent Python F32 | — | 1.798 s | — | 8.931 s | 3,406 MiB |
+
+Q8 cuts original inference time by 27%/24% (1.369×/1.319× speedup), is roughly
+tied with Python on 11 s and takes 10% longer on 55 s, using 53% less peak RAM.
+Q8 remains recommended. These are shape-warmed medians of three calls, excluding
+load/profiling; the 55 s shape repeats JFK five times. One-thread encoder BLAS
+still regresses short Q8 to 2.940 s and long Q8 to 12.456 s versus this default.
+All ten final configurations pass 31 F16 rows; the selected default's minimum
+cosine is 0.999998 and global norm-error bound 0.058%. Its projection/predictor
+SOS/joint probes each print cosine 1.000000. Full per-stage results and
+[raw receipts](docs/phonon2-cpu-2026-10-01.json) are checked in.
+
+All six first-sweep paths pass 31 F16 reference rows, including full encoder
+projection, production one-blank predictor SOS and frame-zero joint logits.
+Cosine alone is insufficient: each row also passes relative RMS error, bounding
+its global tensor norm-ratio error. Both OpenBLAS and ggml with backend projection
+preserve 63/63 original corpus outputs across F16/Q8/Q4. These probes do not
+cover every autoregressive state. Original quantization differences against
+Python remain unchanged.
+
+See [controls and complete validation scope](docs/phonon2.md). These are CPU
+measurements; they do not establish physical Apple GPU or upstream MLX parity.
+
+## Phonon-2 — integration and fair CPU profile (2026-09-30, #481)
+
+Measured after wiring/live/F16 parity gates in
+[CI run 36784469150](https://github.com/CrispStrobe/CrispASR/actions/runs/36784469150).
+AMD EPYC 9V74, 4-vCPU Linux runner, 4 inference threads, Release/OpenBLAS-linked build. Parakeet schedules encoder matmuls on ggml CPU kernels;
+the separate BLAS backend is not registered. OpenBLAS serves mel projection.
+Each shape is warmed; medians of three calls exclude loading and instrumentation.
+The 55 s case is JFK repeated five times, not a natural long-audio accuracy test.
+
+| Engine/export | 11 s median | realtime | 55 s median | realtime | Peak RSS |
+|---|---:|---:|---:|---:|---:|
+| Independent Python F32 (Transformers/PyTorch CPU) | 1.580 s | 6.96× | 8.042 s | 6.84× | 3,414 MiB |
+| CrispASR F16 | 3.731 s | 2.95× | 19.222 s | 2.86× | 2,249 MiB |
+| CrispASR Q8_0 | 1.760 s | 6.25× | 9.301 s | 5.91× | 1,614 MiB |
+| CrispASR Q4_K | 2.043 s | 5.38× | 10.878 s | 5.06× | 1,320 MiB |
+
+Q8 is 11–16% slower than the Python reference here, with 53% less peak process
+RAM. F16/Q8 transcripts match that reference exactly at both lengths; Q4 has
+identical normalized words but differs in long-clip punctuation. These checks
+do not replace the 21-clip quantization validation. Q8 remains the default:
+Q4 is smaller but slower on this CPU. This is not a comparison against MLX.
+
+All 28 compared frontend/encoder stages pass (minimum cosine 0.999994; norm-ratio error bounded by
+0.066%). Shared-library/CLI/explicit alias/renamed-model and repeated-call
+checks pass, including flash-off node verification. A separate Q8 trace finds
+encoder ~1171 ms, scalar Linux decoder ~587 ms, mel ~14 ms. Encoder graph
+build/allocation total ~1 ms; caching is not a useful first optimization and
+the experimental encoder cache remains off. The two FFN matmul shape groups
+are ~50% of traced encoder time. Linux decoder matvecs and encoder FFN kernels
+are the next measured targets; Apple uses Accelerate, while CUDA/Vulkan use
+reused ggml decoder graphs. No new optimization default was selected.
+
+The macOS job also passes all 28 stages (min cosine 0.999992, magnitude bound
+0.069%) on a virtual M1/Apple Paravirtual Metal device without SIMD-group
+matrix support. Q8 medians are 8.396 s (11 s audio) / 15.167 s (55 s audio).
+Treat these as CI timings, not physical M1/M5 performance.
+
+See [full integration, parity and profiling details](docs/phonon2.md) and the
+[raw measurement receipt](docs/phonon2-profile-2026-09-30.json).
+
+## voxcpm2 — #461 (Vulkan) and #478 (CPU) (2026-09-29 to 2026-10-01)
+
+Reporter's Arc B390 iGPU (Vulkan, seed 2, "Hello, this is a short test sentence."):
+
+| build / file | steps | VAE decode | CFM per audio step | total | RTF |
+|---|---|---|---|---|---|
+| before #461 fixes, q8_0 | 6 | 1688 ms | 90.7 ms | 4126 ms | 1.36 |
+| after, q8_0 | 10 | 316 ms | 141.5 ms | 4097 ms | 1.28 |
+| after, q8_0 | 8 | 303 ms | 110.6 ms | 3354 ms | 1.10 |
+| after, q8_0 + F16 LocDiT | 8 | 299 ms | 96.6 ms | 3085 ms | 1.01 |
+
+Kaggle T4 (Vulkan): CFM 70.2 ms (q8_0, 10 steps) → 59.4 (mixed) → 46.7 (mixed, 8).
+CPU (4-core GitHub runner, #478, 62-position voice clone): TSLM prefill 2497 →
+1321 ms, `tslm_step` avg 132.9 → 42.6 ms, total 39.5 → 36.0 s.
+
+RALM prefill also batches the causal prefix on validated native x86 CPU paths.
+Four-thread, same-host medians of three warmed eager/batched pairs at 249
+positions on a four-vCPU Xeon 6973P-C GitHub runner in
+[run 36854994459](https://github.com/CrispStrobe/CrispASR/actions/runs/36854994459):
+
+| RALM matrices | eager | batched | prefill speedup |
+|---|---:|---:|---:|
+| Q8_0 | 4116.5 ms | 899.2 ms | 4.58× |
+| F16 | 6159.5 ms | 3549.8 ms | 1.74× |
+
+The generated-reference Q8 clone's 40-position RALM prefill drops from 603.9
+to 160.4 ms with the new default. These are prefill timings, not whole-synthesis
+speedups or a measurement of the reporter's Windows machine.
+
+Hidden states, KV, next-step decoding, causal isolation and short-after-long
+reuse pass at 1/10/62/249/4 positions for Q8/F16. Both formats pass zero-shot
+and synthetic-reference TTS→ASR; F16 also agrees with an independent PyTorch
+forward using the same weights (relative error < 2e-6). CPU prefill preserves
+the eager RMS reduction and SwiGLU arithmetic because small upstream changes
+can be amplified by activation quantization.
+
+Default batching requires F16/Q8_0 RALM matrices and AVX2/F16C CPU kernels.
+`CRISPASR_VOXCPM2_RALM_PREFILL_BATCH=0` restores eager prefill; other quants/ISAs
+are opt-in with `1`. Q4_K's hidden-state error exceeds the unchanged 1% limit
+(1.83% at 249 positions), and one opt-in speech readback adds trailing words.
+Its default stays eager and preserves the baseline readback.
+GPU prefill stays eager pending actual GPU validation.
+`CRISPASR_VOXCPM2_USE_GRAPH=0` also retains eager prefill. The proof scripts and
+logs record experimental Q4 failure separately from the validated default paths.
+The default/explicit arms and graph-disabled fallback also pass; all thirteen
+cross-platform CI jobs pass. See the
+[checked-in measurement receipt](docs/voxcpm2-ralm-prefill-2026-10-01.json).
+
+## Canary 180M Flash Q4_K_M — Linux CPU/Vulkan bring-up (AMD Ryzen AI MAX+ 395 / Radeon 8060S, 2026-09-25)
+
+Directly loaded
+`handy-computer/canary-180m-flash-gguf/canary-180m-flash-Q4_K_M.gguf`
+(139,223,744 bytes). CPU and Vulkan produced the same English transcript; Q5_K_M
+also produced the same EN→DE translation on both backends.
+
+| Input | Backend | Wall | RTx | Phase detail |
+|---|---|---:|---:|---|
+| JFK 11.0 s | CPU | 1.96 s | 5.6× | mel 17 ms, encoder 1476 ms, decoder 357 ms |
+| JFK 11.0 s | Vulkan (warm) | 0.55 s | 20.0× | first profiled run: mel 18 ms, encoder 502 ms, decoder 490 ms |
+| JFK repeat 35.0 s | CPU | 6.20 s | 5.6× | mel 19 ms, encoder 4937 ms, decoder 1108 ms |
+| JFK repeat 35.0 s | Vulkan | 0.77 s | 45.5× | mel 17 ms, encoder 195 ms, decoder 188 ms |
+| JFK ×4 44.0 s | CPU, offline chunking | 9.37 s | 4.7× | three 20 s / 6 s-overlap windows |
+| JFK ×4 44.0 s | Vulkan, offline chunking | 1.13 s | 38.9× | all four repetitions retained |
+
+GNU `time -v` peak RSS on JFK was 353,568 KiB CPU and 224,628 KiB Vulkan.
+These are desktop bring-up numbers; Android arm64 compiles, packages, and uses
+the same validated runtime path.
+
+---
+
 ## Metal im2col: the v0.17 sync silently dropped the batch-1 occupancy win — restored as kernel_im2col_flat, melotts hifigan back to ~1.85x (Apple M1, 2026-08-06)
 
 The v0.17 ggml sync removed `CRISPASR_METAL_IM2COL_OCC` (upstream reworked
@@ -245,7 +561,7 @@ the §232 campaign. Verified against current code, not carried from this doc.
 - **Batched TDT/RNNT decode (`CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH`,
   default OFF) is a MEASURED CPU LOSS for parakeet TDT — keep it OFF, do NOT
   flip.** The "370 sgemv → 26 sgemm" framing predicted a CPU win; the #81 A/B on
-  a clean Kaggle CPU (P100 box, `chr1str/crispasr-issue81-onnx-bench`,
+  a clean Kaggle CPU (P100 box, `${KAGGLE_ACCOUNT}/crispasr-issue81-onnx-bench`,
   2026-07-18) measured the opposite on parakeet-tdt-0.6b, transcript
   byte-identical in both arms:
 
@@ -403,7 +719,7 @@ Do **not** re-enable encoder-graph caching (#235 UAF + measured dud), and do
 ## Kaggle GPU — full backend sweep — 2026-06-20
 
 Platform: Kaggle GPU worker (CUDA), `tools/kaggle-benchmark-all-backends.py`
-(kernel `chr1s4/crispasr-full-backend-sweep`). Commit: latest `main`. **First
+(kernel `${KAGGLE_ACCOUNT}/crispasr-full-backend-sweep`). Commit: latest `main`. **First
 full-coverage sweep** — every ASR + TTS backend plus the two text-MT backends,
 59 entries — with **per-backend results streamed live to an HF dataset**
 (`cstr/crispasr-kaggle-progress/full-backend-sweep/latest/`, resumable). Audio:
@@ -462,7 +778,7 @@ m2m100 (3.7 s), madlad (12.5 s) — en→de translation produced output.
 
 - **Streaming + resume validated end-to-end.** All per-backend JSONs landed in the
   HF dataset as each backend finished; a re-push skips already-streamed backends.
-  Root cause of the earlier streaming failures (token unresolved on the chr1s4
+  Root cause of the earlier streaming failures (token unresolved on the $KAGGLE_ACCOUNT
   nested mount path) fixed in `81826457`.
 - **Genuine CUDA failures: ~7** (was reported as 10), of which `fastpitch` +
   `speecht5` (§204), `chatterbox` (§205), `lfm2-audio` (§206), and `kugelaudio` (§209) are now FIXED; `orpheus` and `cosyvoice3` (dies 0.1 s) remain — tracked
@@ -883,7 +1199,7 @@ needs a per-stage look).
 | onnx-asr parakeet-ctc CPU int8, 134 s varied | 5.8× (tdt 5.7×) |
 
 **Q4 round-2 rejected arms (P100, 2026-09-07; Kaggle
-`chr1str/crispasr-issue-81-q4-round-2`, encoder matrix v1 at `b82b7baf`,
+`${KAGGLE_ACCOUNT}/crispasr-issue-81-q4-round-2`, encoder matrix v1 at `b82b7baf`,
 TDT matrix v3 at `c0527382`).** Device-side
 selection preserved exact transcripts but improved the experimental baseline by
 only 0.17% on the 134 s clip. Speculative joint batches lost 2.5–8.1%. The
@@ -917,7 +1233,7 @@ parity or lost speed.
 | selected FFN F16 | 156.95× | transcript changed and −3.8% |
 
 **ggml v0.23 fork consolidation (P100 sm_60, 2026-09-07; Kaggle
-`chr1s4/crispasr-ggml-v0-23-q4-a-b` v3).** The old fork pin and merged
+`${KAGGLE_ACCOUNT}/crispasr-ggml-v0-23-q4-a-b` v3).** The old fork pin and merged
 v0.23 runtime used separate source-compatible CrispASR checkouts, the same Q4
 Parakeet TDT model and audio, and an account-matched warm ccache dataset.
 Transcripts were stable and byte-identical. v0.23 was neutral-to-faster:
@@ -930,7 +1246,7 @@ Transcripts were stable and byte-identical. v0.23 was neutral-to-faster:
 The benchmark exercised ggml runtime commit `069a517d`; the merged default
 commit `2dd13edd` has the same runtime source tree (later commits only add
 patch guards, CI, and merge ancestry). Kaggle validation passed and the
-`chr1s4/crispasr-ccache` seed was refreshed to version 13.
+`${KAGGLE_ACCOUNT}/crispasr-ccache` seed was refreshed to version 13.
 
 CUDA rows resolved (2026-07-12, kernel `issue81-onnx-bench` v16, real
 134 s varied LibriSpeech, load-excluded, 301-word proof-of-work,
@@ -944,7 +1260,7 @@ kept as the best-case in-process figure; the 137× row is the fair
 varied-audio comparison against onnx.)
 
 Q4 follow-up (2026-09-07, kernel
-`chr1str/crispasr-issue-81-q4-p100-profile` v4, commit `39c2a7b2`, P100
+`${KAGGLE_ACCOUNT}/crispasr-issue-81-q4-p100-profile` v4, commit `39c2a7b2`, P100
 sm_60): profiling found that TDT spent about 1.40 s of its 2.56 s wall time in
 the encoder-to-joint projection, which still ran as scalar CPU code before the
 GPU decoder loop. One backend matmul reduced that projection to 4.0 ms and the
@@ -976,6 +1292,14 @@ FireRed-ASR, Granite Speech, Moonshine, Moonshine Streaming and Paraformer) ·
 bisection. Kernels: `tools/kaggle/fc-unified-graph-ab` (CUDA A/B),
 `tools/kaggle/fc-pw-requant` (fleet requant),
 `tools/kaggle/issue81-onnx-bench` (onnx head-to-head).
+
+**Cohere artifact-time pointwise requantization (2026-09-28):** the published
+Q4 retained 96 F16 Conformer pointwise matrices. Rewriting only those tensors
+to Q8_0 preserved the JFK transcript and reduced the scheduler-profiled encoder
+from 10242.59 to 9447.52 ms; process wall time fell from 10.93 to 10.16 s. The
+published 1.20 GiB GGUF was range-read after upload and contains exactly 96
+Q8_0 tensors. A load-time conversion was rejected earlier because its startup
+cost outweighed the inference gain; the artifact carries the optimization now.
 
 ---
 
@@ -2356,7 +2680,7 @@ core infrastructure.
   above 0.99999997. Plain Q4_K is 1.86 GB; retaining both acoustic encoders in
   F16 grew it to 2.73 GB without changing the transcript or token IDs, so the
   plain Q4_K arm is the shipped artifact. Kernel:
-  `chr1str/crispasr-vibevoice-streaming-426-q4`, commit `f9f96dd2`.
+  `${KAGGLE_ACCOUNT}/crispasr-vibevoice-streaming-426-q4`, commit `f9f96dd2`.
 - Gap: acoustic+semantic encoders run serial (could fuse/parallel),
   pred head graph rebuilt per DPM step, no CPU embd cache, DPM schedule
   coefficients recomputed per call
@@ -2709,3 +3033,33 @@ Ordered by estimated breadth × depth of impact across the project:
 | | flow_inverse | 2579 |
 | | hifigan_decode | 17947 |
 | | **total** | **26272** |
+
+## Index-Echo decoder scheduler experiment — two T4s, 2026-10-02
+
+`CRISPASR_LLAMA_PIPELINE_DISABLE=1` disables multi-device pipeline scheduling
+in the embedded llama runtime, allowing its existing graph-reuse path to operate.
+The default is unchanged. This trades pipeline overlap for graph construction
+and allocation reuse; it can affect batched prefill as well as generation and
+must be compared on the same actual GPUs. The flag applies to embedded llama
+contexts, so set it only for the process being measured. `INDEX_ECHO_BENCH=1`
+prints per-stage timing and decoder graph-reuse counters at context destruction.
+A successful build is not a performance or hardware proof. Acceptance requires
+independent stage/cache/magnitude checks, complete decoded output and roundtrips,
+plus both execution orders with at least three warm calls per arm.
+
+The [complete A/B receipt](docs/index-echo-scheduler-ab-2026-10-02.json)
+records all 48 outputs passing the independent F32 text/timestamp bounds,
+three strict stage/cache/magnitude checks, five complete file cases and three
+Piper roundtrips (WER 0). Each candidate process reused 1,536 GGML graphs;
+each control reused zero. These counters do not establish CUDA graph capture.
+
+| Clip | Control warm seconds (AB / BA) | Candidate warm seconds (AB / BA) | Speedup (AB / BA) |
+|---|---|---|---|
+| JFK, 11 s | 12.474 / 12.427 | 12.041 / 12.006 | 1.036 / 1.035 |
+| Chinese, 13.052 s | 14.187 / 14.184 | 13.696 / 13.698 | 1.036 / 1.036 |
+| JFK tail, 10.988 s | 3.759 / 3.765 | 3.666 / 3.658 | 1.025 / 1.029 |
+
+This is a modest 2.5–3.6% speed gain on this pair of actual Tesla T4s, with
+same native F16 weights/runtime and initial + three warm calls per clip in
+both orders. Decoder generation accounts for most of the saving. The gate
+remains opt-in; other hardware and batched workloads need their own evidence.

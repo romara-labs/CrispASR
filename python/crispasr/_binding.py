@@ -1329,6 +1329,15 @@ class Session:
     bundled libcrispasr was actually compiled with — a model whose
     backend isn't in that list will fail to open.
 
+    Phonon-2 uses the Parakeet runtime: auto-detection works after renaming,
+    and ``backend="phonon2"`` explicitly selects that alias. ``s.backend``
+    reports the shared runtime, "parakeet". Its trained language is English.
+
+    Index-Echo auto-detects the audio tower; keep its matching decoder and
+    optional Silero companion beside it. ``set_target_language("en"|"ja"|"es")``
+    selects translation. Each segment's text contains transcript + newline +
+    translation; segment times come from the model's generated subtitles.
+
     Usage:
         with crispasr.Session("model.gguf") as s:
             print(f"backend: {s.backend}")
@@ -2243,7 +2252,9 @@ class Session:
         """Contextual biasing: comma-separated words/phrases to boost during
         decoding. Parakeet CTC/TDT use an Aho-Corasick trie; LLM backends inject
         them into the prompt (vibevoice splices the raw string into its
-        "with extra info:" prompt slot, same as the CLI's --context). Empty
+        "with extra info:" prompt slot, same as the CLI's --context). Qwen3
+        puts the hint in the system turn, preserving the selected language
+        prefill independently of an explicit question. Empty
         string clears."""
         if not hasattr(self._lib, "crispasr_session_set_hotwords"):
             raise RuntimeError("session-state API not present in this libcrispasr build")
@@ -2919,7 +2930,9 @@ class Session:
         ``csm``, ``dia``, ``fastpitch``, ``bananamind-tts``, ``speecht5``,
         ``melotts``, ``piper``, ``parler-tts``, ``outetts``, ``cosyvoice3-tts``,
         ``pocket-tts``, ``f5-tts``, ``irodori-tts``, ``supertonic``, ``bark``, ``kugelaudio``, ``tada``,
-        ``lfm2-audio``, ``voxtral-tts``, ``dots-tts``, ``fireredtts3``, ``omnivoice``.
+        ``lfm2-audio``, ``voxtral-tts``, ``dots-tts``, ``fireredtts3``, ``omnivoice``, ``miotts``.
+        For MioTTS, call :meth:`set_voice` with a preset embedding GGUF and
+        use :meth:`output_sample_rate` (44.1 kHz for MioCodec-v2).
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)

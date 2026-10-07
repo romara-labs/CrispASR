@@ -11,7 +11,7 @@ Phase-1 artifacts:
 | File | Role |
 |---|---|
 | `models/convert-breeze-tts-2-to-gguf.py` | HF safetensors → single GGUF, arch `breeze-tts-2` |
-| `tools/kaggle/breeze-refdump/` | GPU reference oracle (kernel `chr1s4/crispasr-breeze-refdump`) |
+| `tools/kaggle/breeze-refdump/` | GPU reference oracle (kernel `${KAGGLE_ACCOUNT}/crispasr-breeze-refdump`) |
 | `tools/reference_backends/breeze_tts_2.py` | local comparator half of the diff harness |
 
 ---

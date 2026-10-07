@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+## 0.8.41
+
+* **Native Index-Echo:** validated 9B F16 translation with a matching decoder,
+  metadata detection through the existing session API, and protected 2B Q8
+  regression checks. The accepted 9B pair requires approximately 17.9 GiB of
+  model storage; experimental 9B quantizations remain unpublished.
+* **Native inference:** CPU thread requests are honored by Nemotron, Paraformer
+  and Dia; Dia fixes enable complete dialogue synthesis without the hidden
+  CPU generation cap. Nemotron realtime CPU inference uses aligned windows.
+* **Windows distribution:** matching CUDA 12.6 CLI, library and runtime assets
+  alongside CUDA 12.8/13, with runtime hash checks and an explicit AVX2 library
+  CPU floor. Native A100/H100 target coverage is restored.
+* The Dart API is unchanged.
+
+## 0.8.40
+
+* **Native ASR:** Phonon-2 English recognition through the shared Parakeet
+  engine, with model metadata detection and registry selection. Q8_0 is the
+  recommended export; native CPU decoder optimizations retain fallback gates.
+* **AudioSeal:** graph and scheduler capacity scale with audio length, fixing
+  embedding/detection aborts on clips longer than approximately two seconds.
+* **VoxCPM2:** batched RALM prefill defaults on for native AVX2/F16C CPU F16/Q8
+  models. Q4 remains opt-in after failing strict state/speech parity checks.
+* **Native distribution:** the standard Intel macOS CLI restores AVX2/FMA/F16C
+  kernels with Accelerate; a separate CPU-legacy archive keeps the SSE2 floor.
+  Both Intel archive variants require and bundle the matching C2PA sidecar.
+
+## 0.8.39
+
+* **VoxCPM2 synthesis:** the bundled native library processes the TSLM prompt
+  once in a batched graph, honors the requested thread count in eager matmuls,
+  reduces VAE weight setup, and enables faster depthwise VAE convolutions on
+  Vulkan. Serial and legacy prefill fallbacks remain available.
+* **Native distribution:** separate Intel and Apple Silicon macOS CLI archives;
+  the Intel archive uses CPU/Accelerate. The existing macOS filename remains
+  an arm64 alias. Fixed the macOS quantizer's bundled C2PA search path.
+* **Quantizer:** tensor-type overrides preserve scalar/one-dimensional tensor
+  precision, avoiding F16 bias/norm crashes during CPU synthesis.
+* **Maintenance:** credential scanning, branch-scoped heavy verification, and
+  CPU reference/roundtrip workflows. The Dart API is unchanged.
+
+## 0.8.38
+
+* **`DiarizeMethod.sortformer`** (C ABI method 5, #466) with a
+  `sortformerModelPath` argument to `diarizeSegments`, which also returns
+  Sortformer's audio-derived turns through `outTurns`. 0.8.37 shipped the
+  method in the native library, but the Dart enum stopped at `foxNose`, so
+  Dart callers could not select it.
+
 ## 0.8.37
 
 * **Phrase scoring:** `CrispasrSession.scoreTexts(pcm, texts, language:,

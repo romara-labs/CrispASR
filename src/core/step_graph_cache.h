@@ -20,7 +20,7 @@
 // a NARROW stride, never to a power of two and never to max_ctx.
 //
 //     MEASURED ON VOXTRAL-3B: NO WIN. THE LEVER IS MODEL-SIZE-DEPENDENT.
-// Kaggle A/B (chr1s4/crispasr-voxtral-stepcache-ab v3, q4_k, 4 CPU threads,
+// Kaggle A/B (${KAGGLE_ACCOUNT}/crispasr-voxtral-stepcache-ab v3, q4_k, 4 CPU threads,
 // decode time isolated via CRISPASR_VOXTRAL_BENCH, best of 3):
 //
 //     arm                     decode ms   ms/step

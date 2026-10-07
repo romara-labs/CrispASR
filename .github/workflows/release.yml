@@ -19,7 +19,8 @@ on:
       only:
         description: >-
           Rebuild ONLY this job and re-upload just its asset
-          (e.g. build-libs-macos-arm64). Empty = the whole release.
+          (e.g. build-libs-macos-arm64; build-macos-cli selects both CLI
+          architectures). Empty = the whole release.
           The publish step attaches whatever was produced, so the other
           assets on the release are left untouched.
         required: false
@@ -27,14 +28,14 @@ on:
         type: string
       cuda12_probe_arch:
         description: >-
-          Dry-run diagnostic only: override the Windows CUDA 12 architecture
-          list to shorten a package probe. Empty keeps the release matrix.
+          Dry-run diagnostic only: override the Windows CUDA 12 CLI/library
+          architecture list to shorten a package probe. Empty keeps the release matrix.
         required: false
         default: ''
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.only || 'all' }}
   cancel-in-progress: true
 
 permissions:
@@ -352,10 +353,11 @@ jobs:
   # Static CLI binary linked with CUDA 12.8. Useful for Kaggle / Colab /
   # any Linux box with an NVIDIA GPU: download, chmod +x, run — no build step.
   # Targets sm_60 (Tesla P100) + sm_61 (P5000/P4000/GTX 10xx) Pascal, sm_70
-  # (Volta: V100/Titan V), sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090),
+  # (Volta: V100/Titan V), sm_75 (T4), sm_80 (A100), sm_86 (3090),
+  # sm_89 (L4/4090), sm_90 (H100),
   # sm_120 (Blackwell). CUDA 12.x still emits Pascal/Volta SASS — CUDA 13
   # dropped them, so the cuda13 variant below floors at sm_75.
-  # plus sm_120 virtual for future compat. Ships as a self-contained tarball
+  # plus general sm_90 / sm_120 PTX for forward compatibility. Ships as a self-contained tarball
   # alongside crispasr-quantize so users can convert + run in one download.
   build-linux-x86_64-cuda:
     if: ${{ !inputs.only || inputs.only == 'build-linux-x86_64-cuda' }}
@@ -392,7 +394,7 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_OPENBLAS=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
+            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -497,7 +499,7 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_OPENBLAS=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -1030,46 +1032,136 @@ jobs:
           files: release/crispasr-python-linux-arm64.tar.gz
           fail_on_unmatched_files: true
 
+  # macOS CLI: separate downloads for Apple Silicon and Intel (#479).
   build-macos:
-    if: ${{ !inputs.only || inputs.only == 'build-macos' }}
-    runs-on: macos-latest
+    if: ${{ !inputs.only || inputs.only == 'build-macos' || inputs.only == 'build-macos-cli' }}
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Build
+      - name: Build (arm64)
         run: |
-          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON \
+          cmake -S . -B build \
+            -DCRISPASR_C2PA_FETCH=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_SERVER=OFF \
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(sysctl -n hw.logicalcpu)
 
-      - name: Package
+      - name: Package and verify
         run: |
-          mkdir -p release/crispasr-macos
-          cp build/bin/crispasr release/crispasr-macos/
-          cp build/bin/crispasr-quantize release/crispasr-macos/
-          bash scripts/bundle-c2pa.sh release/crispasr-macos || true
-          # Ship the licence text with the binaries. Every Windows, Android and
-          # libcrispasr artifact already did; no CLI tarball did, and these carry
-          # bundled third-party libraries whose terms require the notice to
-          # travel with them.
-          cp LICENSE release/crispasr-macos/
-          cp THIRD_PARTY_NOTICES.txt release/crispasr-macos/
-          cd release && tar czf crispasr-macos.tar.gz crispasr-macos/
+          set -euo pipefail
+          OUT=release/crispasr-macos-arm64
+          mkdir -p "$OUT"
+          cp build/bin/crispasr build/bin/crispasr-quantize "$OUT/"
+          bash scripts/bundle-c2pa.sh "$OUT"
+          cp LICENSE THIRD_PARTY_NOTICES.txt "$OUT/"
+          tar -czf "$OUT.tar.gz" -C release "crispasr-macos-arm64"
+          # Verify the extracted archive away from the build tree, including
+          # the sidecar's architecture and dyld resolution at startup.
+          # Hide original libraries so dyld cannot use a build-tree fallback.
+          mv build build-unavailable
+          mv third_party/c2pa third_party/c2pa-unavailable
+          mkdir -p package-check
+          tar -xzf "$OUT.tar.gz" -C package-check
+          bash scripts/verify-macos-cli.sh "package-check/crispasr-macos-arm64" arm64
+          # Preserve the old asset AND its internal directory for consumers
+          # already fetching crispasr-macos.tar.gz (arm64 only).
+          cp -R "$OUT" release/crispasr-macos
+          tar -czf release/crispasr-macos.tar.gz -C release crispasr-macos
 
       - uses: actions/upload-artifact@v4
         with:
-          name: crispasr-macos
-          path: release/crispasr-macos.tar.gz
+          name: crispasr-macos-arm64
+          path: |
+            release/crispasr-macos-arm64.tar.gz
+            release/crispasr-macos.tar.gz
 
-      - name: Attach crispasr-macos.tar.gz to release
+      - name: Attach macOS arm64 assets to release
         if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: release/crispasr-macos.tar.gz
+          files: |
+            release/crispasr-macos-arm64.tar.gz
+            release/crispasr-macos.tar.gz
+          fail_on_unmatched_files: true
+
+  # macOS CLI: separate downloads for Apple Silicon and Intel (#479).
+  build-macos-x86_64:
+    if: ${{ !inputs.only || inputs.only == 'build-macos-x86_64' || inputs.only == 'build-macos-cli' }}
+    runs-on: macos-15-intel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - isa: avx2
+            asset: crispasr-macos-x86_64
+          - isa: legacy
+            asset: crispasr-macos-x86_64-cpu-legacy
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install build tools
+        run: brew install ninja ccache
+
+      # CMake's optional fetch can disable signing on a transient HTTP error.
+      # Release archives require this sidecar: retry and fail before compiling.
+      - name: Fetch required C2PA sidecar
+        run: |
+          bash scripts/fetch-c2pa.sh
+          test -f third_party/c2pa/lib/libc2pa_c.dylib
+
+      - name: Build (x86_64, ${{ matrix.isa }})
+        run: |
+          bash scripts/configure-macos-intel.sh build "${{ matrix.isa }}" -DCRISPASR_C2PA_FETCH=ON
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(sysctl -n hw.logicalcpu)
+
+      - name: Package and verify
+        run: |
+          set -euo pipefail
+          OUT=release/${{ matrix.asset }}
+          mkdir -p "$OUT"
+          cp build/bin/crispasr build/bin/crispasr-quantize "$OUT/"
+          bash scripts/bundle-c2pa.sh "$OUT"
+          cp LICENSE THIRD_PARTY_NOTICES.txt "$OUT/"
+          tar -czf "$OUT.tar.gz" -C release "${{ matrix.asset }}"
+          # Verify the extracted archive away from the build tree, including
+          # the sidecar's architecture and dyld resolution at startup.
+          # Hide original libraries so dyld cannot use a build-tree fallback.
+          mv build build-unavailable
+          mv third_party/c2pa third_party/c2pa-unavailable
+          mkdir -p package-check
+          tar -xzf "$OUT.tar.gz" -C package-check
+          bash scripts/verify-macos-cli.sh "package-check/${{ matrix.asset }}" x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            release/${{ matrix.asset }}.tar.gz
+
+      - name: Attach macOS x86_64 assets to release
+        if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            release/${{ matrix.asset }}.tar.gz
           fail_on_unmatched_files: true
 
   # ── Apple xcframework (iOS + simulator + macOS + tvOS/visionOS) ───────────────
@@ -1101,6 +1193,9 @@ jobs:
       - name: Package
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
+          # A dry run from a branch names the zip after the branch, and
+          # "feat/x" would make zip look for a directory "crispasr-feat".
+          TAG="${TAG//\//-}"
           test -d build-apple/crispasr.xcframework  # fail loudly if the build produced nothing
           mkdir -p release-ios
           # --symlinks: the .framework Versions/Current symlinks must survive the
@@ -1569,9 +1664,7 @@ jobs:
       - name: Install Vulkan SDK
         shell: pwsh
         run: |
-          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
-          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
-          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          $ver = & .\scripts\fetch-vulkan-sdk.ps1
           Start-Process -FilePath .\vulkan_sdk.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
           $sdk = "C:\VulkanSDK\$ver"
           echo "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -1691,7 +1784,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
+            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -1749,7 +1842,7 @@ jobs:
           fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (CUDA) ──────────────────────────────
-  # CUDA 12.8 toolkit (Blackwell-aware). Unlike the Linux CUDA tarball,
+  # Matching CUDA 12.8 (Blackwell) and CUDA 12.6 legacy matrix. Unlike Linux,
   # we bundle the CUDA runtime DLLs (cudart / cublas / cublasLt) so the
   # tarball is self-contained for downstream Windows consumers — matches
   # the existing build-windows-cuda EXE bundle's pattern.
@@ -1757,18 +1850,28 @@ jobs:
     if: ${{ !inputs.only || inputs.only == 'build-libs-windows-x86_64-cuda' }}
     # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolkit: '12.8.0'
+            flavor: cuda
+            arch: '60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual;120-real;120-virtual'
+          - toolkit: '12.6.3'
+            flavor: cuda126
+            arch: '60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual'
     env:
-      CUDA_VERSION: "12.8.0"
+      CUDA_VERSION: ${{ matrix.toolkit }}
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Install CUDA Toolkit 12.8.0
+      - name: Install CUDA Toolkit ${{ matrix.toolkit }}
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8.0'
+          cuda: ${{ matrix.toolkit }}
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
 
@@ -1784,14 +1887,15 @@ jobs:
             -DCRISPASR_BUILD_EXAMPLES=OFF ^
             -DCRISPASR_BUILD_SERVER=OFF ^
             -DGGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ (inputs.tag == '' && inputs.cuda12_probe_arch) || matrix.arch }}" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
       - name: Package
         shell: pwsh
         run: |
-          $OUT = "release\libcrispasr-windows-x86_64-cuda"
+          $OUT = "release\libcrispasr-windows-x86_64-${{ matrix.flavor }}"
           New-Item -ItemType Directory -Force "$OUT\bin","$OUT\src\Release","$OUT\ggml\src\Release","$OUT\ggml\bin","$OUT\include","$OUT\ggml\include" | Out-Null
           # Ninja flat layout: dlls in build-libs\bin, libs in build-libs\src
           $BIN_DIRS = @("build-libs\bin\Release","build-libs\bin")
@@ -1827,17 +1931,17 @@ jobs:
           # This is the largest asset in the release, so it is the one where a
           # slow connection hurts most. The CUDA runtime changes far less often
           # than we cut releases, so re-downloading it every time is waste.
-          $SPLIT = "release\libcrispasr-windows-x86_64-cuda-non-cuda"
+          $SPLIT = "release\libcrispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda"
           Copy-Item $OUT $SPLIT -Recurse
           @'
           This archive intentionally excludes the CUDA runtime DLLs.
-          For a self-contained install, use libcrispasr-windows-x86_64-cuda.tar.gz.
-          For an incremental install, copy the three separate *64_*.dll release assets
+          For a self-contained install, use libcrispasr-windows-x86_64-${{ matrix.flavor }}.tar.gz.
+          For an incremental install, extract the matching ${{ matrix.flavor }}-runtime.zip
           into bin\: cudart64_*.dll, cublas64_*.dll, and cublasLt64_*.dll.
 
           They are published once per release alongside
-          crispasr-windows-x86_64-cuda-runtime-sha256.txt, and are the same files
-          the CLI package uses - both are built against CUDA 12.8.0, so one copy
+          crispasr-windows-x86_64-${{ matrix.flavor }}-runtime-sha256.txt, and are the same files
+          the CLI package uses - both are built against CUDA ${{ matrix.toolkit }}, so one copy
           serves both. Verify with that manifest before reusing an older download.
           '@ | Set-Content "$SPLIT\README-CUDA.txt"
 
@@ -1857,29 +1961,55 @@ jobs:
             throw "The split archive must not contain CUDA runtime DLLs"
           }
 
+          # Match the CLI CPU floor; do not ship the hosted runner's native ISA.
+          $cache = Get-Content build-libs\CMakeCache.txt -Raw
+          foreach ($setting in @('GGML_NATIVE:BOOL=OFF', 'GGML_AVX2:BOOL=ON', 'GGML_AVX512:BOOL=OFF')) {
+            if ($cache -notmatch ('(?m)^' + [regex]::Escape($setting) + '\r?$')) {
+              throw "Unexpected packaged CPU floor: missing $setting"
+            }
+          }
+          Write-Host 'WIN_CUDA_LIB_CPU_FLOOR_OK native=off avx2=on avx512=off'
+
+          # Exercise the C ABI from the staged DLL directory with toolkit/build
+          # directories removed from PATH. The runner has no NVIDIA driver.
+          $library = @(Get-ChildItem "$OUT\bin\*crispasr*.dll")
+          if ($library.Count -ne 1) { throw "Expected one CrispASR library DLL, found $($library.Count)" }
+          $signature = '[System.Runtime.InteropServices.DllImport("' + $library[0].FullName.Replace('\', '\\') + '", CallingConvention=System.Runtime.InteropServices.CallingConvention.Cdecl)] public static extern System.IntPtr whisper_version();'
+          $savedPath = $env:PATH
+          try {
+            $env:PATH = (Resolve-Path "$OUT\bin").Path + ";$env:SystemRoot\System32;$env:SystemRoot"
+            Add-Type -MemberDefinition $signature -Name LibraryVersionProbe -Namespace CrispASR
+            $version = [System.Runtime.InteropServices.Marshal]::PtrToStringAnsi([CrispASR.LibraryVersionProbe]::whisper_version())
+            $expected = (Get-Content VERSION -Raw).Trim()
+            if ($version -ne $expected) { throw "C ABI version $version differs from $expected" }
+            Write-Host "WIN_CUDA_LIB_C_ABI_OK whisper_version=$version"
+          } finally {
+            $env:PATH = $savedPath
+          }
+
           cd release
-          tar -czf libcrispasr-windows-x86_64-cuda.tar.gz libcrispasr-windows-x86_64-cuda
-          tar -czf libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz libcrispasr-windows-x86_64-cuda-non-cuda
-          Get-Item libcrispasr-windows-x86_64-cuda.tar.gz,libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz | Format-List Name,Length
+          tar -czf libcrispasr-windows-x86_64-${{ matrix.flavor }}.tar.gz libcrispasr-windows-x86_64-${{ matrix.flavor }}
+          tar -czf libcrispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.tar.gz libcrispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda
+          Get-Item libcrispasr-windows-x86_64-${{ matrix.flavor }}.tar.gz,libcrispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.tar.gz | Format-List Name,Length
 
       - uses: actions/upload-artifact@v4
         with:
-          name: libcrispasr-windows-x86_64-cuda
-          path: release/libcrispasr-windows-x86_64-cuda.tar.gz
+          name: libcrispasr-windows-x86_64-${{ matrix.flavor }}
+          path: release/libcrispasr-windows-x86_64-${{ matrix.flavor }}.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
-          name: libcrispasr-windows-x86_64-cuda-split
-          path: release/libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz
+          name: libcrispasr-windows-x86_64-${{ matrix.flavor }}-split
+          path: release/libcrispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.tar.gz
 
-      - name: Attach libcrispasr-windows-x86_64-cuda.tar.gz to release
+      - name: Attach libcrispasr-windows-x86_64-${{ matrix.flavor }}.tar.gz to release
         if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            release/libcrispasr-windows-x86_64-cuda.tar.gz
-            release/libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz
+            release/libcrispasr-windows-x86_64-${{ matrix.flavor }}.tar.gz
+            release/libcrispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.tar.gz
           fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (generic CPU legacy) ────────────────
@@ -2052,31 +2182,31 @@ jobs:
     if: ${{ !inputs.only || inputs.only == 'build-windows-cuda' }}
     # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolkit: '12.8.0'
+            flavor: cuda
+            arch: '60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual;120-real;120-virtual'
+          - toolkit: '12.6.3'
+            flavor: cuda126
+            arch: '60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual'
     env:
-      CUDA_VERSION: "12.8.0"
+      CUDA_VERSION: ${{ matrix.toolkit }}
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
-      # CUDA 12.8 is the minimum that ships sm_120 SASS for Blackwell
-      # consumer GPUs (RTX 50xx). Earlier toolkits (12.4 etc.) only know
-      # up to sm_90, so RTX 5060/5070/5080/5090 fail at runtime with
-      # 'no kernel image is available'.
-      # Ships Pascal (sm_61) + Volta (sm_70) + P100 (sm_60) alongside sm_75..sm_120,
-      # same as Linux CUDA-12 (#302/#307). The v0.8.23 crispasr-windows-x86_64-cuda
-      # miss was NOT the arch: a bare MSVC `/bigobj` was leaking into the nvcc
-      # command (nvcc counted it as a 2nd input -> `nvcc fatal: A single input file
-      # is required for a non-link phase`); guarding /bigobj to C/CXX only (root
-      # CMakeLists) removed it, and the Windows CUDA Smoke workflow confirmed the
-      # full arch compiles. Kept in lockstep with build-libs-windows-x86_64-cuda.
-      - name: Install CUDA Toolkit 12.8.0
-        # v0.2.19 only knows up to CUDA 12.4; v0.2.35 added 12.8 + 12.9
-        # support. Required for sm_120 (RTX 50xx, Blackwell consumer) builds.
+      # #483: keep CUDA 12.8/Blackwell and add a coherent CUDA 12.6.3
+      # legacy package. CLI, shared libraries and bundled runtime use the same
+      # toolkit matrix. Never replace a 12.8 runtime with 12.6 DLLs by hand.
+      - name: Install CUDA Toolkit ${{ matrix.toolkit }}
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8.0'
+          cuda: ${{ matrix.toolkit }}
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
 
@@ -2089,15 +2219,15 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="${{ (inputs.tag == '' && inputs.cuda12_probe_arch) || '60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual' }}" ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ (inputs.tag == '' && inputs.cuda12_probe_arch) || matrix.arch }}" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
       - name: Package (complete and split CUDA assets)
         shell: pwsh
         run: |
-          $full = "release\crispasr-windows-x86_64-cuda"
-          $split = "release\crispasr-windows-x86_64-cuda-non-cuda"
+          $full = "release\crispasr-windows-x86_64-${{ matrix.flavor }}"
+          $split = "release\crispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda"
           $runtime = "release\cuda-runtime"
           New-Item -ItemType Directory -Force $full, $split, $runtime | Out-Null
 
@@ -2118,9 +2248,27 @@ jobs:
           $cudaDlls | Copy-Item -Destination $full
           $cudaDlls | Copy-Item -Destination $runtime
 
+          # cudaRuntimeGetVersion does not require a GPU. Verify the actual
+          # packaged DLL rather than only the compile-time diagnostics.
+          $runtimeDll = ($cudaDlls | Where-Object Name -like 'cudart64_*').FullName
+          $signature = '[DllImport("' + $runtimeDll.Replace('\', '\\') + '")] public static extern int cudaRuntimeGetVersion(out int version);'
+          Add-Type -MemberDefinition $signature -Name CudaRuntimeProbe -Namespace CrispASR
+          $runtimeVersion = 0
+          $status = [CrispASR.CudaRuntimeProbe]::cudaRuntimeGetVersion([ref]$runtimeVersion)
+          $parts = $env:CUDA_VERSION.Split('.')
+          $expectedVersion = [int]$parts[0] * 1000 + [int]$parts[1] * 10
+          if ($status -ne 0 -or $runtimeVersion -ne $expectedVersion) {
+            throw "Packaged runtime mismatch: status=$status version=$runtimeVersion expected=$expectedVersion"
+          }
+          Write-Host "WIN_CUDA_RUNTIME_MATCH_OK toolkit=$env:CUDA_VERSION runtime=$runtimeVersion"
+          # CUDA 12.6 and 12.8 DLL basenames overlap. Publish the legacy runtime
+          # as a distinctly named archive so release uploads cannot overwrite
+          # the existing CUDA 12.8 standalone DLL assets.
+          Compress-Archive -Path "$runtime\*.dll" -DestinationPath release\${{ matrix.flavor }}-runtime.zip
+
           Copy-Item LICENSE $full\
           Copy-Item THIRD_PARTY_NOTICES.txt $full\
-          Compress-Archive -Path $full -DestinationPath release\crispasr-windows-x86_64-cuda.zip -CompressionLevel Optimal
+          Compress-Archive -Path $full -DestinationPath release\crispasr-windows-x86_64-${{ matrix.flavor }}.zip -CompressionLevel Optimal
 
           # The split archive contains the executable and CrispASR DLLs, but
           # deliberately omits the three CUDA runtime DLLs below. Users can
@@ -2132,19 +2280,19 @@ jobs:
           } | Copy-Item -Destination $split\
           @'
           This archive intentionally excludes the CUDA runtime DLLs.
-          For a self-contained install, use crispasr-windows-x86_64-cuda.zip.
-          For an incremental install, copy the three separate *64_*.dll release assets
+          For a self-contained install, use crispasr-windows-x86_64-${{ matrix.flavor }}.zip.
+          For an incremental install, extract the matching ${{ matrix.flavor }}-runtime.zip
           into this directory: cudart64_*.dll, cublas64_*.dll, and cublasLt64_*.dll.
           '@ | Set-Content $split\README-CUDA.txt
           Copy-Item LICENSE $split\
           Copy-Item THIRD_PARTY_NOTICES.txt $split\
-          Compress-Archive -Path $split -DestinationPath release\crispasr-windows-x86_64-cuda-non-cuda.zip -CompressionLevel Optimal
+          Compress-Archive -Path $split -DestinationPath release\crispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.zip -CompressionLevel Optimal
 
           $hashLines = $cudaDlls | ForEach-Object {
             $hash = (Get-FileHash (Join-Path $runtime $_.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
           }
-          $hashLines | Set-Content release\crispasr-windows-x86_64-cuda-runtime-sha256.txt
+          $hashLines | Set-Content release\crispasr-windows-x86_64-${{ matrix.flavor }}-runtime-sha256.txt
 
           # The hosted runner has no NVIDIA driver. This simultaneously proves
           # that nvcuda.dll is delay-loaded (the process reaches main) and that
@@ -2159,13 +2307,15 @@ jobs:
             if ($probe.ExitCode -ne 0) { throw "$argument exited $($probe.ExitCode)" }
             return $output
           }
+          $expectedToolkit = "$($parts[0]).$($parts[1])"
+          $toolkitPattern = 'cuda toolkit\s*:\s*' + [regex]::Escape($expectedToolkit) + '\b'
           $version = Invoke-CrispProbe '--version' 'crispasr-cuda12-version'
-          if ($version -notmatch 'cuda toolkit\s*:\s*12\.' -or
+          if ($version -notmatch $toolkitPattern -or
               $version -notmatch 'cuda runtime ABI\s*:\s*12\b') {
             throw 'Packaged CUDA 12 --version does not identify its toolkit/runtime ABI'
           }
           $diagnostics = Invoke-CrispProbe '--diagnostics' 'crispasr-cuda12-diagnostics'
-          if ($diagnostics -notmatch 'cuda toolkit\s*:\s*12\.' -or
+          if ($diagnostics -notmatch $toolkitPattern -or
               $diagnostics -notmatch 'cuda runtime ABI\s*:\s*12\b') {
             throw 'Packaged CUDA 12 --diagnostics does not identify its toolkit/runtime ABI'
           }
@@ -2173,27 +2323,29 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: crispasr-windows-x86_64-cuda
-          path: release/crispasr-windows-x86_64-cuda.zip
+          name: crispasr-windows-x86_64-${{ matrix.flavor }}
+          path: release/crispasr-windows-x86_64-${{ matrix.flavor }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: crispasr-windows-x86_64-cuda-split
+          name: crispasr-windows-x86_64-${{ matrix.flavor }}-split
           path: |
-            release/crispasr-windows-x86_64-cuda-non-cuda.zip
+            release/crispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.zip
+            release/${{ matrix.flavor }}-runtime.zip
             release/cuda-runtime/*.dll
-            release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
+            release/crispasr-windows-x86_64-${{ matrix.flavor }}-runtime-sha256.txt
 
-      - name: Attach crispasr-windows-x86_64-cuda.zip to release
+      - name: Attach crispasr-windows-x86_64-${{ matrix.flavor }}.zip to release
         if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            release/crispasr-windows-x86_64-cuda.zip
-            release/crispasr-windows-x86_64-cuda-non-cuda.zip
-            release/cuda-runtime/*.dll
-            release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
+            release/crispasr-windows-x86_64-${{ matrix.flavor }}.zip
+            release/crispasr-windows-x86_64-${{ matrix.flavor }}-non-cuda.zip
+            release/${{ matrix.flavor }}-runtime.zip
+            ${{ matrix.flavor == 'cuda' && 'release/cuda-runtime/*.dll' || '' }}
+            release/crispasr-windows-x86_64-${{ matrix.flavor }}-runtime-sha256.txt
           fail_on_unmatched_files: true
 
   # ── Windows CUDA 13 (dynamic, driverless CPU fallback) ───────────────────────
@@ -2239,7 +2391,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" ^
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;120-virtual" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
@@ -2347,9 +2499,7 @@ jobs:
       - name: Install Vulkan SDK
         shell: pwsh
         run: |
-          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
-          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
-          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          $ver = & .\scripts\fetch-vulkan-sdk.ps1
           Start-Process -FilePath .\vulkan_sdk.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
           $sdk = "C:\VulkanSDK\$ver"
           echo "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -2490,7 +2640,7 @@ jobs:
   # to transient permission issues). softprops won't clobber files that
   # already exist on the release.
   publish:
-    needs: [validate-version, build-linux, build-linux-cpu-legacy, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-cuda13, build-windows-vulkan, build-android-arm64]
+    needs: [validate-version, build-linux, build-linux-cpu-legacy, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-macos-x86_64, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-cuda13, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:

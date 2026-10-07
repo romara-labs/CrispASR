@@ -1096,7 +1096,7 @@ static std::vector<float> sidon_restore_exact(sidon_context* ctx, const float* s
     // #431 — WHY THIS IS A MEMORY BOUND AND NOT A QUALITY ONE.
     //
     // Measured against the upstream TorchScript reference on Kaggle
-    // (tools/kaggle/sidon-length-parity, chr1s4/crispasr-sidon-length-parity v5),
+    // (tools/kaggle/sidon-length-parity, ${KAGGLE_ACCOUNT}/crispasr-sidon-length-parity v5),
     // comparing our predictor handoff to the reference's at four lengths:
     //
     //   length   whole-utterance vs REF     windowed vs REF

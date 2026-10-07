@@ -48,6 +48,7 @@ static const std::vector<std::pair<std::string, std::string>>& converter_archs()
         {"gigaam", "gigaam"},
         {"canary", "canary"},
         {"canary_qwen", "canary-qwen"},
+        {"index_echo", "index-echo"},
         {"canary-ctc", "fastconformer-ctc"},
         {"cohere-transcribe", "cohere"},
         {"qwen3asr", "qwen3"},
@@ -110,6 +111,7 @@ static const std::vector<std::pair<std::string, std::string>>& converter_archs()
         {"parler-tts", "parler-tts"},
         // ── translation / music ──
         {"m2m100", "m2m100"},
+        {"marian", "marian"},
         {"t5", "madlad"},
         {"htdemucs", "htdemucs"},
         {"mel-band-roformer", "mel-band-roformer"},
@@ -185,6 +187,7 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "gigaam",
         "canary",
         "canary-qwen",
+        "index-echo",
         "fastconformer-ctc",
         "lfm2-audio",
         "mini-omni2",
@@ -251,6 +254,7 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "csm",
         "parler-tts",
         "m2m100",
+        "marian",
         "madlad",
         "htdemucs",
         "mel-band-roformer",
@@ -265,6 +269,7 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "hft-transformer",
         "mt3",
         "bt2-tts", // Breeze-TTS-2 (#412)
+        "hikari",  // sbintuitions/hikari-medium
     };
     size_t n = 0;
     const core_arch::entry* k = core_arch::table(&n);

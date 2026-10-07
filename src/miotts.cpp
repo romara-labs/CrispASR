@@ -2,7 +2,7 @@
 //
 // LLM: standard Qwen3 forward with KV cache (reuses core_attn::kv_self_attn).
 // Codec: FSQ dequant → wave_prenet → conv_upsample → ResNet → wave_decoder
-//        (AdaLN-Zero) → ResNet → iSTFT → 24kHz waveform.
+//        (AdaLN-Zero) → ResNet → iSTFT → model-rate waveform.
 //
 // The LLM generates speech tokens from text; the codec converts them to audio.
 // Voice cloning injects a 128-d global embedding at codec decode time.
@@ -2053,6 +2053,20 @@ float* miotts_synthesize(miotts_context* ctx, const char* text, int* out_n) {
 
     *out_n = n_samples;
     return audio;
+}
+
+void miotts_set_temperature(miotts_context* ctx, float temperature) {
+    if (ctx)
+        ctx->params.temperature = temperature;
+}
+
+void miotts_set_seed(miotts_context* ctx, uint64_t seed) {
+    if (ctx)
+        ctx->params.seed = seed;
+}
+
+int miotts_get_sample_rate(const miotts_context* ctx) {
+    return ctx ? static_cast<int>(ctx->hp.codec_sample_rate) : 24000;
 }
 
 void miotts_free_audio(float* pcm) {

@@ -92,6 +92,7 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    "index-echo": "reference_backends.index_echo",
     # Dolphin (DataoceanAI) E-Branchformer + Transformer decoder + CTC (#436).
     # model_dir holds <name>.pt + train.yaml + units.txt + global_cmvn;
     # DOLPHIN_MODEL_NAME picks the registry name (default small.cn.streaming).
@@ -144,6 +145,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # transformers-format ParakeetForTDT (#454: moondream parakeet-ultra / -redux);
     # same stage names as the NeMo "parakeet" dumper.
     "parakeet-hf": "reference_backends.parakeet_hf",
+    "phonon2":    "reference_backends.parakeet_hf",  # #481, independent upstream container reader
     # Supertonic-3 (#434): ONNX-only distribution — the reference IS the
     # onnxruntime pipeline (standalone script; run it directly, not via this
     # dispatcher). Kept here for discoverability.
@@ -249,7 +251,20 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Moonshine (UsefulSensors tiny/base). model_dir = usefulsensors/moonshine-tiny
     # or usefulsensors/moonshine-base (or a local snapshot). Audio arg is a 16 kHz
     # mono WAV. Captures encoder_output (T_enc, hidden_dim) matching moonshine_encode().
+    # transformers *ForCTC checkpoints (Wav2Vec2 / Hubert / Data2VecAudio, and the
+    # omniASR-CTC Wav2Vec2ForCTC conversions). Captures ctc_logits (T, V), the
+    # grid wav2vec2_compute_logits() / omniasr_transcribe_with_logits() return.
+    "wav2vec2":        "reference_backends.wav2vec2",
+    "hubert":          "reference_backends.wav2vec2",
+    "data2vec":        "reference_backends.wav2vec2",
+    "omniasr":         "reference_backends.hf_ctc",
+    # NeMo FastConformer CTC (stt_en_fastconformer_ctc_large): mel, pre-encode,
+    # per-layer, encoder_output and the CTC log-prob grid (canary_ctc runtime).
+    "fastconformer-ctc": "reference_backends.fastconformer_ctc",
     "moonshine":       "reference_backends.moonshine",
+    # Hikari (sbintuitions/hikari-medium) simultaneous S2TT: replays the
+    # upstream server's per-80ms policy; HIKARI_SRC = hikari repo src/.
+    "hikari":          "reference_backends.hikari",
     "moonshine-base":  "reference_backends.moonshine",
     # Moonshine-Streaming (ONNX variant from usefulsensors/moonshine).
     # model_dir = root of the cloned repo (onnx/tiny/{preprocess,encode}.onnx).

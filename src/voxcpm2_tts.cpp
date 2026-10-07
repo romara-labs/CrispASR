@@ -48,6 +48,7 @@ static int g_cpu_n_threads = 4;
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -422,6 +423,14 @@ struct voxcpm2_context {
     ggml_context* locdit2_arena_ctx = nullptr;
     ggml_cgraph* locdit2_gf = nullptr;
     ggml_gallocr_t locdit2_galloc = nullptr;
+    // #461 fused CFM Euler loop (one graph per patch), cached per (steps, cfg).
+    std::vector<uint8_t> cfm_fused_meta;
+    ggml_context* cfm_fused_ctx = nullptr;
+    ggml_cgraph* cfm_fused_gf = nullptr;
+    ggml_gallocr_t cfm_fused_galloc = nullptr;
+    int cfm_fused_steps = -1;
+    int cfm_fused_zero = -1;
+    float cfm_fused_cfg = 0.0f;
 
     // Cached LocEnc cgraph. Same constant-topology trick — LocEnc takes
     // a single patch [feat_dim, P] and emits a CLS hidden state [d_enc].
@@ -1093,11 +1102,37 @@ static void sync_ralm_kv_cpu_to_backend(voxcpm2_context* ctx) {
     }
 }
 
-// Build the per-step RALM cgraph (all 8 layers, T=1). Same structure as
+// Preserve the eager FP32 reduction/activation order during CPU prefill.
+// Small changes before a quantized matmul can cross activation-quantization
+// thresholds and accumulate over the residual layers, even at T=1.
+static void ralm_prefill_norm_cpu(ggml_tensor* dst, const ggml_tensor* src, const ggml_tensor* weight, int ith, int nth,
+                                  void* userdata) {
+    const float eps = *(const float*)userdata;
+    for (int64_t t = ith; t < src->ne[1]; t += nth) {
+        const float* x = (const float*)((const char*)src->data + t * src->nb[1]);
+        float* y = (float*)((char*)dst->data + t * dst->nb[1]);
+        rms_norm_cpu(x, (const float*)weight->data, y, (int)src->ne[0], eps);
+    }
+}
+
+static void ralm_prefill_swiglu_cpu(ggml_tensor* dst, const ggml_tensor* gate, const ggml_tensor* up, int ith, int nth,
+                                    void*) {
+    for (int64_t t = ith; t < gate->ne[1]; t += nth) {
+        const float* g = (const float*)((const char*)gate->data + t * gate->nb[1]);
+        const float* u = (const float*)((const char*)up->data + t * up->nb[1]);
+        float* y = (float*)((char*)dst->data + t * dst->nb[1]);
+        for (int64_t i = 0; i < gate->ne[0]; ++i) {
+            const float sig = 1.0f / (1.0f + std::exp(-g[i]));
+            y[i] = g[i] * sig * u[i];
+        }
+    }
+}
+
+// Build the RALM cgraph (all 8 layers, decode or causal prefill). Same structure as
 // build_tslm_step_graph but simpler: no RoPE (rope_theta=0 makes
 // ggml_rope_ext a no-op), uses RALM hparams/weights/KV. Dynamic (non-
-// bucketed) build only — RALM's max_ctx is small and per-step cost is low.
-static ggml_cgraph* build_ralm_step_graph(voxcpm2_context* ctx, int n_past) {
+// bucketed) build only. Prefill returns pre-output-norm states for its callers.
+static ggml_cgraph* build_ralm_step_graph(voxcpm2_context* ctx, int n_past, int n_tokens = 1, bool output_norm = true) {
     const vox_hparams& hp = ctx->hp;
     const vox_weights& W = ctx->graph_weights();
     const int d = (int)hp.ralm_d_model;
@@ -1107,7 +1142,7 @@ static ggml_cgraph* build_ralm_step_graph(voxcpm2_context* ctx, int n_past) {
     const int n_kv_grp = n_q / n_kv;
     const float eps = hp.rms_norm_eps;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
-    const int T = 1;
+    const int T = n_tokens;
     const int Lk = n_past + T;
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), /*no_alloc=*/true};
@@ -1121,6 +1156,13 @@ static ggml_cgraph* build_ralm_step_graph(voxcpm2_context* ctx, int n_past) {
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
     ggml_set_name(positions, "ralm_positions");
     ggml_set_input(positions);
+
+    ggml_tensor* causal_mask = nullptr;
+    if (T > 1) {
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
+        ggml_set_name(causal_mask, "ralm_causal_mask");
+        ggml_set_input(causal_mask);
+    }
 
     // No RoPE: set rope_theta = 0.0f so ggml_rope_ext rotates by zero.
     const core_attn::KvSelfAttnParams kvp = {
@@ -1142,33 +1184,47 @@ static ggml_cgraph* build_ralm_step_graph(voxcpm2_context* ctx, int n_past) {
     };
 
     ggml_tensor* cur = hidden_in;
+    const bool eager_cpu_math = !output_norm && core_cpu_backend::is_cpu(ctx->backend);
+    auto norm = [&](ggml_tensor* input, ggml_tensor* weight) {
+        if (eager_cpu_math)
+            return ggml_map_custom2(ctx0, input, weight, ralm_prefill_norm_cpu, GGML_N_TASKS_MAX,
+                                    (void*)&ctx->hp.rms_norm_eps);
+        return ggml_mul(ctx0, ggml_rms_norm(ctx0, input, eps), weight);
+    };
     for (uint32_t il = 0; il < hp.ralm_n_layers; il++) {
         const vox_lm_layer& L = W.ralm_layers[il];
         ggml_tensor* residual = cur;
 
         // Attention block (RMSNorm x scale -> kv_self_attn -> residual).
-        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
-        x = ggml_mul(ctx0, x, L.attn_norm_w);
+        ggml_tensor* x = norm(cur, L.attn_norm_w);
 
-        ggml_tensor* attn =
-            core_attn::kv_self_attn(ctx0, gf, x, L.attn_q_w, L.attn_k_w, L.attn_v_w, L.attn_o_w,
-                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, /*causal_mask*/ nullptr,
-                                    ctx->ralm_kv_k, ctx->ralm_kv_v, (int)il, n_past, kvp,
-                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/Lk,
-                                    /*kv_indices=*/nullptr);
+        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, L.attn_q_w, L.attn_k_w, L.attn_v_w, L.attn_o_w,
+                                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask,
+                                                    ctx->ralm_kv_k, ctx->ralm_kv_v, (int)il, n_past, kvp,
+                                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/Lk,
+                                                    /*kv_indices=*/nullptr);
         cur = ggml_add(ctx0, residual, attn);
 
         // FFN block (RMSNorm x scale -> SwiGLU -> residual).
         residual = cur;
-        x = ggml_rms_norm(ctx0, cur, eps);
-        x = ggml_mul(ctx0, x, L.ffn_norm_w);
-        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, L.ffn_gate_w, L.ffn_up_w, L.ffn_down_w);
+        x = norm(cur, L.ffn_norm_w);
+        ggml_tensor* mlp;
+        if (eager_cpu_math) {
+            ggml_tensor* gate = ggml_mul_mat(ctx0, L.ffn_gate_w, x);
+            ggml_tensor* up = ggml_mul_mat(ctx0, L.ffn_up_w, x);
+            ggml_tensor* h = ggml_map_custom2(ctx0, gate, up, ralm_prefill_swiglu_cpu, GGML_N_TASKS_MAX, nullptr);
+            mlp = ggml_mul_mat(ctx0, L.ffn_down_w, h);
+        } else {
+            mlp = core_ffn::swiglu(ctx0, x, L.ffn_gate_w, L.ffn_up_w, L.ffn_down_w);
+        }
         cur = ggml_add(ctx0, residual, mlp);
     }
 
     // Final RMSNorm x ralm_output_norm.
-    cur = ggml_rms_norm(ctx0, cur, eps);
-    cur = ggml_mul(ctx0, cur, W.ralm_output_norm);
+    if (output_norm) {
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, W.ralm_output_norm);
+    }
     ggml_set_name(cur, "ralm_hidden_out");
     ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
@@ -1244,7 +1300,7 @@ static std::vector<float> ralm_step_graph(voxcpm2_context* ctx, const float* hid
 // state — same value that the legacy path produces after its post-loop
 // rms_norm_cpu(... tslm_output_norm ...).
 static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int fixed_kv_len = 0,
-                                          ggml_context* arena_ctx = nullptr) {
+                                          ggml_context* arena_ctx = nullptr, int n_tokens = 1) {
     const vox_hparams& hp = ctx->hp;
     const vox_weights& W = ctx->graph_weights();
     const int d = (int)hp.tslm_d_model;
@@ -1254,7 +1310,9 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
     const int n_kv_grp = n_q / n_kv;
     const float eps = hp.rms_norm_eps;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
-    const int T = 1;
+    // T > 1: batched prefill (#478) - N prompt positions in one graph, so the
+    // weights are read once instead of once per position.
+    const int T = n_tokens > 0 ? n_tokens : 1;
     const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
 
     // arena_ctx supplied → graph metadata persists across calls
@@ -1276,10 +1334,11 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
     ggml_set_input(positions);
 
     // Bucketed (fixed_kv_len > 0) → causal_mask is required to hide the
-    // unwritten tail [n_past+1, Lk). Dynamic (fixed_kv_len == 0) → Lk
-    // tightly tracks n_past+T and the tail doesn't exist, so no mask.
+    // unwritten tail [n_past+1, Lk). Dynamic (fixed_kv_len == 0) with T == 1
+    // → Lk tightly tracks n_past+T and the tail doesn't exist, so no mask;
+    // with T > 1 query q must not see keys past n_past + q.
     ggml_tensor* causal_mask = nullptr;
-    if (fixed_kv_len > 0) {
+    if (fixed_kv_len > 0 || T > 1) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -1743,6 +1802,54 @@ static std::vector<float> tslm_prefill_ex(voxcpm2_context* ctx, const std::vecto
 //   combined_embed = text_mask * embed_tokens(tokens) + audio_mask * enc_to_lm_proj(feat_encoder(feats))
 // ).
 // `embeds` is [T * d] row-major. Captures all positions when hooks request it.
+// Batched TSLM prefill through the step graph (#478): all N prompt positions
+// in ONE graph (n_past = 0, dynamic KV write of rows [0, N), causal mask).
+// Fills the backend KV exactly like N single-position graph calls would, and
+// writes each position's output-normed hidden state to `normed_out` [N, d].
+// Returns false on any failure (caller falls back to per-position calls).
+static bool tslm_prefill_graph_batched(voxcpm2_context* ctx, const float* embeds, int N, float* normed_out) {
+    const int d = (int)ctx->hp.tslm_d_model;
+    ggml_cgraph* gf = build_tslm_step_graph(ctx, /*n_past=*/0, /*fixed_kv_len=*/0, nullptr, /*n_tokens=*/N);
+    if (!gf || !ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
+        fprintf(stderr, "voxcpm2: batched prefill graph alloc failed (N=%d)\n", N);
+        return false;
+    }
+    ggml_tensor* t_in = ggml_graph_get_tensor(gf, "hidden_in");
+    ggml_tensor* t_pos = ggml_graph_get_tensor(gf, "positions");
+    ggml_tensor* t_mask = ggml_graph_get_tensor(gf, "causal_mask");
+    ggml_tensor* t_out = ggml_graph_get_tensor(gf, "hidden_out");
+    if (!t_in || !t_pos || !t_out || (N > 1 && !t_mask)) {
+        return false;
+    }
+    ggml_backend_tensor_set(t_in, embeds, 0, (size_t)N * d * sizeof(float));
+    std::vector<int32_t> pos((size_t)N);
+    for (int i = 0; i < N; i++)
+        pos[i] = i;
+    ggml_backend_tensor_set(t_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
+    if (t_mask) {
+        // (Lk = N, T = N): row q sees keys k <= q.
+        std::vector<ggml_fp16_t> mask((size_t)N * N);
+        const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < N; q++)
+            for (int k = 0; k < N; k++)
+                mask[(size_t)q * N + k] = (k <= q) ? z : ninf;
+        ggml_backend_tensor_set(t_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+    if (ggml_tensor* half = ggml_graph_get_tensor(gf, "fsq_half")) {
+        std::vector<float> hb((size_t)ggml_nelements(half), 0.5f);
+        ggml_backend_tensor_set(half, hb.data(), 0, hb.size() * sizeof(float));
+    }
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
+    }
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "voxcpm2: batched prefill graph compute failed (N=%d)\n", N);
+        return false;
+    }
+    ggml_backend_tensor_get(t_out, normed_out, 0, (size_t)N * d * sizeof(float));
+    return true;
+}
+
 static std::vector<float> tslm_prefill_from_embeds(voxcpm2_context* ctx, const float* embeds, int T,
                                                    ggml_backend_t cpu_be, const tslm_prefill_hooks& hooks) {
     const vox_hparams& hp = ctx->hp;
@@ -1795,15 +1902,98 @@ static std::vector<float> ralm_prefill(voxcpm2_context* ctx, const std::vector<f
     return hidden;
 }
 
-// Multi-position RALM prefill — processes T tokens sequentially with causal attention.
+// Prefill the backend KV directly, returning pre-output-norm states to match
+// the eager helper. Keep the host prefix too, for eager continuation/fallback.
+static bool ralm_prefill_graph_batched(voxcpm2_context* ctx, const float* input, int T, float* output) {
+    if (T <= 0 || T > ctx->ralm_kv.max_ctx || !init_ralm_kv_backend(ctx))
+        return false;
+    const int d = (int)ctx->hp.ralm_d_model;
+    ggml_cgraph* gf = build_ralm_step_graph(ctx, 0, T, /*output_norm=*/false);
+    if (!gf || !ggml_gallocr_alloc_graph(ctx->galloc, gf))
+        return false;
+    ggml_tensor* t_in = ggml_graph_get_tensor(gf, "ralm_hidden_in");
+    ggml_tensor* t_out = ggml_graph_get_tensor(gf, "ralm_hidden_out");
+    ggml_tensor* t_mask = ggml_graph_get_tensor(gf, "ralm_causal_mask");
+    if (!t_in || !t_out || (T > 1 && !t_mask))
+        return false;
+    ggml_backend_tensor_set(t_in, input, 0, (size_t)T * d * sizeof(float));
+    if (t_mask) {
+        std::vector<ggml_fp16_t> mask((size_t)T * T);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < T; ++q)
+            for (int k = 0; k < T; ++k)
+                mask[(size_t)q * T + k] = k <= q ? zero : ninf;
+        ggml_backend_tensor_set(t_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS)
+        return false;
+    ggml_backend_tensor_get(t_out, output, 0, (size_t)T * d * sizeof(float));
+
+    const int hd = (int)ctx->hp.ralm_head_dim;
+    const int n_kv = (int)ctx->hp.ralm_n_kv;
+    std::vector<float> rows((size_t)T * hd);
+    for (int layer = 0; layer < (int)ctx->hp.ralm_n_layers; ++layer) {
+        for (int head = 0; head < n_kv; ++head) {
+            for (int kind = 0; kind < 2; ++kind) {
+                ggml_tensor* cache = kind == 0 ? ctx->ralm_kv_k : ctx->ralm_kv_v;
+                auto& host = kind == 0 ? ctx->ralm_kv.k_cache[layer] : ctx->ralm_kv.v_cache[layer];
+                const size_t offset = (size_t)layer * cache->nb[3] + (size_t)head * cache->nb[2];
+                ggml_backend_tensor_get(cache, rows.data(), offset, rows.size() * sizeof(float));
+                for (int t = 0; t < T; ++t)
+                    std::memcpy(host.data() + ((size_t)t * n_kv + head) * hd, rows.data() + (size_t)t * hd,
+                                (size_t)hd * sizeof(float));
+            }
+        }
+    }
+    ctx->ralm_kv.n_past = T;
+    ctx->ralm_kv_synced = true;
+    return true;
+}
+
+// Only the native x86 F16/Q8 matrix paths have passed the state/KV,
+// continuation and speech gates. Other quants/ISAs remain opt-in.
+static bool ralm_prefill_batch_default(const voxcpm2_context* ctx) {
+    if (!core_cpu_backend::is_cpu(ctx->backend) || !core_cpu_backend::has_feature("AVX2") ||
+        !core_cpu_backend::has_feature("F16C"))
+        return false;
+    for (const auto& layer : ctx->graph_weights().ralm_layers) {
+        for (const ggml_tensor* weight : {layer.attn_q_w, layer.attn_k_w, layer.attn_v_w, layer.attn_o_w,
+                                          layer.ffn_gate_w, layer.ffn_up_w, layer.ffn_down_w}) {
+            if (!weight || (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_Q8_0))
+                return false;
+        }
+    }
+    return true;
+}
+
+// Multi-position RALM prefill with causal attention (batched or eager).
 // Input: [T * d] row-major (T vectors of d dimensions).
 // Returns: [T * d] row-major output hidden states (pre-output-norm).
 static std::vector<float> ralm_prefill_multi(voxcpm2_context* ctx, const float* input, int T, ggml_backend_t cpu_be) {
+    voxcpm2_bench_stage bench("ralm_prefill");
     const vox_hparams& hp = ctx->hp;
     int d = (int)hp.ralm_d_model;
     ctx->ralm_kv.reset();
+    ctx->ralm_kv_synced = false;
 
     std::vector<float> all_out((size_t)T * d);
+    // CPU-only until real GPU parity is measured. USE_GRAPH=0 keeps the
+    // complete eager A/B path, including its prefill and continuation.
+    const bool batch = crispasr_env::get("CRISPASR_VOXCPM2_RALM_PREFILL_BATCH")
+                           ? vox_env_bool("CRISPASR_VOXCPM2_RALM_PREFILL_BATCH")
+                           : ralm_prefill_batch_default(ctx);
+    if (core_cpu_backend::is_cpu(ctx->backend) && vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH") && batch) {
+        if (ralm_prefill_graph_batched(ctx, input, T, all_out.data())) {
+            if (voxcpm2_bench_enabled())
+                fprintf(stderr, "voxcpm2: RALM prefill graph batched (%d positions)\n", T);
+            return all_out;
+        }
+        ctx->ralm_kv.reset();
+        fprintf(stderr, "voxcpm2: RALM batched prefill failed; using eager prefill\n");
+    }
     std::vector<float> hidden(d);
 
     for (int t = 0; t < T; t++) {
@@ -2397,7 +2587,13 @@ static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_ra
 // every op broadcasts over the batch dim (flash-attn over ne[3]), so each
 // sample's arithmetic is the single-sample graph's. Halves the dispatches and
 // weight reads of the 18 LocDiT forwards per AR step (dispatch-bound on iGPUs).
-static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena_ctx = nullptr, int B = 1) {
+// LocDiT forward body on caller-supplied input nodes: time/delta-time MLPs,
+// in/cond projections, 12 bidirectional layers, final norm + out_proj.
+// Returns vel [feat_dim, P, B]. Shared by build_locdit_graph (one forward per
+// graph) and build_cfm_fused_graph (the whole Euler loop in one graph, #461).
+static ggml_tensor* build_locdit_body(voxcpm2_context* ctx, ggml_context* ctx0, ggml_tensor* x_in, ggml_tensor* cond_in,
+                                      ggml_tensor* mu_in, ggml_tensor* t_sin, ggml_tensor* dt_sin,
+                                      ggml_tensor* positions, int B) {
     const vox_hparams& hp = ctx->hp;
     const vox_weights& W = ctx->graph_weights();
     const int d = (int)hp.locdit_d_model;
@@ -2407,41 +2603,11 @@ static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena
     const int n_kv_grp = n_q / n_kv;
     const float eps = hp.rms_norm_eps;
     const float ascale = 1.0f / std::sqrt((float)hd);
-    const int feat_dim = 64;
     const int P = (int)hp.patch_frames; // 4
     const int mu_toks = 2;
     const int T = mu_toks + 1 + P + P; // 11
     const int x_offset = mu_toks + 1 + P;
 
-    // When arena_ctx is supplied, build into the caller's persistent arena
-    // (the graph + tensor metadata outlive this call); otherwise fall back
-    // to the shared compute_meta (last-write-wins, single-call lifetime).
-    ggml_context* ctx0 = arena_ctx;
-    if (!ctx0) {
-        ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), /*no_alloc=*/true};
-        ctx0 = ggml_init(ip);
-    }
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
-
-    // ── Inputs ───────────────────────────────────────────────────
-    ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
-    ggml_set_name(x_in, "x_in");
-    ggml_set_input(x_in);
-    ggml_tensor* cond_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
-    ggml_set_name(cond_in, "cond_in");
-    ggml_set_input(cond_in);
-    ggml_tensor* mu_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d, mu_toks, B);
-    ggml_set_name(mu_in, "mu_in");
-    ggml_set_input(mu_in);
-    ggml_tensor* t_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
-    ggml_set_name(t_sin, "t_sin");
-    ggml_set_input(t_sin);
-    ggml_tensor* dt_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
-    ggml_set_name(dt_sin, "dt_sin");
-    ggml_set_input(dt_sin);
-    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
-    ggml_set_name(positions, "positions");
-    ggml_set_input(positions);
 
     // ── time_mlp + delta_time_mlp ────────────────────────────────
     // Each MLP: Linear → SiLU → Linear, both with bias. Sum the two MLPs.
@@ -2586,6 +2752,48 @@ static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena
     }
     ggml_tensor* vel = ggml_mul_mat(ctx0, W.locdit_out_proj_w, normed); // [feat_dim, P, B]
     vel = ggml_add(ctx0, vel, W.locdit_out_proj_b);
+    return vel;
+}
+
+static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena_ctx = nullptr, int B = 1) {
+    const vox_hparams& hp = ctx->hp;
+    const int d = (int)hp.locdit_d_model;
+    const int feat_dim = 64;
+    const int P = (int)hp.patch_frames; // 4
+    const int mu_toks = 2;
+    const int T = mu_toks + 1 + P + P; // 11
+
+    // When arena_ctx is supplied, build into the caller's persistent arena
+    // (the graph + tensor metadata outlive this call); otherwise fall back
+    // to the shared compute_meta (last-write-wins, single-call lifetime).
+    ggml_context* ctx0 = arena_ctx;
+    if (!ctx0) {
+        ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), /*no_alloc=*/true};
+        ctx0 = ggml_init(ip);
+    }
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    // ── Inputs ───────────────────────────────────────────────────
+    ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(x_in, "x_in");
+    ggml_set_input(x_in);
+    ggml_tensor* cond_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(cond_in, "cond_in");
+    ggml_set_input(cond_in);
+    ggml_tensor* mu_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d, mu_toks, B);
+    ggml_set_name(mu_in, "mu_in");
+    ggml_set_input(mu_in);
+    ggml_tensor* t_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
+    ggml_set_name(t_sin, "t_sin");
+    ggml_set_input(t_sin);
+    ggml_tensor* dt_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
+    ggml_set_name(dt_sin, "dt_sin");
+    ggml_set_input(dt_sin);
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    ggml_tensor* vel = build_locdit_body(ctx, ctx0, x_in, cond_in, mu_in, t_sin, dt_sin, positions, B);
     ggml_set_name(vel, "vel");
     ggml_set_output(vel);
     ggml_build_forward_expand(gf, vel);
@@ -2790,6 +2998,162 @@ static bool locdit_forward_graph_cfg(voxcpm2_context* ctx, const float* x_raw, c
 }
 
 // ---------------------------------------------------------------------------
+// #461: the whole CFG Euler loop as ONE graph. Per denoise step it chains the
+// batch-2 LocDiT forward (cond row on mu, uncond row on zeros), CFG-zero-star
+// (st = <v_c,v_u> / (|v_u|^2 + 1e-8); dphi = v_u*st + cfg*(v_c - v_u*st)) and
+// the Euler update x -= dt*dphi, so a patch costs one submit + one readback
+// instead of one per step with host-side mixing in between. The step
+// schedule (t_span, dt) and cfg are baked in; the graph is cached per
+// (steps, cfg). Layout: x/cond are [feat_dim, P] (= the host's [T, C]).
+// ---------------------------------------------------------------------------
+static ggml_cgraph* build_cfm_fused_graph(voxcpm2_context* ctx, ggml_context* ctx0, const std::vector<float>& t_span,
+                                          int zero_init_steps, float cfg) {
+    const vox_hparams& hp = ctx->hp;
+    const int d = (int)hp.locdit_d_model;
+    const int feat_dim = 64;
+    const int P = (int)hp.patch_frames;
+    const int mu_toks = 2;
+    const int T = mu_toks + 1 + P + P;
+    const int steps = (int)t_span.size() - 1;
+    const int n_active = steps - std::min(steps, zero_init_steps);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096 * (size_t)std::max(1, n_active), false);
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(x, "x0");
+    ggml_set_input(x);
+    ggml_tensor* cond_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(cond_in, "cond_in");
+    ggml_set_input(cond_in);
+    ggml_tensor* mu_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d, mu_toks, 2);
+    ggml_set_name(mu_in, "mu_in");
+    ggml_set_input(mu_in);
+    ggml_tensor* t_sin_all = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, std::max(1, n_active));
+    ggml_set_name(t_sin_all, "t_sin_all");
+    ggml_set_input(t_sin_all);
+    ggml_tensor* dt_sin = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d);
+    ggml_set_name(dt_sin, "dt_sin");
+    ggml_set_input(dt_sin);
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    int k = 0;
+    for (int step = zero_init_steps + 1; step <= steps; step++, k++) {
+        // step <= zero_init_steps: zero velocity (CFG zero-star), x unchanged.
+        const float dt_val = t_span[step - 1] - t_span[step];
+        ggml_tensor* t_sin = ggml_view_1d(ctx0, t_sin_all, d, (size_t)k * t_sin_all->nb[1]);
+        ggml_tensor* vel = build_locdit_body(ctx, ctx0, x, cond_in, mu_in, t_sin, dt_sin, positions, /*B=*/2);
+        ggml_tensor* v_c = ggml_view_2d(ctx0, vel, feat_dim, P, vel->nb[1], 0);
+        ggml_tensor* v_u = ggml_view_2d(ctx0, vel, feat_dim, P, vel->nb[1], vel->nb[2]);
+        ggml_tensor* dot = ggml_sum(ctx0, ggml_mul(ctx0, v_c, v_u));
+        ggml_tensor* nsq = ggml_scale_bias(ctx0, ggml_sum(ctx0, ggml_mul(ctx0, v_u, v_u)), 1.0f, 1e-8f);
+        ggml_tensor* st = ggml_div(ctx0, dot, nsq);
+        ggml_tensor* neg = ggml_mul(ctx0, v_u, st); // [1] broadcast
+        ggml_tensor* dphi = ggml_add(ctx0, neg, ggml_scale(ctx0, ggml_sub(ctx0, v_c, neg), cfg));
+        x = ggml_add(ctx0, x, ggml_scale(ctx0, dphi, -dt_val));
+    }
+    ggml_set_name(x, "x_out");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    return gf;
+}
+
+// Runs the fused solve. x_ct: in/out state [C=feat_dim, T=P] channels-first
+// (the cfm_euler_solve layout). Returns false (caller uses the per-step path)
+// when the graph cannot be built/allocated/computed.
+static bool cfm_fused_solve(voxcpm2_context* ctx, std::vector<float>& x_ct, const float* mu, const float* cond_raw,
+                            const std::vector<float>& t_span, int zero_init_steps, float cfg) {
+    const vox_hparams& hp = ctx->hp;
+    const int d = (int)hp.locdit_d_model;
+    const int feat_dim = 64;
+    const int P = (int)hp.patch_frames;
+    const int mu_toks = 2;
+    const int T = mu_toks + 1 + P + P;
+    const int steps = (int)t_span.size() - 1;
+    const int n_active = steps - std::min(steps, zero_init_steps);
+    if (n_active <= 0)
+        return false;
+    if (!ctx->cfm_fused_gf || ctx->cfm_fused_steps != steps || ctx->cfm_fused_cfg != cfg ||
+        ctx->cfm_fused_zero != zero_init_steps) {
+        if (ctx->cfm_fused_galloc)
+            ggml_gallocr_free(ctx->cfm_fused_galloc);
+        if (ctx->cfm_fused_ctx)
+            ggml_free(ctx->cfm_fused_ctx);
+        ctx->cfm_fused_galloc = nullptr;
+        ctx->cfm_fused_ctx = nullptr;
+        ctx->cfm_fused_gf = nullptr;
+        // Tensor metadata only (no_alloc): ~350 tensors per LocDiT body + the
+        // CFG/Euler ops; 1024 per step is a generous bound.
+        ctx->cfm_fused_meta.assign(ggml_tensor_overhead() * (1024 * (size_t)n_active + 64) +
+                                       ggml_graph_overhead_custom(4096 * (size_t)n_active, false),
+                                   0);
+        ggml_init_params ip = {ctx->cfm_fused_meta.size(), ctx->cfm_fused_meta.data(), /*no_alloc=*/true};
+        ctx->cfm_fused_ctx = ggml_init(ip);
+        if (!ctx->cfm_fused_ctx)
+            return false;
+        ctx->cfm_fused_gf = build_cfm_fused_graph(ctx, ctx->cfm_fused_ctx, t_span, zero_init_steps, cfg);
+        ctx->cfm_fused_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!ctx->cfm_fused_gf || !ctx->cfm_fused_galloc ||
+            !ggml_gallocr_reserve(ctx->cfm_fused_galloc, ctx->cfm_fused_gf)) {
+            if (ctx->cfm_fused_galloc)
+                ggml_gallocr_free(ctx->cfm_fused_galloc);
+            ggml_free(ctx->cfm_fused_ctx);
+            ctx->cfm_fused_galloc = nullptr;
+            ctx->cfm_fused_ctx = nullptr;
+            ctx->cfm_fused_gf = nullptr;
+            return false;
+        }
+        ctx->cfm_fused_steps = steps;
+        ctx->cfm_fused_cfg = cfg;
+        ctx->cfm_fused_zero = zero_init_steps;
+    }
+    ggml_cgraph* gf = ctx->cfm_fused_gf;
+    if (!ggml_gallocr_alloc_graph(ctx->cfm_fused_galloc, gf))
+        return false;
+
+    std::vector<float> x_tc((size_t)feat_dim * P);
+    for (int t = 0; t < P; t++)
+        for (int c = 0; c < feat_dim; c++)
+            x_tc[(size_t)t * feat_dim + c] = x_ct[(size_t)c * P + t];
+    std::vector<float> mu_buf((size_t)d * mu_toks * 2, 0.0f); // row 1 = zero mu (uncond)
+    std::memcpy(mu_buf.data(), mu, (size_t)d * mu_toks * sizeof(float));
+    std::vector<float> t_all((size_t)d * n_active);
+    for (int k = 0, step = zero_init_steps + 1; step <= steps; step++, k++) {
+        std::vector<float> e = sinusoidal_time_emb(t_span[step - 1], d);
+        std::memcpy(t_all.data() + (size_t)k * d, e.data(), (size_t)d * sizeof(float));
+    }
+    std::vector<float> dt_sin = sinusoidal_time_emb(0.0f, d); // non-mean mode: dt = 0
+    std::vector<int32_t> positions(T);
+    for (int i = 0; i < T; i++)
+        positions[i] = i;
+
+    ggml_tensor* in_x = ggml_graph_get_tensor(gf, "x0");
+    ggml_tensor* in_c = ggml_graph_get_tensor(gf, "cond_in");
+    ggml_tensor* in_mu = ggml_graph_get_tensor(gf, "mu_in");
+    ggml_tensor* in_t = ggml_graph_get_tensor(gf, "t_sin_all");
+    ggml_tensor* in_dt = ggml_graph_get_tensor(gf, "dt_sin");
+    ggml_tensor* in_pos = ggml_graph_get_tensor(gf, "positions");
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "x_out");
+    if (!in_x || !in_c || !in_mu || !in_t || !in_dt || !in_pos || !out)
+        return false;
+    ggml_backend_tensor_set(in_x, x_tc.data(), 0, x_tc.size() * sizeof(float));
+    ggml_backend_tensor_set(in_c, cond_raw, 0, (size_t)feat_dim * P * sizeof(float));
+    ggml_backend_tensor_set(in_mu, mu_buf.data(), 0, mu_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(in_t, t_all.data(), 0, t_all.size() * sizeof(float));
+    ggml_backend_tensor_set(in_dt, dt_sin.data(), 0, dt_sin.size() * sizeof(float));
+    ggml_backend_tensor_set(in_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS)
+        return false;
+    ggml_backend_tensor_get(out, x_tc.data(), 0, x_tc.size() * sizeof(float));
+    for (int t = 0; t < P; t++)
+        for (int c = 0; c < feat_dim; c++)
+            x_ct[(size_t)c * P + t] = x_tc[(size_t)t * feat_dim + c];
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // CFM Euler solve — sway schedule (t: 1->0), CFG-zero-star
 //
 // mu:       [tslm_d_model=2048] conditioning from TSLM+RALM
@@ -2871,6 +3235,25 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
                 cfg_interval, cfg_interval);
 
     float dt_scalar = 0.0f; // non-mean-mode
+
+    // #461: the whole Euler loop in one graph (one submit per patch instead of
+    // one per denoise step). Same eligibility as the batch-2 CFG path; the
+    // per-step loop below stays as the fallback and for interval-CFG.
+    // CRISPASR_VOXCPM2_CFM_FUSED=0 -> per-step path.
+    static const bool cfm_fused = vox_env_bool_default_on("CRISPASR_VOXCPM2_CFM_FUSED");
+    if (cfm_fused && cfg > 1.0f && cfg_batch && use_graph && !fa_cpu && !interval_on) {
+        double tl = bench ? vox_now_ms() : 0;
+        if (cfm_fused_solve(ctx, x, mu, cond_raw, t_span, zero_init_steps, cfg)) {
+            if (bench) {
+                sum_locdit += vox_now_ms() - tl;
+                double total = vox_now_ms() - t_cfm0;
+                fprintf(stderr,
+                        "voxcpm2[bench]:   cfm.locdit_fwd %.1f ms total (%.1f%% of cfm)  cfm.total=%.1f ms [fused]\n",
+                        sum_locdit, total > 0 ? 100.0 * sum_locdit / total : 0.0, total);
+            }
+            return x;
+        }
+    }
 
     for (int step = 1; step <= steps; step++) {
         float t_cur = t_span[step - 1];
@@ -3049,6 +3432,12 @@ static std::vector<float> wn_reconstruct(const float* weight_g, const float* wei
     // Output layout: w[ki + ic*ksize + oc*in_ch*ksize] = [out_ch, in_ch, k]
     int total = out_ch * in_ch * ksize;
     std::vector<float> w(total);
+    // Rows are independent and each row's norm is summed in the same order by
+    // one thread, so threading changes nothing but wall time (#461: this runs
+    // on every process start, 41M+ elements for the VAE decoder).
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if ((size_t)total > ((size_t)1 << 20))
+#endif
     for (int oc = 0; oc < out_ch; oc++) {
         float g = weight_g[oc];
         // Compute L2 norm across ALL (in_ch * ksize) elements for this oc
@@ -3534,12 +3923,50 @@ static ggml_tensor* snake1d_ggml(ggml_context* ctx0, ggml_tensor* x, ggml_tensor
 // retained slice is causal.
 // ---------------------------------------------------------------------------
 
+// Causal depthwise conv as K shifted multiply-adds (issue #461):
+//   y[t, c] = sum_k w[k, c] * xp[t + k*d, c],  xp = x left-padded by (K-1)*d.
+// Same algebra as ggml_conv_1d_dw + left crop, but elementwise over [T, C]
+// instead of im2col (K x the activation, F16) + a batched mat-mul whose
+// contraction is only K wide - the VAE decoder runs 18 of these at up to
+// 146k samples x 32..1024 channels per 3 s of audio.
+static ggml_tensor* causal_dwconv1d_shift_ggml(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* weight, int dilation) {
+    const int K = (int)weight->ne[0];
+    const int T = (int)x->ne[0];
+    const int C = (int)x->ne[1];
+    const int pad = (K - 1) * dilation;
+    ggml_tensor* xp = ggml_pad_ext(ctx0, x, pad, 0, 0, 0, 0, 0, 0, 0); // [T + pad, C]
+    // [K, 1, C] -> [C, K] so each tap is a contiguous [C] vector.
+    ggml_tensor* wt = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, weight, K, C)));
+    ggml_tensor* y = nullptr;
+    for (int k = 0; k < K; k++) {
+        ggml_tensor* xk = ggml_view_2d(ctx0, xp, T, C, xp->nb[1], (size_t)k * dilation * ggml_element_size(xp));
+        ggml_tensor* wk = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, wt, C, (size_t)k * wt->nb[1]), 1, C);
+        ggml_tensor* term = ggml_mul(ctx0, xk, wk);
+        y = y ? ggml_add(ctx0, y, term) : term;
+    }
+    return y;
+}
+
+// Whether the VAE decoder uses causal_dwconv1d_shift_ggml. Default: on for
+// Vulkan only, where it was measured (#461, T4: VAE graph 360 -> 116-136 ms,
+// PCM rel diff 2e-3, ASR identical); CUDA / Metal are unmeasured. The env var
+// CRISPASR_VOXCPM2_VAE_DW_SHIFT=1|0 forces it on or off for any backend.
+static bool vae_dw_shift_for(ggml_backend_t backend) {
+    const char* e = crispasr_env::get("CRISPASR_VOXCPM2_VAE_DW_SHIFT");
+    if (e && *e)
+        return *e != '0';
+    const char* name = backend ? ggml_backend_name(backend) : nullptr;
+    return name && std::strncmp(name, "Vulkan", 6) == 0;
+}
+
 static ggml_tensor* causal_conv1d_ggml(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias,
-                                       int dilation, bool depthwise) {
+                                       int dilation, bool depthwise, bool dw_shift = false) {
     const int K = (int)weight->ne[0];
     const int pad = (K - 1) * dilation;
     ggml_tensor* y;
-    if (depthwise) {
+    if (depthwise && dw_shift && weight->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32) {
+        y = causal_dwconv1d_shift_ggml(ctx0, x, weight, dilation);
+    } else if (depthwise) {
         y = ggml_conv_1d_dw(ctx0, weight, x, /*s*/ 1, pad, dilation);
     } else {
         y = ggml_conv_1d(ctx0, weight, x, /*s*/ 1, pad, dilation);
@@ -3853,15 +4280,43 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
     }
 
     // Now populate. WN convs: reconstruct from g/v, write into the tensor.
+    double t_fetch = 0, t_wn = 0, t_up = 0; // CRISPASR_VOXCPM2_BENCH split (#461)
+    auto is_convt_key = [](const std::string& k) {
+        // "vae.dec.layer.{2..7}.block.1" - the six ConvTranspose1d upsamplers
+        static const std::string pre = "vae.dec.layer.", suf = ".block.1";
+        return k.size() == pre.size() + 1 + suf.size() && k.compare(0, pre.size(), pre) == 0 && k[pre.size()] >= '2' &&
+               k[pre.size()] <= '7' && k.compare(pre.size() + 1, suf.size(), suf) == 0;
+    };
+    std::map<std::string, std::unique_ptr<float[]>> host_perm;
     for (const auto& e : wn_entries) {
+        auto c0 = std::chrono::steady_clock::now();
         const float* g = vae_tensor_f32(T, e.g_name);
         const float* v = vae_tensor_f32(T, e.v_name);
         if (!g || !v) {
             continue; // optional layer; leaves the tensor zero-initialised
         }
+        auto c1 = std::chrono::steady_clock::now();
         std::vector<float> w = wn_reconstruct(g, v, e.out_ch, e.in_ch, e.ksize);
+        auto c2 = std::chrono::steady_clock::now();
         ggml_backend_tensor_set(M[e.key], w.data(), 0, w.size() * sizeof(float));
+        if (is_convt_key(e.key)) {
+            // Permute for the decomposed transposed-conv path straight from the
+            // host copy: tensor ne = [K, e.in_ch, e.out_ch] = [K, OC, IC] of
+            // core_convt's layout. Saves downloading 168 MB back from the GPU
+            // just to permute it (#461).
+            const float* wp = w.data();
+            auto buf = std::make_unique<float[]>(w.size());
+            core_convt::permute_convt1d_host([wp](size_t i) { return wp[i]; }, buf.get(), e.ksize, e.in_ch, e.out_ch);
+            host_perm[e.key] = std::move(buf);
+        }
+        auto c3 = std::chrono::steady_clock::now();
+        t_fetch += std::chrono::duration<double, std::milli>(c1 - c0).count();
+        t_wn += std::chrono::duration<double, std::milli>(c2 - c1).count();
+        t_up += std::chrono::duration<double, std::milli>(c3 - c2).count();
     }
+    if (voxcpm2_bench_enabled())
+        fprintf(stderr, "  voxcpm2_bench: vae.wn f32_fetch=%.1f ms rebuild=%.1f ms upload=%.1f ms (%zu convs)\n",
+                t_fetch, t_wn, t_up, wn_entries.size());
 
     // Snake1d: populate inv_alpha + copy alpha to the compute backend.
     for (const auto& name : alpha_names) {
@@ -3939,7 +4394,33 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
             srcs[b] = (it != M.end()) ? it->second : nullptr;
             dsts[b] = &perm_ptrs[b];
         }
-        core_convt::permute_convt1d_weights_batch(srcs, dsts, n, ctx->backend, &ctx->vae_perm_ctx, &ctx->vae_perm_buf);
+        voxcpm2_bench_stage st("vae.wn perm_upload");
+        bool have_all = true;
+        for (int b = 0; b < n; b++)
+            have_all = have_all && srcs[b] && host_perm.count(ggml_get_name(srcs[b]));
+        if (have_all) {
+            ggml_init_params pp = {ggml_tensor_overhead() * (size_t)n + 4096, nullptr, true};
+            ctx->vae_perm_ctx = ggml_init(pp);
+            for (int b = 0; b < n; b++) {
+                const int K = (int)srcs[b]->ne[0], OC = (int)srcs[b]->ne[1], IC = (int)srcs[b]->ne[2];
+                perm_ptrs[b] = ggml_new_tensor_2d(ctx->vae_perm_ctx, GGML_TYPE_F32, IC, K * OC);
+            }
+            ctx->vae_perm_buf = ggml_backend_alloc_ctx_tensors(ctx->vae_perm_ctx, ctx->backend);
+            if (!ctx->vae_perm_buf) {
+                ggml_free(ctx->vae_perm_ctx);
+                ctx->vae_perm_ctx = nullptr;
+                for (int b = 0; b < n; b++)
+                    perm_ptrs[b] = nullptr;
+                have_all = false;
+            } else {
+                for (int b = 0; b < n; b++)
+                    ggml_backend_tensor_set(perm_ptrs[b], host_perm[ggml_get_name(srcs[b])].get(), 0,
+                                            ggml_nbytes(perm_ptrs[b]));
+            }
+        }
+        if (!have_all)
+            core_convt::permute_convt1d_weights_batch(srcs, dsts, n, ctx->backend, &ctx->vae_perm_ctx,
+                                                      &ctx->vae_perm_buf);
         for (int b = 0; b < n; b++) {
             if (perm_ptrs[b]) {
                 std::string key = "vae.dec.layer." + std::to_string(b + 2) + ".block.1.perm";
@@ -3980,7 +4461,12 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
         return std::vector<float>((size_t)n_patches * (size_t)P * 1920, 0.0f);
     }
 
-    if (!vae_wn_init_ggml(ctx)) {
+    bool wn_ok;
+    {
+        voxcpm2_bench_stage st("vae.wn_init");
+        wn_ok = vae_wn_init_ggml(ctx);
+    }
+    if (!wn_ok) {
         if (ctx->verbosity >= 1)
             fprintf(stderr, "voxcpm2: vae_wn_init_ggml failed; falling back to CPU vae_decode\n");
         return vae_decode_cpu(ctx, patches);
@@ -4071,8 +4557,9 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     auto InvAlpha = [&](const std::string& prefix) -> ggml_tensor* { return Wget(prefix + ".alpha.inv"); };
 
     // Layer 0: depthwise k=7, channels=64
+    const bool dw_shift = vae_dw_shift_for(ctx->backend);
     cur = causal_conv1d_ggml(ctx0, cur, Wget("vae.dec.layer.0"), Bias("vae.dec.layer.0"),
-                             /*dilation*/ 1, /*depthwise*/ true);
+                             /*dilation*/ 1, /*depthwise*/ true, dw_shift);
 
     const bool trace = vox_env_bool("CRISPASR_VOXCPM2_VAE_TRACE");
     if (trace) {
@@ -4152,7 +4639,8 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
                 cur = snake1d_ggml(ctx0, cur, Alpha(rp + ".0"), InvAlpha(rp + ".0"));
             }
             // dilated depthwise conv k=7
-            cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".1"), Bias(rp + ".1"), dilations[r], /*depthwise*/ true);
+            cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".1"), Bias(rp + ".1"), dilations[r], /*depthwise*/ true,
+                                     dw_shift);
             // snake2
             if (Alpha(rp + ".2") && InvAlpha(rp + ".2")) {
                 cur = snake1d_ggml(ctx0, cur, Alpha(rp + ".2"), InvAlpha(rp + ".2"));
@@ -4179,7 +4667,12 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
 
-    if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
+    bool alloc_ok;
+    {
+        voxcpm2_bench_stage st("vae.alloc");
+        alloc_ok = ggml_gallocr_alloc_graph(ctx->galloc, gf);
+    }
+    if (!alloc_ok) {
         fprintf(stderr, "voxcpm2: vae_decode_graph gallocr alloc failed; falling back to CPU\n");
         ggml_free(ctx0);
         return vae_decode_cpu(ctx, patches);
@@ -4196,7 +4689,12 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (core_cpu_backend::is_cpu(ctx->backend)) {
         core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
-    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+    ggml_status vae_st;
+    {
+        voxcpm2_bench_stage st("vae.compute");
+        vae_st = ggml_backend_graph_compute(ctx->backend, gf);
+    }
+    if (vae_st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: vae_decode_graph compute failed; falling back to CPU\n");
         ggml_free(ctx0);
         return vae_decode_cpu(ctx, patches);
@@ -6005,8 +6503,10 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
                 hp.audio_start_token);
     }
 
-    // Set ggml matmul thread count
-    g_cpu_n_threads = 4; // TODO: fix ctx->params
+    // Eager-path matmul thread count (matmul_mv_ggml). Re-synced from
+    // ctx->n_threads at the start of every synthesis, so -t and
+    // voxcpm2_set_n_threads() reach it (#478: it was pinned to 4).
+    g_cpu_n_threads = ctx->n_threads > 0 ? ctx->n_threads : 4;
 
     return true;
 }
@@ -6204,19 +6704,52 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     const auto& audio_mask_pos = pi.audio_mask_pos;
     const auto& feat_embed_pos = pi.feat_embed_pos;
 
-    // 2. TSLM prefill from the combined embeds (capture all positions for RALM).
-    double t0_prefill = vox_now_ms();
-    std::vector<float> all_pos;
-    tslm_prefill_hooks hooks;
-    hooks.max_capture_positions = N_pos;
-    hooks.all_positions = &all_pos;
-    tslm_prefill_from_embeds(ctx, pi.combined_embed.data(), N_pos, cpu_be, hooks);
+    g_cpu_n_threads = ctx->n_threads > 0 ? ctx->n_threads : g_cpu_n_threads; // -t reaches eager matmuls (#478)
 
-    // 5. Apply TSLM output norm per position.
+    // 2. TSLM prefill from the combined embeds (capture all positions for RALM).
+    // Graph mode (default): run the prompt ONCE through the same graph as the
+    // AR steps. That writes the backend KV directly - the attention the steps
+    // use, so the stop predictor keeps firing (#164) - and returns the
+    // output-normed hidden state of every position for FSQ / RALM. Before
+    // #478 the prompt went through the legacy CPU prefill AND was replayed
+    // through the graph on the first AR step: two full prefills, the first
+    // pinned to 4 threads. CRISPASR_VOXCPM2_LEGACY_PREFILL=1 restores the
+    // legacy prefill (+ replay).
+    const bool use_graph_tslm = vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH");
+    ctx->tslm_kv_synced = false;
+    double t0_prefill = vox_now_ms();
     std::vector<float> normed_all((size_t)N_pos * d_tslm);
-    for (int i = 0; i < N_pos; i++) {
-        rms_norm_cpu(all_pos.data() + (size_t)i * d_tslm, tensor_data_f32(ctx->weights.tslm_output_norm),
-                     normed_all.data() + (size_t)i * d_tslm, d_tslm, hp.rms_norm_eps);
+    bool graph_prefilled = false;
+    bool prefill_batched = false;
+    if (use_graph_tslm && !vox_env_bool("CRISPASR_VOXCPM2_LEGACY_PREFILL") && init_tslm_kv_backend(ctx)) {
+        ctx->tslm_kv.reset();
+        // One batched graph for the whole prompt; per-position graph calls
+        // (same KV, same hidden states) if it fails or with
+        // CRISPASR_VOXCPM2_PREFILL_SERIAL=1.
+        if (!vox_env_bool("CRISPASR_VOXCPM2_PREFILL_SERIAL") &&
+            tslm_prefill_graph_batched(ctx, pi.combined_embed.data(), N_pos, normed_all.data())) {
+            prefill_batched = true;
+        } else {
+            for (int t = 0; t < N_pos; t++) {
+                std::vector<float> h = tslm_step_graph(ctx, pi.combined_embed.data() + (size_t)t * d_tslm, t);
+                std::memcpy(normed_all.data() + (size_t)t * d_tslm, h.data(), (size_t)d_tslm * sizeof(float));
+            }
+        }
+        ctx->tslm_kv.n_past = N_pos;
+        ctx->tslm_kv_synced = true;
+        graph_prefilled = true;
+    }
+    if (!graph_prefilled) {
+        std::vector<float> all_pos;
+        tslm_prefill_hooks hooks;
+        hooks.max_capture_positions = N_pos;
+        hooks.all_positions = &all_pos;
+        tslm_prefill_from_embeds(ctx, pi.combined_embed.data(), N_pos, cpu_be, hooks);
+        // 5. Apply TSLM output norm per position.
+        for (int i = 0; i < N_pos; i++) {
+            rms_norm_cpu(all_pos.data() + (size_t)i * d_tslm, tensor_data_f32(ctx->weights.tslm_output_norm),
+                         normed_all.data() + (size_t)i * d_tslm, d_tslm, hp.rms_norm_eps);
+        }
     }
     // 5b. FSQ masking — Python:
     //   enc_outputs = fsq(enc_outputs) * audio_mask + enc_outputs * text_mask
@@ -6232,8 +6765,9 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     std::vector<float> tslm_hidden(normed_all.data() + (size_t)(N_pos - 1) * d_tslm,
                                    normed_all.data() + (size_t)N_pos * d_tslm);
     if (ctx->verbosity >= 1) {
-        fprintf(stderr, "voxcpm2: TSLM prefill %.1f ms (%d positions%s)\n", vox_now_ms() - t0_prefill, N_pos,
-                have_ref ? " incl. ref" : "");
+        fprintf(stderr, "voxcpm2: TSLM prefill %.1f ms (%d positions%s, %s)\n", vox_now_ms() - t0_prefill, N_pos,
+                have_ref ? " incl. ref" : "",
+                graph_prefilled ? (prefill_batched ? "graph batched" : "graph per-position") : "legacy");
     }
 
     // 6. fusion_concat_proj + multi-position RALM prefill. Python concatenates
@@ -6334,9 +6868,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     // through the graph (no further CPU↔backend traffic). Resetting
     // tslm_kv_synced here ensures every synthesis call re-syncs from the
     // fresh prefill cache.
-    const bool use_graph_tslm = vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH");
-    ctx->tslm_kv_synced = false;
-    ctx->ralm_kv_synced = false;
+    // ralm_prefill_multi sets ralm_kv_synced when it fills backend KV directly.
 
     // Python AR loop order (from voxcpm2.py _inference, lines 1060-1108):
     //   1. Build mu → CFM solve → LocEnc → enc_to_lm → collect patch
@@ -6876,6 +7408,14 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
     if (ctx->locdit2_galloc) {
         ggml_gallocr_free(ctx->locdit2_galloc);
         ctx->locdit2_galloc = nullptr;
+    }
+    if (ctx->cfm_fused_galloc) {
+        ggml_gallocr_free(ctx->cfm_fused_galloc);
+        ctx->cfm_fused_galloc = nullptr;
+    }
+    if (ctx->cfm_fused_ctx) {
+        ggml_free(ctx->cfm_fused_ctx);
+        ctx->cfm_fused_ctx = nullptr;
     }
     if (ctx->locdit2_arena_ctx) {
         ggml_free(ctx->locdit2_arena_ctx);
