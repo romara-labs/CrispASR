@@ -7,6 +7,9 @@
 // The whisper code path in cli.cpp is left completely untouched so the
 // historical crispasr behaviour is bit-identical.
 
+#include "core/align_json.h"
+#include "core/lid_probe.h"
+#include "core/parakeet_gguf.h"
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_gap_fill.h"
@@ -2524,6 +2527,39 @@ static std::string crispasr_stream_common_speaker(const std::vector<crispasr_seg
     return spk;
 }
 
+int crispasr_run_lid_only(const whisper_params& params) {
+    if (params.fname_inp.empty()) {
+        fprintf(stderr, "crispasr: error: --detect-language requires audio input\n");
+        return 2;
+    }
+    if (params.lid_backend == "off" || params.lid_backend == "none" || params.lid_backend == "probe" ||
+        params.lid_backend == "self") {
+        fprintf(stderr, "crispasr: error: standalone --detect-language requires an external LID backend\n");
+        return 2;
+    }
+
+    int rc = 0;
+    for (const std::string& path : params.fname_inp) {
+        std::vector<float> samples;
+        std::vector<std::vector<float>> stereo;
+        if (!read_audio_data(path, samples, stereo, false) || samples.empty()) {
+            fprintf(stderr, "crispasr: error: failed to read audio '%s'\n", path.c_str());
+            rc = 20;
+            continue;
+        }
+        crispasr_lid_result lid;
+        if (!crispasr_detect_language_cli(samples.data(), (int)samples.size(), params, lid) || lid.lang_code.empty()) {
+            fprintf(stderr, "crispasr: error: language detection failed for '%s'\n", path.c_str());
+            rc = 21;
+            continue;
+        }
+        fprintf(stdout, "lang=%s\tconfidence=%.6f\tsource=%s\tfile=%s\n", lid.lang_code.c_str(), lid.confidence,
+                lid.source.c_str(), path.c_str());
+    }
+    crispasr_lid_free_cache();
+    return rc;
+}
+
 int crispasr_run_backend(const whisper_params& params_in) {
     whisper_params params = params_in;
 
@@ -2954,13 +2990,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
             fprintf(stderr, "crispasr[align-only]: aligner=%s\n", am.c_str());
             fprintf(stderr, "crispasr[align-only]: audio=%.2fs (%d samples @ 16kHz)\n",
                     (float)samples.size() / 16000.0f, (int)samples.size());
-            fprintf(stderr, "crispasr[align-only]: transcript='%.80s%s'\n", transcript.c_str(),
-                    transcript.size() > 80 ? "…" : "");
+            const std::string preview = core_lid_probe::utf8_prefix(transcript, 80);
+            fprintf(stderr, "crispasr[align-only]: transcript='%s%s'\n", preview.c_str(),
+                    transcript.size() > preview.size() ? "…" : "");
         }
 
         // Run alignment.
         auto aligned = crispasr_align_words(am, transcript, samples.data(), (int)samples.size(), /*t_offset_cs=*/0,
-                                            params.n_threads);
+                                            params.n_threads, nullptr, params.chunk_seconds);
         if (aligned.empty()) {
             fprintf(stderr, "crispasr[align-only]: alignment failed or produced no words.\n");
             return 10;
@@ -2990,13 +3027,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return buf;
         };
         auto json_esc = [](const std::string& s) {
-            std::string esc;
-            for (char c : s) {
-                if (c == '"' || c == '\\')
-                    esc += '\\';
-                esc += c;
-            }
-            return esc;
+            const auto quoted = nlohmann::json(s).dump();
+            return quoted.substr(1, quoted.size() - 2);
         };
         std::string out;
         const std::string& fmt = params.align_format;
@@ -3010,18 +3042,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
                              seg.t1_cs / 100.0);
                     out += "  {\"text\": \"" + json_esc(seg.text) + "\", " + num;
                     for (size_t w = seg.word_begin; w < seg.word_end; w++) {
-                        snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f}", aligned[w].t0_cs / 100.0,
-                                 aligned[w].t1_cs / 100.0);
-                        out += std::string(w > seg.word_begin ? ", " : "") + "{\"word\": \"" +
-                               json_esc(aligned[w].text) + "\", " + num;
+                        out += std::string(w > seg.word_begin ? ", " : "") + core_align_json::word(aligned[w]).dump();
                     }
                     out += std::string("]}") + (i + 1 < segments.size() ? "," : "") + "\n";
                 }
             } else {
                 for (size_t i = 0; i < aligned.size(); i++) {
-                    snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f}%s\n", aligned[i].t0_cs / 100.0,
-                             aligned[i].t1_cs / 100.0, i + 1 < aligned.size() ? "," : "");
-                    out += "  {\"word\": \"" + json_esc(aligned[i].text) + "\", " + num;
+                    out += "  " + core_align_json::word(aligned[i]).dump() + (i + 1 < aligned.size() ? "," : "") + "\n";
                 }
             }
             out += "]\n";
@@ -3121,6 +3148,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
         } else {
             backend_name = crispasr_detect_backend_from_gguf(params.model);
             if (backend_name.empty()) {
+                if (core_parakeet_gguf::reject_external_file(params.model.c_str()))
+                    return 11;
                 fprintf(stderr,
                         "crispasr: error: could not auto-detect backend from '%s'. "
                         "Use --backend NAME to force one.\n",
@@ -3287,6 +3316,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
     params.model = resolved;
 
+    // Reject the foreign Parakeet schema even if a filename or explicit backend
+    // bypassed metadata auto-detection. Do this before loading weights/processing.
+    if (core_parakeet_gguf::family_backend(backend_name.c_str()) &&
+        core_parakeet_gguf::reject_external_file(params.model.c_str()))
+        return 11;
+
     // A pure-CTC FastConformer model (parakeet-ctc-*, stt_*_fastconformer_ctc:
     // encoder + CTC head, no RNN-T decoder/joint) cannot run on the parakeet
     // (transducer) backend. Autodetection already routes such GGUFs to
@@ -3326,6 +3361,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
             //   1. next to the model file (sibling directory)
             //   2. in the cache dir / well-known search dirs
             bool companion_found = false;
+            // Converted Moonshine GGUFs carry a model-specific sidecar to
+            // avoid sharing incompatible language vocabularies.
+            if (backend_name == "moonshine" || backend_name == "moonshine-streaming") {
+                FILE* own = fopen((params.model + ".tokenizer.bin").c_str(), "rb");
+                if (own) {
+                    fclose(own);
+                    companion_found = true;
+                }
+            }
             {
                 const auto sep = params.model.find_last_of("/\\");
                 if (sep != std::string::npos) {
@@ -5038,7 +5082,21 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // 32000 samples = 2 s @ 16 kHz, comfortably
                         // above every supported backend's encoder
                         // minimum.
-                        if (!allow_partial_decode) {
+                        // #547: the cadence throttle must not starve the decode
+                        // that OPENS an utterance. `final_silence_due` already
+                        // bypasses it for the tail of an open utterance, but a
+                        // step with no utterance open — or a slice that starts a
+                        // new one past the silence gap — got no decode at all.
+                        // The new utterance then had no `partial` text, and a VAD
+                        // span below the redecode floor finalized with an empty
+                        // `final`, silently dropping the speech. This is what a
+                        // multi-turn `--stream --vad` session hit whenever a step
+                        // shorter than `--stream-partial-decode-ms` carried the
+                        // onset (typically the final, partial read at EOF).
+                        const bool opens_utterance = crispasr_stream_partial_decode_opens_utterance(
+                            have_open_utterance, s_start_abs, last_speech_end_sample, params.stream_final_silence_ms,
+                            SR);
+                        if (!allow_partial_decode && !opens_utterance) {
                             // Keep VAD slice timing in the JSON state machine
                             // but skip the expensive ASR partial decode for
                             // this step.

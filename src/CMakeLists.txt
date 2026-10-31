@@ -116,6 +116,7 @@ add_library(crispasr-lib
             # Lets language wrappers feed `crispasr_session_transcribe`
             # any audio format without bundling an external ffmpeg.
             crispasr_audio.cpp
+            crispasr_audio_resample.cpp
             # Library-level mic capture (PLAN #62d) — wraps miniaudio
             # ma_device for cross-platform live PCM. Symbols share the
             # MINIAUDIO_IMPLEMENTATION already linked from crispasr_audio.cpp.
@@ -722,6 +723,8 @@ macro(crispasr_prefer_cblas)
     endif()
 endmacro()
 
+include(${PROJECT_SOURCE_DIR}/cmake/CrispASRCPUBlas.cmake)
+
 # Cohere Transcribe library (Conformer encoder + transformer decoder)
 add_library(cohere STATIC
             cohere-arch.h
@@ -873,6 +876,7 @@ target_include_directories(lfm2_audio PUBLIC . ../include)
 target_compile_features   (lfm2_audio PUBLIC cxx_std_17)
 set_target_properties(lfm2_audio PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries     (lfm2_audio PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+target_link_libraries(lfm2_audio PRIVATE crispasr-cpu-blas)
 if(NOT MSVC)
     target_compile_options(lfm2_audio PRIVATE -O3)
 endif()
@@ -1819,8 +1823,34 @@ set_target_properties(miotts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(miotts PUBLIC .)
 target_compile_features   (miotts PUBLIC cxx_std_17)
 target_link_libraries     (miotts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+target_link_libraries(miotts PRIVATE crispasr-cpu-blas)
 if(NOT MSVC)
     target_compile_options(miotts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# arktts — Edge0/Audio8-TTS-Realistic-0.6b (ArkttsModel + Snake vocoder)
+# ---------------------------------------------------------------------------
+add_library(arktts STATIC arktts.h arktts.cpp)
+set_target_properties(arktts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(arktts PUBLIC .)
+target_compile_features   (arktts PUBLIC cxx_std_17)
+target_link_libraries     (arktts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(arktts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# meanvc2 — ASLP@NPU MeanVC2 Streaming Zero-Shot Voice Conversion (Apache-2.0)
+# ---------------------------------------------------------------------------
+add_library(meanvc2 STATIC meanvc2.h meanvc2.cpp)
+set_target_properties(meanvc2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(meanvc2 PUBLIC .)
+target_compile_features   (meanvc2 PUBLIC cxx_std_17)
+target_link_libraries     (meanvc2 PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+target_link_libraries(meanvc2 PRIVATE crispasr-cpu-blas)
+if(NOT MSVC)
+    target_compile_options(meanvc2 PRIVATE -O3)
 endif()
 
 # miocodec — Aratako/MioCodec-25Hz-44.1kHz-v2 (MIT, 133M params)
@@ -1830,10 +1860,11 @@ set_target_properties(miocodec PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(miocodec PUBLIC .)
 target_compile_features   (miocodec PUBLIC cxx_std_17)
 target_link_libraries     (miocodec PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+target_link_libraries(miocodec PRIVATE crispasr-cpu-blas)
 
 # ---------------------------------------------------------------------------
 # omnivoice — OmniVoice (full realtime Qwen3 + RVQ codec pipeline)
-# ---------------------------------------------------------------------------
+# The monolithic omnivoice.cpp is retained only for upstream reference tests.
 # ---------------------------------------------------------------------------
 add_library(omnivoice STATIC
     omnivoice.h
@@ -2363,7 +2394,7 @@ endif()
 # ---------------------------------------------------------------------------
 # dia-tts — Nari Labs Dia TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
-add_library(dia-tts STATIC dia_tts.h dia_tts.cpp)
+add_library(dia-tts STATIC dia_tts.h dia_tts.cpp dia_dump_step.h)
 set_target_properties(dia-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(dia-tts PUBLIC .)
 target_compile_features   (dia-tts PUBLIC cxx_std_17)
@@ -2392,6 +2423,7 @@ set_target_properties(fireredtts3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(fireredtts3 PUBLIC .)
 target_compile_features   (fireredtts3 PUBLIC cxx_std_17)
 target_link_libraries     (fireredtts3 PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu chatterbox)
+target_link_libraries(fireredtts3 PRIVATE crispasr-cpu-blas)
 if(NOT MSVC)
     target_compile_options(fireredtts3 PRIVATE -O3)
 endif()
@@ -3043,6 +3075,12 @@ endif()
 if (TARGET miotts)
     target_link_libraries(crispasr-lib PUBLIC miotts)
 endif()
+if (TARGET arktts)
+    target_link_libraries(crispasr-lib PUBLIC arktts)
+endif()
+if (TARGET meanvc2)
+    target_link_libraries(crispasr-lib PUBLIC meanvc2)
+endif()
 if (TARGET mini-omni2)
     target_link_libraries(crispasr-lib PUBLIC mini-omni2)
 endif()
@@ -3378,6 +3416,9 @@ endif()
 if (TARGET rvc-svc)
     target_link_libraries(crispasr-lib PUBLIC rvc-svc)
 endif()
+if (TARGET meanvc2)
+    target_link_libraries(crispasr-lib PUBLIC meanvc2)
+endif()
 if (TARGET beat-this)
     target_link_libraries(crispasr-lib PUBLIC beat-this)
 endif()
@@ -3423,4 +3464,19 @@ if (BUILD_SHARED_LIBS)
             COMMENT "Copying $<TARGET_FILE:crispasr-lib> to whisper.dll alias"
         )
     endif()
+endif()
+
+# Optional native ONNX execution for German Moonshine exports. No network fetch
+# during configure: point at an installed official ONNX Runtime distribution.
+set(CRISPASR_ONNXRUNTIME_ROOT "" CACHE PATH "ONNX Runtime CPU SDK root")
+if(CRISPASR_ONNXRUNTIME_ROOT)
+    find_path(CRISPASR_ORT_INCLUDE onnxruntime_cxx_api.h PATHS "${CRISPASR_ONNXRUNTIME_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+    find_library(CRISPASR_ORT_LIBRARY NAMES onnxruntime PATHS "${CRISPASR_ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
+    add_library(moonshine_onnx STATIC moonshine_onnx.cpp moonshine_onnx.h)
+    set_target_properties(moonshine_onnx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(moonshine_onnx PUBLIC cxx_std_17)
+    target_include_directories(moonshine_onnx PRIVATE "${CRISPASR_ORT_INCLUDE}")
+    target_link_libraries(moonshine_onnx PUBLIC moonshine_tokenizer "${CRISPASR_ORT_LIBRARY}")
+    target_compile_definitions(moonshine_onnx PUBLIC CRISPASR_HAS_ONNX=1)
+    target_link_libraries(crispasr-lib PUBLIC moonshine_onnx)
 endif()

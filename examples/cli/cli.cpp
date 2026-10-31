@@ -13,9 +13,10 @@
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
 #include "core/asr_sensitivity.h"      // --sensitivity presets (PLAN.md §W7)
-#include "core/ggml_cpu_backend.h"     // CPU-backend probe — fail fast when no module loads (#405)
-#include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
-#include "core/win_compat.h"           // setenv/unsetenv shims for MSVC
+#include "core/parakeet_gguf.h"
+#include "core/ggml_cpu_backend.h" // CPU-backend probe — fail fast when no module loads (#405)
+#include "core/gpu_backend_pref.h" // crispasr_set_gpu_backend_pref (#214)
+#include "core/win_compat.h"       // setenv/unsetenv shims for MSVC
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -362,6 +363,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.language = whisper_param_turn_lowercase(ARGV_NEXT);
     } else if (arg == "-dl" || arg == "--detect-language") {
         params.detect_language = true;
+    } else if (arg == "--lid-full-recording") {
+        params.lid_full_recording = true;
     } else if (arg == "--prompt") {
         params.prompt = ARGV_NEXT;
     } else if (arg == "--ask") {
@@ -493,6 +496,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         } else {
             fprintf(stderr, "crispasr: --att-context expects \"L,R\" (e.g. 128,128 or -1,-1), got '%s'\n", v.c_str());
         }
+    } else if (arg == "--hikari-stride" || arg == "--hikari-refresh-stride") {
+        params.hikari_refresh_stride = std::stoi(ARGV_NEXT);
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {
@@ -580,6 +585,21 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.stream_continuous = true;
     } else if (arg == "--monitor") {
         params.stream_monitor = true;
+    } else {
+        return false;
+    }
+    return true;
+#undef ARGV_NEXT
+}
+
+// TTS sampling controls shared with the server and Session API.
+static bool whisper_params_parse_arg_tts_sampling(int argc, char** argv, int& i, whisper_params& params) {
+    std::string arg = argv[i];
+#define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
+    if (arg == "--tts-top-k") {
+        params.tts_top_k = std::stoi(ARGV_NEXT);
+    } else if (arg == "--tts-top-p") {
+        params.tts_top_p = std::stof(ARGV_NEXT);
     } else {
         return false;
     }
@@ -680,7 +700,7 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.align_granularity = ARGV_NEXT;
     } else if (arg == "--text-file") {
         params.text_file = ARGV_NEXT;
-    } else if (arg == "--instruct") {
+    } else if (arg == "--instruct" || arg == "--tts-instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--tts-phonemes") {
         params.tts_phonemes = ARGV_NEXT;
@@ -1047,6 +1067,9 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
         if (whisper_params_parse_arg_backend_vad(argc, argv, i, params)) {
             continue;
         }
+        if (whisper_params_parse_arg_tts_sampling(argc, argv, i, params)) {
+            continue;
+        }
         if (whisper_params_parse_arg_streaming_tts(argc, argv, i, params)) {
             continue;
         }
@@ -1093,7 +1116,7 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.hotwords.empty() ? "" : params.hotwords.c_str());
     fprintf(out,
             "             --context TEXT        [%-7s] hotword/context text injected into the prompt "
-            "(vibevoice-asr only)\n",
+            "(qwen3, vibevoice-asr)\n",
             params.context.empty() ? "" : "set");
     fprintf(out,
             "             --prefix-text TEXT    [%-7s] granite incremental decoding: seed the transcript so "
@@ -1184,9 +1207,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.log_score ? "true" : "false");
     fprintf(out, "  -ng,       --no-gpu               [%-7s] disable GPU\n", params.use_gpu ? "false" : "true");
     fprintf(out, "  -dev N,    --device N             [%-7d] GPU device ID (default: 0)\n", params.gpu_device);
-    fprintf(out,
-            "  --gpu-backend NAME                [%-7s] force GPU backend: cuda|vulkan|metal|cpu (default: auto)\n",
-            params.gpu_backend.empty() ? "auto" : params.gpu_backend.c_str());
+    fprintf(
+        out,
+        "  --gpu-backend NAME                [%-7s] force GPU backend: cuda|vulkan|metal|cann|cpu (default: auto)\n",
+        params.gpu_backend.empty() ? "auto" : params.gpu_backend.c_str());
     fprintf(out, "  -fa,       --flash-attn           [%-7s] enable flash attention\n",
             params.flash_attn ? "true" : "false");
     fprintf(out, "  -nfa,      --no-flash-attn        [%-7s] disable flash attention\n",
@@ -1246,6 +1270,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
         params.lid_backend.c_str());
     fprintf(out, "  --lid-model FNAME                 [%-7s] optional LID model path (default ggml-tiny.bin)\n",
             params.lid_model.c_str());
+    fprintf(out,
+            "  --lid-full-recording              [%-7s] opt in to language detection across all 15 s windows; "
+            "duration-weighted vote (default: first 15 s)\n",
+            params.lid_full_recording ? "true" : "false");
     fprintf(out,
             "  --lid-on-transcript FNAME         [%-7s] post-ASR text LID. Path or "
             "'auto[:cld3|glotlid|lid-fasttext176]' (default cld3, auto-downloaded). "
@@ -1464,6 +1492,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "frames (~80ms ea) — true windowed attn (O(T*window) mem, NeMo rel_pos_local_attn); "
             "-1,-1 = full. CRISPASR_FC_WINDOWED_ATTN=0 forces legacy masked-full\n",
             "model");
+    fprintf(out,
+            "             --hikari-stride N      [%-7d] hikari strided encoder refresh interval (0 = exact, K>0)\n",
+            params.hikari_refresh_stride);
     fprintf(out, "             --lcs-dedup VAL        [%-7s] sub-word LCS dedup across chunk boundaries: auto|on|off\n",
             params.lcs_dedup.c_str());
     fprintf(out,
@@ -1591,12 +1622,21 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "moss-tts-local). Units are the backend's AR decode step, NOT samples or ms: one codec frame, "
             "12.5 Hz on the shipped models, so 80 ms each and N=25 floors at ~2 s. -1 = model default\n",
             params.tts_min_speech_tokens);
-    fprintf(
-        out,
-        "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada/irodori; "
-        "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
-        "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
-        "default");
+    fprintf(out,
+            "             --tts-top-k N            [%-7s] TTS top-k cutoff (dia/tada/chatterbox/moss-tts); "
+            "0 disables filtering\n",
+            "default");
+    fprintf(out,
+            "             --tts-top-p X            [%-7s] TTS nucleus threshold (dia/tada/chatterbox/moss-tts); "
+            "1 disables filtering\n",
+            "default");
+    fprintf(out,
+            "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale "
+            "(vibevoice/chatterbox/f5/tada/irodori/bt2-tts; "
+            "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
+            "bt2-tts: applies with --tts-instruct (default 1 = unguided, try 4); "
+            "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
+            "default");
     fprintf(
         out,
         "             --tts-speed X            [%-7.2f] speaking-rate multiplier (kokoro/omnivoice/f5/piper/melotts/"
@@ -2628,8 +2668,17 @@ int main(int argc, char** argv) {
         // never prevented.
         if (!params.gpu_backend.empty()) {
             crispasr_set_gpu_backend_pref(params.gpu_backend.c_str());
+            if (ci_starts_with(params.gpu_backend.c_str(), "cann")) {
+                crispasr_set_gpu_device_pref(params.gpu_device);
+            }
         }
     }
+
+    // #560: --detect-language is an exit action, including when -m names an
+    // invalid or absent ASR model. Route before --hf-repo and model dispatch so
+    // only the selected LID provider may resolve/load a model.
+    if (params.detect_language && !params.server && !params.dry_run_resolve)
+        return crispasr_run_lid_only(params);
 
     // Issue #128 — resolve --hf-repo / --hf-file early, before any
     // model-path interpretation downstream. Synthesise the HF resolve
@@ -2812,6 +2861,11 @@ int main(int argc, char** argv) {
     {
         const bool explicit_backend = !params.backend.empty();
         const bool model_is_auto = is_auto_model_arg(params.model);
+
+        // #551: do not fall through to legacy Whisper or a forced incompatible
+        // loader when a known unsupported GGUF yields an empty detector result.
+        if (!model_is_auto && core_parakeet_gguf::reject_external_file(params.model.c_str()))
+            return 11;
 
         bool auto_detected_non_whisper = false;
         if (!explicit_backend && !model_is_auto) {

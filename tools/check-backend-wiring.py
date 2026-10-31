@@ -185,6 +185,17 @@ def main():
     capi_names = set(re.findall(r'list \+= ",([^"]+)"', capi))
     capi_flat = {n.strip() for entry in capi_names for n in entry.split(",") if n.strip()}
     cli_names = {name for name, _caps in backends}
+    # Source scanning sees #ifdef branches that this binary did not compile.
+    # Moonshine ONNX is optional in BOTH the CLI roster and the C ABI. Use
+    # the audited binary's own CMake cache as evidence that its SDK was off;
+    # without that evidence keep the reverse check fail-closed. ONNX-enabled
+    # builds still receive every normal factory/roster/library check below.
+    cache_path = Path(args.crispasr).resolve().parent.parent / "CMakeCache.txt"
+    if cache_path.is_file():
+        cache = cache_path.read_text(encoding="utf-8", errors="replace")
+        configured = re.search(r"^CRISPASR_ONNXRUNTIME_ROOT:PATH=(.*)$", cache, re.M)
+        if configured is not None and not configured.group(1).strip():
+            capi_flat.discard("moonshine-onnx")
     # A name is fine if the CLI ROSTER lists it *or* the CLI FACTORY resolves it
     # as an alias -- several backends are advertised by the c_api under an alias
     # (canary-ctc, vibevoice-tts, omniasr-llm-unlimited) and are genuinely
@@ -202,7 +213,7 @@ def main():
     # Only the handful not already in the roster need probing.
     def cli_resolves(name):
         r = subprocess.run([args.crispasr, "--backend", name, "-m", os.devnull, "-f", os.devnull],
-                           capture_output=True, text=True)
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
         return f"unknown backend '{name}'" not in (r.stderr + r.stdout)
 
     capi_only = sorted(n for n in capi_flat if n not in cli_names and not cli_resolves(n))
@@ -524,6 +535,16 @@ def main():
     if not go_ok and not is_macos:
         print("   run: python tools/sync_go_cgo_ldflags.py   (see docs/contributing.md)")
 
+    fmatrix_rows = re.findall(r"^\| `([^`]+)` \|", fmatrix, re.M)
+    fmatrix_count = len(fmatrix_rows)
+    readme_match = re.search(r"One C\+\+ binary, (\d+) backends", readme)
+    readme_count = int(readme_match.group(1)) if readme_match else None
+    counts_ok = (readme_count == fmatrix_count)
+    counts_label = f"✅ in sync ({fmatrix_count} backends)" if counts_ok else f"❌ OUT OF SYNC (README: {readme_count}, feature matrix: {fmatrix_count})"
+    print(f"Documentation backend counts check: {counts_label}")
+    if not counts_ok:
+        print("   run: python tools/gen-feature-matrix.py")
+
     # Name the ACTUAL cause. This used to print "FAIL (required gap)" for all
     # four conditions, so a run whose only problem was Go LDFLAGS drift reported
     # a required *wiring* gap two lines below "✅ REQUIRED wiring: ..." — the
@@ -598,6 +619,8 @@ def main():
         causes.append("orphan runtime")
     if not go_ok and not is_macos:
         causes.append("Go cgo LDFLAGS drift")
+    if not counts_ok:
+        causes.append("documentation backend counts out-of-sync")
     print()
     print("RESULT:", f"FAIL ({'; '.join(causes)})" if causes else "PASS")
     return 1 if causes else 0

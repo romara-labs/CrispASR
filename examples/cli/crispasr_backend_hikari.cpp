@@ -74,7 +74,7 @@ std::string token_text(hikari_context* ctx, int32_t id) {
 
 class HikariRealtimeSession final : public CrispasrRealtimeSession {
 public:
-    HikariRealtimeSession(hikari_context* ctx, HikariVad* vad) : ctx_(ctx), vad_(vad) { reset(); }
+    HikariRealtimeSession(hikari_context* ctx, HikariVad* vad) : ctx_(ctx), vad_(vad) { reset_state(); }
 
     bool append(const float* samples, int n_samples, bool flush, callback on_text) override {
         if (n_samples > 0 && hikari_stream_push(ctx_, samples, n_samples) < 0)
@@ -93,14 +93,16 @@ public:
         return true;
     }
 
-    void reset() override {
+    void reset() override { reset_state(); }
+
+private:
+    void reset_state() {
         hikari_stream_reset(ctx_);
         if (vad_)
             vad_->reset();
         last_.clear();
     }
 
-private:
     hikari_context* ctx_;
     HikariVad* vad_;
     std::string last_;
@@ -133,6 +135,12 @@ public:
         pol.wait_penalty_decay = env_f("HIKARI_WP_DECAY", pol.wait_penalty_decay);
         pol.repetition_penalty = env_f("HIKARI_REP", pol.repetition_penalty);
         pol.decoder_context = env_i("HIKARI_CTX", pol.decoder_context);
+        pol.refresh_stride = env_i("HIKARI_STRIDE", env_i("CRISPASR_HIKARI_REFRESH_STRIDE", pol.refresh_stride));
+        if (p.hikari_refresh_stride >= 0) {
+            pol.refresh_stride = p.hikari_refresh_stride;
+        }
+        pol.stride_margin = env_i("HIKARI_STRIDE_MARGIN", pol.stride_margin);
+        pol.stale_tol = env_f("HIKARI_STALE_TOL", pol.stale_tol);
         hikari_set_policy(ctx_, &pol);
         hikari_set_tail_silence_ms(ctx_, env_i("HIKARI_TAIL_MS", 2000));
 

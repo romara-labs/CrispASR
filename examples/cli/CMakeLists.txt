@@ -82,6 +82,7 @@ add_executable(${TARGET}
     crispasr_backend_crepe.cpp
     crispasr_backend_btc.cpp
     crispasr_backend_rvc.cpp
+    crispasr_backend_meanvc2.cpp
     crispasr_piano_cli.cpp
     crispasr_backend_beat_this.cpp
     crispasr_backend_mel_band_roformer.cpp
@@ -94,6 +95,7 @@ add_executable(${TARGET}
     crispasr_backend_mimo_asr.cpp
     crispasr_backend_ark_asr.cpp
     crispasr_backend_miotts.cpp
+    crispasr_backend_arktts.cpp
     crispasr_backend_bt2_tts.cpp
     crispasr_backend_piano_transcription.cpp
     crispasr_backend_basic_pitch.cpp
@@ -293,6 +295,8 @@ target_link_libraries(crispasr-diff PRIVATE
     confucius4-tts
     miotts
     miocodec
+    arktts
+    meanvc2
     breeze_tts_2
     crepe
     omniasr
@@ -301,6 +305,7 @@ target_link_libraries(crispasr-diff PRIVATE
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
+    dia-tts
 )
 install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
 
@@ -432,6 +437,8 @@ target_link_libraries(${TARGET} PRIVATE
     moss_transcribe
     moss_transcribe_diarize
     miotts
+    arktts
+    meanvc2
     breeze_tts_2
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -532,3 +539,8 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(crispasr-repack-probe PRIVATE ggml ggml-base ggml-cpu)
 endif()
 include(DefaultTargetOptions)
+
+if(TARGET moonshine_onnx)
+    target_sources(${TARGET} PRIVATE crispasr_backend_moonshine_onnx.cpp)
+    target_link_libraries(${TARGET} PRIVATE moonshine_onnx)
+endif()

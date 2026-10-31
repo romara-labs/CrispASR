@@ -64,6 +64,18 @@ void    omnivoice_free(struct omnivoice_context * ctx);
 void    omnivoice_sync(struct omnivoice_context * ctx);
 void    omnivoice_set_n_threads(struct omnivoice_context * ctx, int n_threads);
 
+// Configure audio utilities without changing context_params' by-value ABI.
+// Defaults: preprocess=true, postprocess=true, pad/fade=0.1 seconds.
+// postprocess controls silence removal only; fade/pad are independent upstream.
+// Set before loading a reference; changing preprocessing does not re-encode an
+// already-loaded prompt. Durations must be finite and in [0,10]. Returns 0/-1.
+// Environment at init: CRISPASR_OMNIVOICE_PREPROCESS_PROMPT,
+// CRISPASR_OMNIVOICE_POSTPROCESS_OUTPUT (0 disables); *_PAD_DURATION and
+// *_FADE_DURATION (seconds). *_AUDIO_LEGACY=1 restores the prior raw pipeline.
+int omnivoice_set_audio_processing(struct omnivoice_context* ctx, bool preprocess_prompt, bool postprocess_output,
+                                   float pad_duration, float fade_duration);
+
+
 // Compare the unified codec encoder against a reference GGUF containing
 // `input_wav24k` and `codes` tensors. Returns zero when every code matches.
 int omnivoice_encode_diff(struct omnivoice_context * ctx, const char * ref_gguf_path);

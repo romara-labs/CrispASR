@@ -24,6 +24,7 @@
 #include "core/audio_resample.h"
 #include "core/crispasr_env.h"
 #include "core/omnivoice_duration.h"
+#include "core/omnivoice_audio.h"
 #include "core/omnivoice_instruct.h"
 #include "core/omnivoice_lang.h"
 #include "core/wav_reader.h"
@@ -684,6 +685,13 @@ struct omnivoice_context {
     float speed = 1.0f;
     float target_duration_s = 0.0f;
     float env_target_duration_s = 0.0f;
+    bool legacy_audio = false;
+    bool preprocess_prompt = true;
+    bool ref_preprocess_prompt = true;
+    bool postprocess_output = true;
+    float pad_duration = 0.1f;
+    float fade_duration = 0.1f;
+    float ref_rms = 0.0f;
     int num_steps = 32;
     float guidance_scale = 2.0f;
     float class_temperature = 0.0f;
@@ -692,6 +700,21 @@ struct omnivoice_context {
     float t_shift = 0.1f;
     uint64_t seed = 42;
 };
+
+// Shared by the compatibility decoder and its model-free integration test.
+static void omnivoice_process_output(const omnivoice_context & ctx, std::vector<float> & pcm) {
+    if (ctx.postprocess_output) {
+        pcm = core_omnivoice_audio::remove_silence(pcm, 500, 100, 100);
+    }
+    if (!ctx.ref_audio_24k.empty() && ctx.ref_rms < 0.1f && (!ctx.legacy_audio || ctx.ref_rms > 0.0f)) {
+        for (float & sample : pcm) {
+            sample *= ctx.ref_rms / 0.1f;
+        }
+    } else if (ctx.ref_audio_24k.empty() && !ctx.legacy_audio) {
+        peak_normalize_half(pcm);
+    }
+    core_omnivoice_audio::fade_and_pad(pcm, ctx.pad_duration, ctx.fade_duration);
+}
 
 extern "C" {
 
@@ -727,6 +750,27 @@ struct omnivoice_context * omnivoice_init_from_file(const char * path_model,
         return nullptr;
     }
     ctx->model_path = path_model;
+
+    auto audio_bool = [](const char * key, bool fallback) {
+        const char * value = crispasr_env::get(key);
+        return value && *value ? value[0] != '0' : fallback;
+    };
+    ctx->legacy_audio = audio_bool("CRISPASR_OMNIVOICE_AUDIO_LEGACY", false);
+    ctx->preprocess_prompt = audio_bool("CRISPASR_OMNIVOICE_PREPROCESS_PROMPT", !ctx->legacy_audio);
+    ctx->postprocess_output = audio_bool("CRISPASR_OMNIVOICE_POSTPROCESS_OUTPUT", !ctx->legacy_audio);
+    auto audio_duration = [](const char * key, float fallback) {
+        if (const char * value = crispasr_env::get(key)) {
+            char * end = nullptr;
+            const float duration = std::strtof(value, &end);
+            if (end != value && !*end && std::isfinite(duration) && duration >= 0.0f && duration <= 10.0f) {
+                return duration;
+            }
+        }
+        return fallback;
+    };
+    ctx->pad_duration = audio_duration("CRISPASR_OMNIVOICE_PAD_DURATION", ctx->legacy_audio ? 0.0f : 0.1f);
+    ctx->fade_duration = audio_duration("CRISPASR_OMNIVOICE_FADE_DURATION", ctx->legacy_audio ? 0.0f : 0.1f);
+
     ctx->num_steps = params.num_steps > 0 ? params.num_steps : 32;
     ctx->guidance_scale = params.guidance_scale > 0.0f ? params.guidance_scale : 2.0f;
     ctx->class_temperature = params.class_temperature;
@@ -756,6 +800,20 @@ int omnivoice_set_tokenizer_path(struct omnivoice_context * ctx, const char * pa
     return ov_set_codec_path(ctx->ov, path) == OV_STATUS_OK ? 0 : -1;
 }
 
+int omnivoice_set_audio_processing(struct omnivoice_context * ctx, bool preprocess_prompt, bool postprocess_output,
+                                   float pad_duration, float fade_duration) {
+    if (!ctx || !std::isfinite(pad_duration) || !std::isfinite(fade_duration) || pad_duration < 0.0f ||
+        fade_duration < 0.0f || pad_duration > 10.0f || fade_duration > 10.0f) {
+        return -1;
+    }
+    ctx->legacy_audio = false;
+    ctx->preprocess_prompt = preprocess_prompt;
+    ctx->postprocess_output = postprocess_output;
+    ctx->pad_duration = pad_duration;
+    ctx->fade_duration = fade_duration;
+    return 0;
+}
+
 int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_path, const char * ref_text) {
     if (!ctx || !ctx->ov) {
         return -1;
@@ -764,6 +822,7 @@ int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_
     // reference cannot be read.
     ctx->ref_audio_24k.clear();
     ctx->ref_text.clear();
+    ctx->ref_rms = 0.0f;
     if (!wav_path || !*wav_path) {
         return 0;
     }
@@ -780,6 +839,12 @@ int omnivoice_set_voice_prompt(struct omnivoice_context * ctx, const char * wav_
         ov_set_error("omnivoice_set_voice_prompt: empty reference '%s'", wav_path);
         return -1;
     }
+    double sum_sq = 0.0;
+    for (float sample : wav) {
+        sum_sq += (double) sample * sample;
+    }
+    ctx->ref_rms = (float) std::sqrt(sum_sq / wav.size());
+    ctx->ref_preprocess_prompt = ctx->preprocess_prompt;
     ctx->ref_audio_24k = std::move(wav);
     ctx->ref_text = ref_text ? ref_text : "";
     return 0;
@@ -877,6 +942,7 @@ int32_t * omnivoice_synthesize_codes(struct omnivoice_context * ctx, const char 
         // Legacy OmniVoice uses 25 frames per second (24 kHz / 960 hop).
         tp.T_override = std::max(1, (int) std::lround(ctx->target_duration_s * 25.0f));
     }
+    tp.preprocess_prompt = ctx->ref_preprocess_prompt;
     tp.ref_text = ctx->ref_text.c_str();
     if (!ctx->ref_audio_24k.empty()) {
         tp.ref_audio_24k = ctx->ref_audio_24k.data();
@@ -908,8 +974,20 @@ float * omnivoice_decode_codes(struct omnivoice_context * ctx,
         *out_n_samples = 0;
         return nullptr;
     }
-    *out_n_samples = audio.n_samples;
-    return audio.samples;
+    std::vector<float> pcm(audio.samples, audio.samples + audio.n_samples);
+    ov_audio_free(&audio);
+    omnivoice_process_output(*ctx, pcm);
+    *out_n_samples = 0;
+    if (pcm.empty()) {
+        return nullptr;
+    }
+    float * result = (float *) std::malloc(pcm.size() * sizeof(float));
+    if (!result) {
+        return nullptr;
+    }
+    std::memcpy(result, pcm.data(), pcm.size() * sizeof(float));
+    *out_n_samples = (int) pcm.size();
+    return result;
 }
 
 float * omnivoice_synthesize(struct omnivoice_context * ctx, const char * text, int * out_n_samples) {

@@ -2,7 +2,12 @@
 
 #include "crispasr_backend.h"
 #include "whisper_params.h"
+#ifdef CRISPASR_HAS_ONNX
+#include "moonshine_onnx.h"
+#endif
 #include "core/arch_backend_map.h" // #335: general.architecture → backend table, SHARED with the C ABI
+#include "core/backend_aliases.h"
+#include "core/parakeet_gguf.h"
 
 // Forward declarations of per-backend constructors. Each is implemented in
 // its own crispasr_backend_X.cpp file and compiled only if the backend's
@@ -26,7 +31,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_voxtral_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral4b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_higgs_stt_backend();
-std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend(bool context_enabled);
 std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_backend();
@@ -51,6 +56,9 @@ std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend_lang(const char* sole_lang);
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
+#ifdef CRISPASR_HAS_ONNX
+std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_onnx_backend();
+#endif
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
@@ -73,6 +81,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_paraformer_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sidon_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_miotts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_arktts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_bt2_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_piano_transcription_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_basic_pitch_backend();
@@ -106,6 +115,8 @@ std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_bananamind_tts_backend();
 // omnivoice: k2-fsa/OmniVoice — Qwen3-based masked iterative TTS (600+ languages).
 std::unique_ptr<CrispasrBackend> crispasr_make_omnivoice_backend();
+// meanvc2: ASLP MeanVC2 zero-shot streaming voice conversion.
+std::unique_ptr<CrispasrBackend> crispasr_make_meanvc2_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -120,7 +131,8 @@ std::unique_ptr<CrispasrBackend> crispasr_make_omnivoice_backend();
 // Factory
 // ---------------------------------------------------------------------------
 
-std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name) {
+std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& requested_name) {
+    const std::string name = core_backend::canonical_runtime_name(requested_name);
     // "tiron" (#295) is a Whisper large-v3 checkpoint with inline <|speakerN|>
     // markers — it runs on the whisper backend, which auto-detects the speaker
     // vocab and enables the tiron constrained-decoding grammar. The alias only
@@ -168,7 +180,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" || name == "qwen3_17b" || name == "mega-asr" ||
         name == "mega_asr" || name == "megaasr" || name == "raon-speech" || name == "raon-speech-9b" ||
         name == "raon_speech")
-        return crispasr_make_qwen3_backend(); // #455 Raon-Speech rides the qwen3-asr runtime
+        return crispasr_make_qwen3_backend(name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" ||
+                                           name == "qwen3_17b");
     if (name == "fastconformer-ctc" || name == "fastconformer_ctc" || name == "canary-ctc" || name == "canary_ctc")
         return crispasr_make_fastconformer_ctc_backend();
     if (name == "wav2vec2" || name == "hubert" || name == "data2vec")
@@ -192,6 +205,9 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_qwen3_tts_backend();
     if (name == "miotts" || name == "mio-tts" || name == "mio_tts" || name == "miotts-0.6b")
         return crispasr_create_miotts_backend();
+    if (name == "arktts" || name == "ark-tts" || name == "audio8-tts" || name == "audio8" ||
+        name == "audio8-tts-realistic")
+        return crispasr_create_arktts_backend();
     // Breeze TTS 2 (#412). The primary key does NOT lead with the licensor's
     // mark (LICENSE §4); the descriptive aliases are attribution, which §4
     // permits, and keep the model discoverable by the name it is published
@@ -292,12 +308,18 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_tabcnn_backend();
     if (name == "rvc-svc" || name == "rvc" || name == "svc")
         return crispasr_make_rvc_backend();
+    if (name == "meanvc2" || name == "mean-vc2")
+        return crispasr_make_meanvc2_backend();
     if (name == "beat-this" || name == "beatthis" || name == "beat_this" || name == "beats")
         return crispasr_make_beat_this_backend();
     if (name == "kyutai-stt" || name == "kyutai" || name == "moshi-stt" || name == "kyutai-stt-2.6b")
         return crispasr_make_kyutai_stt_backend();
     if (name == "firered-asr" || name == "firered")
         return crispasr_make_firered_asr_backend();
+#ifdef CRISPASR_HAS_ONNX
+    if (name == "moonshine-onnx" || (name.find("moonshine-") == 0 && name.find("-onnx") != std::string::npos))
+        return crispasr_make_moonshine_onnx_backend();
+#endif
     if (name == "moonshine-streaming")
         return crispasr_make_moonshine_streaming_backend();
     if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
@@ -305,7 +327,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     // The de fine-tunes share the runtime but are NOT en-only — the variant's
     // language must ride along or the sole-language guard rejects `-l de` and
     // the #227 auto shortcut mislabels output (found 2026-09-02).
-    if (name == "moonshine-de" || name == "moonshine-tiny-de")
+    if (name == "moonshine-de" || name == "moonshine-tiny-de" || name == "moonshine-tiny-de-dattazigzag")
         return crispasr_make_moonshine_backend_lang("de");
     if (name == "moonshine")
         return crispasr_make_moonshine_backend();
@@ -398,6 +420,8 @@ std::vector<std::string> crispasr_list_backends() {
         "kugelaudio",
         "qwen3-tts",
         "miotts",
+        "arktts",
+        "audio8-tts",
         "bt2-tts",
         "piano-transcription",
         "basic-pitch",
@@ -453,6 +477,13 @@ std::vector<std::string> crispasr_list_backends() {
         "firered-asr",
         "moonshine",
         "moonshine-streaming",
+#ifdef CRISPASR_HAS_ONNX
+        "moonshine-onnx",
+        "moonshine-streaming-small-de-onnx",
+        "moonshine-streaming-tiny-de-onnx",
+        "moonshine-tiny-de-phreak87-onnx",
+#endif
+        "moonshine-tiny-de-dattazigzag",
         "gemma4-e2b",
         "omniasr",
         "omniasr-300m",
@@ -495,6 +526,7 @@ std::vector<std::string> crispasr_list_backends() {
         "btc-chords",
         "tabcnn",
         "rvc-svc",
+        "meanvc2",
         "beat-this",
     };
 }
@@ -665,9 +697,16 @@ void crispasr_print_backend_matrix_json() {
 // Mappings are based on the value that each model's converter writes into
 // the GGUF file. When a converter doesn't write this key we fall back to
 // filename heuristics.
-std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
+static std::string detect_backend_unchecked(const std::string& model_path) {
     if (model_path.empty())
         return "";
+
+#ifdef CRISPASR_HAS_ONNX
+    // Exported ONNX filenames are generic. Inspect their companion config,
+    // using the same detector as the session C ABI before GGUF fallback.
+    if (moonshine_onnx_is_model(model_path.c_str()))
+        return "moonshine-onnx";
+#endif
 
     // ---- Pass 1: filename heuristics ----
     //
@@ -727,6 +766,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "parakeet";
     if (contains_ci("quds"))
         return "parakeet"; // #387: Persian FastConformer-RNNT rides the parakeet runtime
+    if (contains_ci("haas"))
+        return "parakeet";
 
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
@@ -828,6 +869,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "firered-asr";
     if (contains_ci("gemma") && (contains_ci("e2b") || contains_ci("4-e2b")))
         return "gemma4-e2b";
+    if (contains_ci("moonshine") && contains_ci("onnx"))
+        return "moonshine-onnx";
     if (contains_ci("moonshine") && contains_ci("streaming"))
         return "moonshine-streaming";
     // The de fine-tune must resolve to its variant name so the factory hands
@@ -877,6 +920,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "moss-audio";
     if (contains_ci("miotts"))
         return "miotts";
+    if (contains_ci("arktts") || contains_ci("audio8"))
+        return "arktts";
     if (contains_ci("piano") && contains_ci("transcription"))
         return "piano-transcription";
     if (contains_ci("basic") && contains_ci("pitch"))
@@ -922,27 +967,22 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     return result;
 }
 
+std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
+    const std::string backend = detect_backend_unchecked(model_path);
+    if (core_parakeet_gguf::family_backend(backend.c_str()) &&
+        core_parakeet_gguf::reject_external_file(model_path.c_str(), false))
+        return "";
+    return backend;
+}
+
 bool crispasr_gguf_is_pure_ctc(const std::string& model_path) {
-    // Mirror the parakeet backend's pure-CTC guard (src/parakeet.cpp): a NeMo
-    // EncDecCTCModelBPE (parakeet-ctc-*, stt_*_fastconformer_ctc) has an encoder +
-    // CTC head but NO RNN-T prediction network / joint — so it lacks both the
-    // single-embedding predictor (decoder.embed.weight) and the LSTM predictor
-    // (decoder.lstm.0.w_ih). Reads tensor infos only; no weights loaded.
+    // Require positive evidence of the encoder/head schema our CTC loader uses.
+    // Absence of familiar predictor names alone also matches foreign RNN-T GGUFs.
     struct gguf_init_params gip = {/*.no_alloc=*/true, /*.ctx=*/nullptr};
     gguf_context* gctx = gguf_init_from_file(model_path.c_str(), gip);
     if (!gctx)
         return false;
-    bool has_embed = false, has_lstm = false;
-    const int64_t n_tensors = gguf_get_n_tensors(gctx);
-    for (int64_t i = 0; i < n_tensors; i++) {
-        const char* name = gguf_get_tensor_name(gctx, i);
-        if (!name)
-            continue;
-        if (std::strcmp(name, "decoder.embed.weight") == 0)
-            has_embed = true;
-        else if (std::strcmp(name, "decoder.lstm.0.w_ih") == 0)
-            has_lstm = true;
-    }
+    const bool ctc = core_parakeet_gguf::compatible_ctc(gctx);
     gguf_free(gctx);
-    return !has_embed && !has_lstm;
+    return ctc;
 }

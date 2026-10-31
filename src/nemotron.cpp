@@ -829,6 +829,12 @@ static std::vector<float> nemotron_compute_mel_impl(nemotron_context* ctx, const
 
     auto mel = core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, nemotron_fft_r2c,
                                  p, T_out);
+    // NeMo FilterbankFeatures.get_seq_len uses floor(n_samples / hop) with
+    // centered STFT, then masks frames at/after that length to pad_value=0.
+    // Keep the STFT shape; its extra terminal frame is not a valid feature.
+    const int valid_frames = n_samples / hop;
+    if (valid_frames < T_out)
+        std::fill(mel.begin() + (size_t)valid_frames * n_mels, mel.end(), 0.0f);
     return mel;
 }
 
@@ -3306,6 +3312,7 @@ static void nemotron_apply_prompt(nemotron_context* ctx, std::vector<float>& enc
 struct nemotron_stream {
     nemotron_context* ctx = nullptr;
     std::vector<float> audio;
+    std::vector<float> pending; // caller packets are regrouped into canonical steps
     size_t audio_offset = 0;
     bool full_recompute = false; // backend default and control gates, read when a turn starts
     size_t frontend_checked_samples = 0;
@@ -3389,6 +3396,7 @@ static bool nemotron_stream_full_frontend(const nemotron_context* ctx) {
 
 static void nemotron_stream_clear(nemotron_stream* stream) {
     stream->audio.clear();
+    stream->pending.clear();
     stream->audio_offset = 0;
     stream->full_recompute = nemotron_stream_full_frontend(stream->ctx);
     stream->processed_pre_frames = 0;
@@ -3648,8 +3656,19 @@ extern "C" int nemotron_stream_processed_frames(const struct nemotron_stream* st
     return stream ? stream->encoder_frames_computed : 0;
 }
 
-extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
-                                       nemotron_token_cb cb, void* userdata) {
+static size_t nemotron_stream_step_samples(nemotron_context* ctx) {
+    const auto& hp = ctx->model.hparams;
+    int chunks = core_cpu_backend::is_cpu(ctx->backend) ? 4 : 1;
+    if (const char* value = crispasr_env::get("CRISPASR_NEMOTRON_STREAM_CHUNKS_PER_STEP")) {
+        const int n = atoi(value);
+        if (n >= 1)
+            chunks = n;
+    }
+    return (size_t)hp.hop_length * 8 * (hp.att_context_right[ctx->att_context_preset] + 1) * chunks;
+}
+
+static bool nemotron_stream_append_impl(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
+                                        nemotron_token_cb cb, void* userdata) {
     if (!stream || !stream->ctx || n_samples < 0 || (n_samples > 0 && !samples))
         return false;
     if (n_samples > 0)
@@ -3667,13 +3686,7 @@ extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const flo
     // cannot safely outlive sched_reset (#215e). Amortize that fixed cost on
     // CPU while retaining the model's native single-chunk cadence on GPU.
     // CRISPASR_NEMOTRON_STREAM_CHUNKS_PER_STEP sets how many chunks are gathered per step.
-    int chunks_per_step = core_cpu_backend::is_cpu(ctx->backend) ? 4 : 1;
-    if (const char* v = crispasr_env::get("CRISPASR_NEMOTRON_STREAM_CHUNKS_PER_STEP")) {
-        int n = atoi(v);
-        if (n >= 1)
-            chunks_per_step = n;
-    }
-    const size_t raw_chunk_samples = frame_samples * chunk_size * chunks_per_step;
+    const size_t raw_chunk_samples = nemotron_stream_step_samples(ctx);
     const size_t total_samples = stream->audio_offset + stream->audio.size();
     if (!flush && total_samples - stream->frontend_checked_samples < raw_chunk_samples)
         return true;
@@ -3756,6 +3769,34 @@ extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const flo
         fprintf(stderr, "nemotron: stream advanced %d new encoder frames (computed_total=%d)\n", n_new,
                 stream->encoder_frames_computed);
     return true;
+}
+
+// Packetization belongs to the recognizer, not the microphone. Calling the
+// frontend at 23,101 samples versus 20,480 changes its normalization/right
+// edge and can change words. Always process the same canonical audio prefixes
+// regardless of how capture/network packets happen to be split.
+extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
+                                       nemotron_token_cb cb, void* userdata) {
+    if (!stream || !stream->ctx || n_samples < 0 || (n_samples > 0 && !samples))
+        return false;
+    if (n_samples)
+        stream->pending.insert(stream->pending.end(), samples, samples + n_samples);
+    const size_t step = nemotron_stream_step_samples(stream->ctx);
+    size_t consumed = 0;
+    while (stream->pending.size() - consumed >= step) {
+        if (!nemotron_stream_append_impl(stream, stream->pending.data() + consumed, (int)step, false, cb, userdata))
+            return false;
+        consumed += step;
+    }
+    if (consumed)
+        stream->pending.erase(stream->pending.begin(), stream->pending.begin() + consumed);
+    if (!flush)
+        return true;
+    const bool ok =
+        nemotron_stream_append_impl(stream, stream->pending.data(), (int)stream->pending.size(), true, cb, userdata);
+    if (ok)
+        stream->pending.clear();
+    return ok;
 }
 
 extern "C" void nemotron_set_context_preset(struct nemotron_context* ctx, int preset) {
@@ -3842,6 +3883,29 @@ extern "C" float* nemotron_compute_mel(struct nemotron_context* ctx, const float
         *out_T_mel = T_mel;
     float* ret = (float*)malloc(mel.size() * sizeof(float));
     memcpy(ret, mel.data(), mel.size() * sizeof(float));
+    return ret;
+}
+
+extern "C" float* nemotron_run_preencode_ext(struct nemotron_context* ctx, const float* mel, int n_mels, int T_mel,
+                                             int* out_T_enc, int* out_d_model) {
+    if (out_T_enc)
+        *out_T_enc = 0;
+    if (out_d_model)
+        *out_d_model = 0;
+    if (!ctx || !mel || T_mel <= 0 || n_mels != (int)ctx->model.hparams.n_mels)
+        return nullptr;
+    std::vector<float> pre_enc;
+    int T_enc = 0, d_model = 0;
+    if (!nemotron_run_preencode(ctx, mel, T_mel, pre_enc, T_enc, d_model))
+        return nullptr;
+    float* ret = (float*)malloc(pre_enc.size() * sizeof(float));
+    if (!ret)
+        return nullptr;
+    memcpy(ret, pre_enc.data(), pre_enc.size() * sizeof(float));
+    if (out_T_enc)
+        *out_T_enc = T_enc;
+    if (out_d_model)
+        *out_d_model = d_model;
     return ret;
 }
 

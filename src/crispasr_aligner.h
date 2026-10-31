@@ -33,10 +33,17 @@
 #include <string>
 #include <vector>
 
+struct CrispasrAlignedCharacter {
+    std::string text;
+    int64_t t0_cs = 0;
+    int64_t t1_cs = 0;
+};
+
 struct CrispasrAlignedWord {
     std::string text;
     int64_t t0_cs = 0; // centiseconds, absolute (includes t_offset_cs)
     int64_t t1_cs = 0;
+    std::vector<CrispasrAlignedCharacter> characters{}; // measured wav2vec2 CTC labels only
 };
 
 /// A re-timed segment: one input SRT cue (or one text line) with timings
@@ -105,6 +112,11 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// or GGUF architecture identifies that family. Models load and free inside the call —
 /// cost is dominated by the ASR pass upstream, not the aligner load.
 ///
+/// Canary/FastConformer inference uses overlapping encoder windows for long
+/// input (30-second cores by default), then one global transcript alignment.
+/// chunk_seconds changes the core duration; zero explicitly disables windowing.
+/// Host logits/DP memory still scales with recording length. VAD is not applied.
+///
 /// Returns an empty vector on any failure (error printed to stderr).
 ///
 /// When `out_load_failed` is non-null it is set to `true` iff the aligner
@@ -116,7 +128,8 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// false-positives.
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads, bool* out_load_failed = nullptr);
+                                                      int n_threads, bool* out_load_failed = nullptr,
+                                                      int chunk_seconds = 30);
 
 /// Free the cached aligner model context (§176e). Call at shutdown.
 void crispasr_aligner_free_cache();

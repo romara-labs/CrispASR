@@ -44,8 +44,10 @@ static const std::vector<std::pair<std::string, std::string>>& converter_archs()
         // ── ASR ──
         {"whisper", "whisper"},
         {"parakeet", "parakeet"},
+        {"haas", "parakeet"},
         {"nemotron", "nemotron"},
         {"gigaam", "gigaam"},
+        {"dolphin", "dolphin"},
         {"canary", "canary"},
         {"canary_qwen", "canary-qwen"},
         {"index_echo", "index-echo"},
@@ -81,6 +83,7 @@ static const std::vector<std::pair<std::string, std::string>>& converter_archs()
         // ── TTS ──
         {"qwen3tts", "qwen3-tts"},
         {"miotts", "miotts"},
+        {"arktts", "arktts"},
         {"moss-tts", "moss-tts"},
         {"moss-tts-local", "moss-tts-local"},
         {"orpheus", "orpheus"},
@@ -185,6 +188,7 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "parakeet",
         "nemotron",
         "gigaam",
+        "dolphin",
         "canary",
         "canary-qwen",
         "index-echo",
@@ -270,6 +274,8 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "mt3",
         "bt2-tts", // Breeze-TTS-2 (#412)
         "hikari",  // sbintuitions/hikari-medium
+        "arktts",
+        "meanvc2",
     };
     size_t n = 0;
     const core_arch::entry* k = core_arch::table(&n);
@@ -354,6 +360,7 @@ TEST_CASE("crispasr_detect_backend_from_gguf reads the shared table", "[unit][ar
     const probe probes[] = {
         {"granite_speech", "granite"}, // #335
         {"nemotron", "nemotron"},      // was CLI-only too
+        {"dolphin", "dolphin"},        // #540: full model passed diff, automatic bindings failed
         {"qwen3tts", "qwen3-tts"},     // ditto
         {"whisper", "whisper"},        // was already shared — must not regress
         {"not-a-real-architecture", ""},

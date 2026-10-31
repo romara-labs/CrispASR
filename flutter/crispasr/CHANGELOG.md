@@ -2,6 +2,99 @@
 
 ## Unreleased
 
+## 0.8.49
+
+* **Native speech:** integrate Audio8-TTS (ArkTTS 0.6B) dual-autoregressive TTS
+  and causal neural vocoder; chunked causal decoding bounds memory (<2.5 GB) for
+  arbitrary audio lengths, with FASTCONV k=1 bypass and dual-transformer KV caching.
+* **Recognition:** support free-form transcription context in Qwen3-ASR (#559);
+  standalone LID mode exits before model load, and dominant language detection
+  spans full recordings (#560).
+* **Streaming & Context:** adaptive strided audio context gating for Hikari and
+  Parakeet; Moonshine attention mask caching.
+* **Bindings:** synchronize audio context and strided refresh parameters across
+  Dart, Go, Rust, Python, JavaScript, and C ABI.
+
+## 0.8.48
+
+* **Native speech:** restore original Melo/OpenVoice conditioning, duration and
+  decoder behavior; preserve output rates and reject invalid speaker choices.
+* **Models:** managed Melo V2 downloads select the qualified F16 BERT companion
+  with immutable source pins and separate Apache-2.0 attribution.
+* **Recognition and CLI:** preserve standalone Parakeet word boundaries and
+  make standalone language detection exit before loading an ASR model.
+* Public Dart interfaces are unchanged. CPU/T4 speech acceptance is bounded to
+  the documented English profile; additional GPU families remain unverified.
+
+## 0.8.47
+
+* **Packaging:** Linux GPU Python wheels and native bundles (#557). Dart
+  interfaces and native inference are unchanged.
+
+## 0.8.46
+
+* **Models:** the managed Nemotron download now selects the original-qualified
+  F16 model with its OpenMDW-1.1 notices; the former plain Q4 default failed
+  fixed original-model controls. Public Dart interfaces are unchanged.
+
+## 0.8.45
+
+* **Native speech:** restore original CSM rotary scaling for both transformer
+  stacks and shared CLI/C ABI initialization.
+* **Models:** add the qualified Granite Speech5 F16/Q4_K profiles and model-matched
+  Qwen3-TTS designed voice packs with retained source/license provenance.
+* **Bindings:** decode incomplete UTF-8 safely in Dart results and preserve
+  native synthesis errors in the Rust wrapper. Public Dart interfaces are unchanged.
+
+## 0.8.44
+
+* **Native results and alignment:** preserve owned Session token metadata and
+  structured diarization results; bound long CTC encoder windows and expose
+  aligner cache release through Python/native APIs.
+* **Native runtime:** fix Dolphin decoding, Breeze instructions/reference audio
+  and server voice handling, Whisper callback/parallel timelines, and TTS
+  reference ownership and sample rates.
+* **Bindings:** harden speaker-result validation, native lifetimes and callback
+  ownership across the supported wrappers. Raw low-level handles still require
+  caller serialization.
+* **Distribution:** ship both public native headers consistently and verify
+  clean installed-wheel loading. Optional CANN NZ caching stays off by default;
+  experimental quantizations and unmerged OmniVoice/Conv1D changes are excluded.
+* **Model downloads:** retain explicit ordinary-NC opt-ins and require separate
+  acknowledgment for OmniVoice companion terms and OpenRAIL restrictions.
+
+## 0.8.43
+
+* **Transcript correctness:** preserve UTF-8 continuation bytes during cleanup
+  and sanitize malformed result bytes before native callbacks/getters publish
+  them, retaining strict binding decoding.
+* **Session audio/control fixes:** VoxCPM2 synthesis reports its native 48 kHz
+  rate; Breeze sessions forward temperature, 64-bit seed and token limits,
+  including restoration of the model limit when cleared.
+* **Native discovery:** canonical capabilities include Hikari and German
+  Dattazigzag Moonshine; ggml plugins are found beside the loaded native library.
+* **Native inference:** Nemotron frontend padding/length masks match reference
+  behavior; HTDemucs Q8 attention avoids unsupported Metal contiguous copies.
+* **Distribution:** packages use immutable source pins and checked CUDA runtime
+  pairing. Experimental quantizations and pending Breeze instruction/voice-cache
+  features are excluded. The Dart API is unchanged.
+
+## 0.8.42
+
+* **Persistent streaming:** `streamKind` exposes unavailable, rolling-window,
+  persistent-cache and text-prefix implementations. Nemotron, Qwen3-ASR and
+  Voxtral use their native streaming paths through the session API.
+* **German Moonshine:** native and ONNX deployments, model detection and
+  streaming/session support.
+* **Live translation:** Marian translation models and direction selection;
+  Hikari simultaneous English ASR and speech translation to German, Japanese
+  and Russian.
+* **Native fixes:** Arabic word/character alignment, Qwen3 hotword prompt
+  forwarding, MiMo device/verbosity settings, and MioTTS output/voice handling.
+* **Distribution:** ggml Metal fixes, synchronized bindings/capabilities and
+  improved Windows CUDA diagnostics. Experimental PR #492 precision changes
+  remain excluded; production model/precision defaults are unchanged.
+
 ## 0.8.41
 
 * **Native Index-Echo:** validated 9B F16 translation with a matching decoder,

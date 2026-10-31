@@ -130,6 +130,7 @@ struct granite_speech_hparams {
     uint32_t llm_head_dim = 128;
     uint32_t llm_ff_dim = 4096;
     float llm_rope_theta = 10000.0f;
+    core_granite_llm::RopeScaling llm_rope;
     float llm_rms_eps = 1e-5f;
     uint32_t llm_vocab_size = 100353;
 
@@ -415,6 +416,21 @@ static bool granite_speech_load_model(granite_speech_model& model, const char* p
         hp.llm_head_dim = core_gguf::kv_u32(g, "granite_speech.llm.head_dim", hp.llm_head_dim);
         hp.llm_ff_dim = core_gguf::kv_u32(g, "granite_speech.llm.ff_dim", hp.llm_ff_dim);
         hp.llm_rope_theta = core_gguf::kv_f32(g, "granite_speech.llm.rope_theta", hp.llm_rope_theta);
+        const std::string rope_type = core_gguf::kv_str(g, "granite_speech.llm.rope_scaling.type", "default");
+        if (rope_type != "default") {
+            const float factor = core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.factor", 0.0f);
+            const int original_ctx = core_gguf::kv_u32(g, "granite_speech.llm.rope_scaling.original_context", 0);
+            const float attention_factor =
+                core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.attention_factor", 0.0f);
+            const float beta_fast = core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.beta_fast", 32.0f);
+            const float beta_slow = core_gguf::kv_f32(g, "granite_speech.llm.rope_scaling.beta_slow", 1.0f);
+            if (rope_type != "yarn" || !core_granite_llm::configure_yarn(hp.llm_rope, factor, original_ctx,
+                                                                         attention_factor, beta_fast, beta_slow)) {
+                fprintf(stderr, "granite_speech: unsupported or invalid RoPE scaling metadata\n");
+                core_gguf::free_metadata(g);
+                return false;
+            }
+        }
         hp.llm_rms_eps = core_gguf::kv_f32(g, "granite_speech.llm.rms_norm_eps", hp.llm_rms_eps);
         hp.llm_vocab_size = core_gguf::kv_u32(g, "granite_speech.llm.vocab_size", hp.llm_vocab_size);
 
@@ -1756,7 +1772,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
         // Shaw block attention on CPU
         core_conformer_ibm::shaw_block_attention_cpu(attn_out.data(), Q.data(), K.data(), V.data(),
                                                      rpe_per_layer[il].empty() ? nullptr : rpe_per_layer[il].data(), T,
-                                                     n_heads, hd, ctx_size, attn_scale, remainder);
+                                                     n_heads, hd, ctx_size, attn_scale, remainder, ctx->n_threads);
 
         if (ctx->params.verbosity >= 2 && il == 0) {
             fprintf(stderr, "  L0 after attn[0][:4] = %.4f %.4f %.4f %.4f\n", attn_out[0], attn_out[1], attn_out[2],
@@ -1796,7 +1812,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
             if (b.post_norm_b)
                 ggml_backend_tensor_get(b.post_norm_b, nb.data(), 0, d * sizeof(float));
             core_cpu::layernorm(hidden.data(), hidden.data(), b.post_norm_w ? nw.data() : nullptr,
-                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
+                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f, ctx->n_threads);
         }
 
         // PLUS: snapshot the post-norm hidden state at any cat_layer index.
@@ -2216,6 +2232,7 @@ static ggml_cgraph* granite_build_llm_kv(granite_speech_context* ctx, int n_past
     llm_hp.head_dim = (int)hp.llm_head_dim;
     llm_hp.rms_eps = hp.llm_rms_eps;
     llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.rope = hp.llm_rope;
     llm_hp.embedding_multiplier = hp.embedding_multiplier;
     llm_hp.attention_multiplier = hp.attention_multiplier;
     llm_hp.residual_multiplier = hp.residual_multiplier;
@@ -2475,6 +2492,7 @@ static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int
     llm_hp.head_dim = (int)hp.llm_head_dim;
     llm_hp.rms_eps = hp.llm_rms_eps;
     llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.rope = hp.llm_rope;
     llm_hp.embedding_multiplier = hp.embedding_multiplier;
     llm_hp.attention_multiplier = hp.attention_multiplier;
     llm_hp.residual_multiplier = hp.residual_multiplier;
@@ -2620,6 +2638,7 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
     llm_hp.head_dim = (int)hp.llm_head_dim;
     llm_hp.rms_eps = hp.llm_rms_eps;
     llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.rope = hp.llm_rope;
     llm_hp.embedding_multiplier = hp.embedding_multiplier;
     llm_hp.attention_multiplier = hp.attention_multiplier;
     llm_hp.residual_multiplier = hp.residual_multiplier;
