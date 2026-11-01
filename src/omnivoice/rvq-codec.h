@@ -68,8 +68,7 @@ static bool rvq_load(RVQCodec * rvq, WeightCtx * wctx, const GGUFModel & gf) {
         }
 
         // Precompute ||embed[:, j]||^2 per codebook entry j on CPU side.
-        // The codebook is stored either F32 (preserved native precision for
-        // accurate residual chain) or BF16 (downcast). We branch on the source
+        // The codebook may be F32, F16 or BF16. We branch on the source
         // dtype to decode each value to f32 once, then accumulate squared sums
         // per entry.
         // Memory layout: embed ne=(codebook_dim, codebook_size) row-major
@@ -87,6 +86,8 @@ static bool rvq_load(RVQCodec * rvq, WeightCtx * wctx, const GGUFModel & gf) {
                 float v;
                 if (embed_type == GGML_TYPE_F32) {
                     v = ((const float *) raw_embed)[j * rvq->codebook_dim + i];
+                } else if (embed_type == GGML_TYPE_F16) {
+                    v = ggml_fp16_to_fp32(((const ggml_fp16_t *) raw_embed)[j * rvq->codebook_dim + i]);
                 } else {
                     v = ggml_bf16_to_fp32(((const ggml_bf16_t *) raw_embed)[j * rvq->codebook_dim + i]);
                 }

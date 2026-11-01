@@ -95,6 +95,8 @@ static void dac_load_alpha(struct ggml_tensor * dst, const GGUFModel & gf, const
         float a;
         if (mt->type == GGML_TYPE_F32) {
             a = ((const float *) raw)[i];
+        } else if (mt->type == GGML_TYPE_F16) {
+            a = ggml_fp16_to_fp32(((const ggml_fp16_t *) raw)[i]);
         } else {
             a = ggml_bf16_to_fp32(((const ggml_bf16_t *) raw)[i]);
         }
@@ -118,7 +120,8 @@ static void dac_load_bias_f32(struct ggml_tensor * dst, const GGUFModel & gf, co
     }
     std::vector<float> d(C);
     for (int i = 0; i < C; i++) {
-        d[i] = ggml_bf16_to_fp32(((const ggml_bf16_t *) raw)[i]);
+        d[i] = mt->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) raw)[i])
+                                       : ggml_bf16_to_fp32(((const ggml_bf16_t *) raw)[i]);
     }
     ggml_backend_tensor_set(dst, d.data(), 0, (size_t) C * sizeof(float));
 }

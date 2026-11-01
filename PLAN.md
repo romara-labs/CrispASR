@@ -12,6 +12,13 @@ acceptance) is in [the handoff, "Open tasks"](docs/maintenance-handoff.md#open-t
 
 ## NOW — release verification and nightly diagnosis (2026-10-30)
 
+### CLAIMED 2026-10-31 — Romara GPU and real TTS validation
+
+- Owner: Codex; current checkout / `kokoro-omnivoice-realtime`; source `8cba72951`.
+- Scope: actual Radeon Vulkan execution and CPU/GPU real synthesis for Kokoro and the active complete OmniVoice runtime; preserve source models and retain generated audio/log evidence.
+- Gates: finite/non-silent PCM, speech readback, matching settings, physical GPU execution evidence, and explicit failure reporting.
+- Result 2026-10-31: DONE. Device `AMD Radeon RX 7900 XT (RADV NAVI31)` via Vulkan0 (probe: `fp16: 1 | bf16: 0`). Kokoro CPU/GPU/full-GPU-gen all read back "The quick brown fox jumps over the lazy dog." (PCM RMS 0.0468 across all three; `KOKORO_GEN_FORCE_METAL=1` ran the iSTFTNet generator on Vulkan without the Metal hang, GPU busy up to 38%). OmniVoice F16 initially produced noise; root cause: `dac_load_alpha`/`dac_load_bias_f32`/`rvq_load` read F16 payloads as BF16 — fixed, regression `test_f16_codec_readers` fails pre-fix and passes post-fix, 53/53 omnivoice CTests pass. Post-fix OmniVoice F16 says "Hello world." on CPU and Vulkan (LM+codec on Vulkan0, RTF 6.50 -> 0.723). Adapter round-trip byte-verified 312 LM + 486 codec tensors. Evidence: `/tmp/crispasr-gpu-validation-20261031/` (wavs, logs, ASR transcripts, util samples, `model-adapter-proof.json`).
+
 ### Main integration follow-up — 2026-10-31
 
 - Owner: audit repair team; source `d71788aa769334940d12096b549f5edd2f7770e7`.
