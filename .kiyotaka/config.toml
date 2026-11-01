@@ -1,0 +1,109 @@
+# Kiyotaka — The White Room Framework
+
+[framework]
+name = "kiyotaka"
+version = "1.0.0"
+
+[mode]
+selected = "project_evolution"
+allow_mode_switch = true
+
+[output]
+profiles = "_kiyotaka_profiles"
+plan = "_kiyotaka_plan"
+security = "_kiyotaka_security"
+project = "_kiyotaka_project"
+interrogation = "_kiyotaka_interrogation"
+cleanroom = "_kiyotaka_cleanroom"
+replication = "_kiyotaka_replication"
+
+[methodology]
+observe_first = true
+model_before_action = true
+atomic_tasks = true
+test_first_when_possible = true
+document_decisions = true
+minimal_intervention = true
+
+[agents]
+installed = ["kiyotaka", "kiyotaka-observer", "kiyotaka-excavator", "kiyotaka-architect-reader", "kiyotaka-recorder", "kiyotaka-verifier", "kiyotaka-interrogator", "kiyotaka-assumption-hunter", "kiyotaka-source-tracer", "kiyotaka-coverage-mapper", "kiyotaka-hallucination-detector", "kiyotaka-blocker-judge", "kiyotaka-plan-corrector", "kiyotaka-facade-operator", "kiyotaka-incentive-mapper", "kiyotaka-authority-reader", "kiyotaka-humanity-guard", "kiyotaka-mimic", "kiyotaka-chameleon", "kiyotaka-shadow", "kiyotaka-mentor", "kiyotaka-trainer", "kiyotaka-pair"]
+
+[engines]
+installed_engines = ["claude-code", "codex", "opencode"]
+
+[capabilities]
+optional_capabilities = ["strategic_persona", "style_replication", "support_companions", "security_hardening", "clean_architecture", "documentation", "test_strategy", "adr", "mermaid"]
+
+[profiles]
+granularity = "hybrid"
+confidence_required = "medium"
+evidence_required = true
+
+[planning]
+task_system = "TK"
+acceptance_criteria_required = true
+tests_required = true
+adr_required_for_architecture_changes = true
+
+[security]
+defensive_only = true
+threat_model_required = true
+data_lineage_required = true
+security_tests_required = true
+remediation_plan_required = true
+
+[project_evolution]
+document_current_code = true
+clean_code_plan = true
+clean_architecture_plan = true
+regression_guard_required = true
+
+[legacy_cleanroom]
+enabled = false
+output = "_kiyotaka_cleanroom"
+strict_role_isolation = true
+team_a_can_view_target = true
+team_b_can_view_target = false
+validation_required = true
+contamination_log_required = true
+confidence_required = true
+golden_datasets_required = true
+parity_tests_required = true
+handoff_required = true
+
+[legacy_cleanroom.confidence]
+default = "low"
+require_evidence_for_claims = true
+allow_unverified_claims = false
+
+[legacy_cleanroom.contamination]
+block_internal_names = true
+block_pseudocode_copy = true
+block_private_structure_leakage = true
+require_contamination_review_before_handoff = true
+
+[global_skills.shadow_orchestration]
+enabled = true
+require_base_plan = true
+default_disposal = "archive"
+max_active_agents = 10
+
+[commands]
+require_kiyotaka_prefix = true
+
+[commands.aliases]
+shadow_orchestrate = "kiyotaka-shadow-orchestrate"
+spawn_agent = "kiyotaka-spawn-agent"
+delegate = "kiyotaka-delegate"
+synthesize_agents = "kiyotaka-synthesize-agents"
+planner_mode = "kiyotaka-planner-mode"
+
+[planner_mode]
+enabled = true
+command = "kiyotaka-planner-mode"
+require_plan_input = true
+require_task_generation = true
+require_backlog_patch = true
+require_progress_update = true
+block_execution_without_bk_or_tk = true
+allow_direct_execution = false

@@ -1,0 +1,11 @@
+# CrispASR — Kiyotaka Progress (project_evolution)
+
+## 2026-06-25
+- project_evolution completo: observation → excavation → architecture → recording → verification (97% confiança, 33 claims).
+
+## 2026-06-28
+- Re-observação do delta (kokoro/omnivoice/lstm não capturado em 25/06): _kiyotaka_project/observation-delta-2026-06-28.md.
+- Escavação do delta: _kiyotaka_project/excavation-delta-2026-06-28.md (Z1/Z2/Z3/Z4, R1, D2/D3).
+- Provenância confirmada: omnivoice ← omnivoice.cpp-master; kokoro Full-GGUF ← voicer.cpp/src/kokoro; ambas migrações com erros residuais (WIP).
+- planner-mode PATCH_PLAN: TK-0006..TK-0011 gerados (delta stabilization). Próxima tarefa segura: TK-0006 (Z1-test).
+- Decisões do mantenedor: D4 descartado (risco aceito); Z1 testar+corrigir; R1 documentar+ajustar; D2/D3 estabilizar. Autorização de edição escopada aos TK-0006..0011.

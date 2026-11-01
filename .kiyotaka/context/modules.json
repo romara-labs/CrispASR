@@ -1,0 +1,282 @@
+{
+  "modules": [
+    {
+      "name": "core_engine",
+      "path": "src/",
+      "purpose": "Central orchestrator and all model implementations",
+      "files": 269,
+      "lines_of_code": "~150k+",
+      "languages": ["C++17", "C99"],
+      "complexity": "very-high",
+      "developer_signature": {
+        "naming": "snake_case with whisper_/crispasr_ prefix; PascalCase classes; ALL_CAPS macros; PLAN-tagged comments",
+        "function_length": "mixed",
+        "comment_style": "moderate",
+        "error_handling": "assert-abort (CRISPASR_ASSERT, GGML_ASSERT) + return codes; no exceptions",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 29,
+        "fixmes": 3,
+        "hacks": 0,
+        "dead_code": "minimal (legacy batch API, commented debug prints)",
+        "refactoring_habits": "reactive"
+      },
+      "patterns": [
+        { "name": "God Object (whisper_state)", "type": "anti-pattern", "frequency": "ubiquitous", "evidence": ["src/crispasr.cpp:1300-1401"] },
+        { "name": "Global Mutable State (g_cpu_pools, g_state)", "type": "anti-pattern", "frequency": "occasional", "evidence": ["src/crispasr.cpp:208-209", "src/crispasr.cpp:1426"] },
+        { "name": "Backend Scheduler", "type": "architectural", "frequency": "ubiquitous", "evidence": ["src/crispasr.cpp:1788"] },
+        { "name": "KV Cache", "type": "structural", "frequency": "ubiquitous", "evidence": ["src/crispasr.cpp:1433-1479"] },
+        { "name": "Grammar-Constrained Sampling", "type": "behavioral", "frequency": "occasional", "evidence": ["src/crispasr.cpp:5919-6194"] },
+        { "name": "Monolithic file (9,550 LOC)", "type": "anti-pattern", "frequency": "ubiquitous", "evidence": ["src/crispasr.cpp"] }
+      ],
+      "data_structures": [
+        { "name": "whisper_state", "type": "model", "file": "src/crispasr.cpp", "fields": 40 },
+        { "name": "whisper_context", "type": "model", "file": "src/crispasr.cpp", "fields": 10 },
+        { "name": "whisper_model", "type": "model", "file": "src/crispasr.cpp", "fields": 15 },
+        { "name": "whisper_vocab", "type": "model", "file": "src/crispasr.cpp", "fields": 8 }
+      ]
+    },
+    {
+      "name": "c_api_facade",
+      "path": "src/crispasr_c_api.cpp",
+      "purpose": "C-ABI facade wrapping 40+ model backends",
+      "files": 1,
+      "lines_of_code": 7752,
+      "languages": ["C++17"],
+      "complexity": "high",
+      "developer_signature": {
+        "naming": "crispasr_ prefix; CA_EXPORT macro; _abi suffix for struct returns",
+        "function_length": "short (setter boilerplate)",
+        "comment_style": "sparse",
+        "error_handling": "null-guard + return 0/nullptr; no exceptions",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 1,
+        "fixmes": 0,
+        "hacks": 0,
+        "dead_code": "none",
+        "refactoring_habits": "reactive"
+      },
+      "patterns": [
+        { "name": "Facade Pattern", "type": "structural", "frequency": "ubiquitous", "evidence": ["src/crispasr_c_api.cpp"] },
+        { "name": "Conditional Compilation (40+ backends)", "type": "anti-pattern", "frequency": "ubiquitous", "evidence": ["src/crispasr_c_api.cpp:49-276"] },
+        { "name": "God-file (7,752 LOC)", "type": "anti-pattern", "frequency": "ubiquitous", "evidence": ["src/crispasr_c_api.cpp"] }
+      ],
+      "data_structures": []
+    },
+    {
+      "name": "audio_io",
+      "path": "src/crispasr_audio.cpp",
+      "purpose": "Audio decode and I/O with platform fallbacks",
+      "files": 1,
+      "lines_of_code": 2714,
+      "languages": ["C++17"],
+      "complexity": "medium",
+      "developer_signature": {
+        "naming": "crispasr_ prefix; kConstant Google-style constants; platform-specific suffixes",
+        "function_length": "medium",
+        "comment_style": "moderate (good platform explanations)",
+        "error_handling": "int return codes exclusively (-2 open, -3 alloc, -4 read)",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 0,
+        "fixmes": 0,
+        "hacks": 0,
+        "dead_code": "none",
+        "refactoring_habits": "proactive (cleanest of 3 major files)"
+      },
+      "patterns": [
+        { "name": "Strategy Pattern (cascade decoders)", "type": "behavioral", "frequency": "ubiquitous", "evidence": ["src/crispasr_audio.cpp:2615-2630"] },
+        { "name": "Platform ifdef soup", "type": "anti-pattern", "frequency": "ubiquitous", "evidence": ["src/crispasr_audio.cpp"] },
+        { "name": "Dynamic Library Loading (FDK-AAC)", "type": "anti-pattern", "frequency": "occasional", "evidence": ["src/crispasr_audio.cpp:1496"] }
+      ],
+      "data_structures": [
+        { "name": "EBMLReader", "type": "interface", "file": "src/crispasr_audio.cpp", "fields": 10 },
+        { "name": "WebMTrack", "type": "model", "file": "src/crispasr_audio.cpp", "fields": 8 }
+      ]
+    },
+    {
+      "name": "core_primitives",
+      "path": "src/core/",
+      "purpose": "Shared NN toolkit: mel, attention, BPE, FFT, RVQ, GGUF loader",
+      "files": 49,
+      "lines_of_code": "~5000",
+      "languages": ["C++17"],
+      "complexity": "medium",
+      "developer_signature": {
+        "naming": "core_ namespace prefix; snake_case; header-only where possible",
+        "function_length": "short (well-factored)",
+        "comment_style": "dense (excellent — every param documented, dedup mission stated)",
+        "error_handling": "returns empty vector/false on failure; assert for invariants",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 0,
+        "fixmes": 0,
+        "hacks": 0,
+        "dead_code": "none",
+        "refactoring_habits": "proactive (deduplication mission, PLAN-tagged tracking)"
+      },
+      "patterns": [
+        { "name": "Strategy via Enums (mel params)", "type": "behavioral", "frequency": "frequent", "evidence": ["src/core/mel.h:116-198"] },
+        { "name": "Header-Only Library", "type": "structural", "frequency": "frequent", "evidence": ["src/core/bpe.h", "src/core/fft.h", "src/core/attention.h"] },
+        { "name": "PLAN-tagged Engineering", "type": "architectural", "frequency": "occasional", "evidence": ["src/core/gguf_loader.h:127", "src/core/mel.cpp:116"] },
+        { "name": "Lazy Singleton", "type": "structural", "frequency": "occasional", "evidence": ["src/core/bpe.h"] }
+      ],
+      "data_structures": [
+        { "name": "core_mel::Params", "type": "model", "file": "src/core/mel.h", "fields": 16 },
+        { "name": "core_gguf::WeightLoad", "type": "model", "file": "src/core/gguf_loader.h", "fields": 12 }
+      ]
+    },
+    {
+      "name": "cli_tool",
+      "path": "examples/cli/",
+      "purpose": "Unified CLI: ASR, TTS, LID, diarization, VAD, alignment, diff",
+      "files": 102,
+      "lines_of_code": "~30k",
+      "languages": ["C++17"],
+      "complexity": "high",
+      "developer_signature": {
+        "naming": "crispasr_/whisper_ prefix; snake_case functions; PascalCase classes",
+        "function_length": "mixed",
+        "comment_style": "moderate",
+        "error_handling": "fprintf(stderr) + exit(0)/return 10; no exceptions",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 2,
+        "fixmes": 0,
+        "hacks": 0,
+        "dead_code": "minimal",
+        "refactoring_habits": "reactive"
+      },
+      "patterns": [
+        { "name": "Strategy/Adapter (CrispasrBackend)", "type": "behavioral", "frequency": "ubiquitous", "evidence": ["crispasr_backend.h:109-246"] },
+        { "name": "Registry Pattern (model lookup)", "type": "architectural", "frequency": "ubiquitous", "evidence": ["crispasr_model_registry.cpp:42-1171"] },
+        { "name": "Capability Matrix (bitmask gating)", "type": "behavioral", "frequency": "ubiquitous", "evidence": ["crispasr_backend.h:75-103"] },
+        { "name": "Factory Pattern (backend creation)", "type": "creational", "frequency": "ubiquitous", "evidence": ["crispasr_create_backend()"] },
+        { "name": "Dual Code Path (legacy + unified)", "type": "anti-pattern", "frequency": "ubiquitous", "evidence": ["cli.cpp"] }
+      ],
+      "data_structures": [
+        { "name": "CrispasrBackend", "type": "interface", "file": "crispasr_backend.h", "fields": 20 },
+        { "name": "crispasr_segment", "type": "model", "file": "crispasr_backend.h", "fields": 8 },
+        { "name": "whisper_params", "type": "model", "file": "whisper_params.h", "fields": 80 }
+      ]
+    },
+    {
+      "name": "ggml_framework",
+      "path": "ggml/",
+      "purpose": "Tensor computation library with 15+ GPU backends",
+      "files": "~200+",
+      "lines_of_code": "~250k+",
+      "languages": ["C99", "C++17", "CUDA", "Metal"],
+      "complexity": "very-high",
+      "developer_signature": {
+        "naming": "ggml_ prefix; ALL_CAPS macros; GGML_OP_* enum; _i suffix for interface vtables",
+        "function_length": "mixed (reference ops short, CUDA kernels medium, monolithic ops.cpp 11.6k LOC)",
+        "comment_style": "moderate (TODO sections in header, sparse inline)",
+        "error_handling": "GGML_ASSERT abort (400+ in ggml.c, 1100+ total) + ggml_status enum for alloc/graph failures",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 310,
+        "fixmes": 41,
+        "hacks": 28,
+        "dead_code": "moderate (legacy CUDA pool, mid-migration C->C++)",
+        "refactoring_habits": "reactive"
+      },
+      "patterns": [
+        { "name": "Computation Graph (define-then-execute)", "type": "architectural", "frequency": "ubiquitous", "evidence": ["ggml/include/ggml.h:11-89"] },
+        { "name": "Backend vtable (Strategy Pattern)", "type": "structural", "frequency": "ubiquitous", "evidence": ["ggml/src/ggml-backend-impl.h:105-202"] },
+        { "name": "Memory Arena (ggml_context)", "type": "structural", "frequency": "ubiquitous", "evidence": ["ggml/include/ggml.h:660-665"] },
+        { "name": "Graph Scheduler (multi-device split)", "type": "architectural", "frequency": "ubiquitous", "evidence": ["ggml/include/ggml-backend.h:260-303"] },
+        { "name": "Tensor Views (zero-copy)", "type": "behavioral", "frequency": "ubiquitous", "evidence": ["ggml/include/ggml.h:694-695"] },
+        { "name": "Operation Fusion", "type": "architectural", "frequency": "frequent", "evidence": ["ggml/src/ggml-impl.h:663-742"] },
+        { "name": "Dynamic Backend Loading", "type": "structural", "frequency": "occasional", "evidence": ["ggml/src/ggml-backend-dl.cpp"] },
+        { "name": "Custom Upstream Patch (AA_SNAKE_BETA)", "type": "anti-pattern", "frequency": "occasional", "evidence": ["ggml/include/ggml.h:582-585"] },
+        { "name": "Circular Device Reference", "type": "anti-pattern", "frequency": "occasional", "evidence": ["ggml/src/ggml-backend.cpp:2404"] }
+      ],
+      "data_structures": [
+        { "name": "ggml_tensor", "type": "model", "file": "ggml/include/ggml.h", "fields": 15 },
+        { "name": "ggml_cgraph", "type": "model", "file": "ggml/src/ggml-impl.h", "fields": 10 },
+        { "name": "ggml_backend_i", "type": "interface", "file": "ggml/src/ggml-backend-impl.h", "fields": 17 },
+        { "name": "ggml_backend_device_i", "type": "interface", "file": "ggml/src/ggml-backend-impl.h", "fields": 15 }
+      ]
+    },
+    {
+      "name": "test_suite",
+      "path": "tests/",
+      "purpose": "Catch2 C++, pytest Python, shell integration tests",
+      "files": 186,
+      "lines_of_code": "~20k",
+      "languages": ["C++17", "Python", "Shell"],
+      "complexity": "medium",
+      "developer_signature": {
+        "naming": "mixed (test-*.cpp, test_*.py, test-*.sh); tag-based filtering [unit][mel]",
+        "function_length": "short (well-organized)",
+        "comment_style": "moderate (regression issue references)",
+        "error_handling": "Catch2 REQUIRE/REQUIRE_THROWS; Python unittest assert*; shell PASS/FAIL counters",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 0,
+        "fixmes": 0,
+        "hacks": 0,
+        "dead_code": "none",
+        "refactoring_habits": "proactive (deliberately TODO-free, null-handle validation conventions)"
+      },
+      "patterns": [
+        { "name": "Tag-based Test Filtering", "type": "structural", "frequency": "frequent", "evidence": ["test-core-mel-parallel.cpp:75"] },
+        { "name": "Regression Issue Tracking", "type": "behavioral", "frequency": "frequent", "evidence": ["test-issue-79.cpp", "test-issue-114*.cpp", "test-issue-150*.cpp"] },
+        { "name": "Null-Handle Defense Testing", "type": "behavioral", "frequency": "ubiquitous", "evidence": ["test_python_session.py:207-218"] },
+        { "name": "Bit-Exact Regression Tests", "type": "behavioral", "frequency": "occasional", "evidence": ["test_python_session.py:389-429"] },
+        { "name": "Environment-Variable Gating", "type": "behavioral", "frequency": "frequent", "evidence": ["test_python_session.py"] }
+      ],
+      "data_structures": []
+    },
+    {
+      "name": "bindings",
+      "path": "python/, crispasr/, bindings/",
+      "purpose": "Multi-language bindings: Python, Rust, Go, Java, JS/WASM, Ruby, Dart/Flutter",
+      "files": "~80+",
+      "lines_of_code": "~15k",
+      "languages": ["Python", "Rust", "Go", "Java", "JavaScript", "Ruby", "Dart", "C"],
+      "complexity": "medium",
+      "developer_signature": {
+        "naming": "language-idiomatic (snake_case Python, CamelCase Java, etc.)",
+        "function_length": "short",
+        "comment_style": "moderate",
+        "error_handling": "language-idiomatic (exceptions Python, Result Rust, etc.)",
+        "confidence": "confirmed"
+      },
+      "technical_debt": {
+        "todos": 0,
+        "fixmes": 0,
+        "hacks": 0,
+        "dead_code": "none",
+        "refactoring_habits": "reactive"
+      },
+      "patterns": [
+        { "name": "FFI/CTypes Bridge (Python)", "type": "structural", "frequency": "ubiquitous", "evidence": ["python/crispasr/_binding.py"] },
+        { "name": "CGo Bridge (Go)", "type": "structural", "frequency": "ubiquitous", "evidence": ["bindings/go/"] },
+        { "name": "JNA Bridge (Java)", "type": "structural", "frequency": "ubiquitous", "evidence": ["bindings/java/"] },
+        { "name": "Emscripten Bridge (JS/WASM)", "type": "structural", "frequency": "ubiquitous", "evidence": ["bindings/javascript/"] }
+      ],
+      "data_structures": []
+    }
+  ],
+  "summary": {
+    "total_modules": 8,
+    "total_lines": "~500k+",
+    "average_complexity": "high",
+    "most_complex_module": "core_engine",
+    "cleanest_module": "core_primitives"
+  },
+  "metadata": {
+    "analyzed_at": "2026-06-25T00:00:00Z",
+    "analyzer": "kiyotaka-excavator"
+  }
+}
