@@ -14,9 +14,14 @@
 
 set(TARGET crispasr-quantize)
 add_executable(${TARGET} main.cpp)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 include(DefaultTargetOptions)
 
 target_link_libraries(${TARGET} PRIVATE common ggml ggml-base ${CMAKE_THREAD_LIBS_INIT})
+
+# common pulls in the core library and its C2PA dependency. Give this executable
+# the same sidecar search path as the CLI so release bundles survive relocation.
+crispasr_enable_c2pa(${TARGET})
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)

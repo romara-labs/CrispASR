@@ -34,11 +34,21 @@ namespace CrispASR.Tests
             Assert.Equal(0.03f, w.Alts[0].P);
         }
 
+        // Times are SECONDS (issue #291), formatted culture-invariantly so the
+        // string is the same on a machine whose decimal separator is a comma.
         [Fact]
-        public void Word_ToString_ShowsRange()
+        public void Word_ToString_ShowsRangeInSeconds()
         {
-            var w = new Word("test", 100, 200, 0.9f);
-            Assert.Equal("100-200 test", w.ToString());
+            var w = new Word("test", 1.0, 2.0, 0.9f);
+            Assert.Equal("1.00-2.00 test", w.ToString());
+        }
+
+        [Fact]
+        public void Word_UntimedSentinelSurvivesRoundTrip()
+        {
+            var w = new Word("test", -1.0, -1.0, 0.9f);
+            Assert.Equal(-1.0, w.T0);
+            Assert.Equal(-1.0, w.T1);
         }
 
         // ---- AltToken ----
@@ -72,10 +82,10 @@ namespace CrispASR.Tests
         }
 
         [Fact]
-        public void Segment_ToString_ShowsBracketedRange()
+        public void Segment_ToString_ShowsBracketedRangeInSeconds()
         {
-            var seg = new Segment("hello world", 50, 300, Array.Empty<Word>());
-            Assert.Equal("[50-300] hello world", seg.ToString());
+            var seg = new Segment("hello world", 0.5, 3.0, Array.Empty<Word>());
+            Assert.Equal("[0.50-3.00] hello world", seg.ToString());
         }
 
         [Fact]
@@ -185,6 +195,66 @@ namespace CrispASR.Tests
             var su = new StreamingUpdate("", 0, 0, 0);
             Assert.Equal("", su.Text);
             Assert.Equal(0, su.Counter);
+        }
+
+        // ---- Music / task-backend result types (newly bound; issue #291 follow-up) ----
+
+        [Fact]
+        public void BeatEvent_And_Result()
+        {
+            var b = new BeatEvent(1.25, true);
+            Assert.Equal(1.25, b.TimeSeconds);
+            Assert.True(b.IsDownbeat);
+            var r = new BeatResult(new[] { b }, 120.0);
+            Assert.Single(r.Beats);
+            Assert.Equal(120.0, r.TempoBpm);
+        }
+
+        [Fact]
+        public void ChordSpan_Properties()
+        {
+            var c = new ChordSpan(0.5, 2.0, 3, 0.9f, "Am");
+            Assert.Equal(0.5, c.StartSeconds);
+            Assert.Equal(2.0, c.EndSeconds);
+            Assert.Equal(3, c.Label);
+            Assert.Equal("Am", c.Name);
+        }
+
+        [Fact]
+        public void PianoNote_Properties()
+        {
+            var n = new PianoNote(0.1, 0.6, 60, 100);
+            Assert.Equal(0.1, n.OnsetSeconds);
+            Assert.Equal(60, n.MidiNote);
+            Assert.Equal(100, n.Velocity);
+        }
+
+        [Fact]
+        public void PitchFrame_Properties()
+        {
+            var p = new PitchFrame(0.02, 220.0f, 0.95f);
+            Assert.Equal(0.02, p.TimeSeconds);
+            Assert.Equal(220.0f, p.F0Hz);
+            Assert.Equal(0.95f, p.VoicedProb);
+        }
+
+        [Fact]
+        public void Stem_Properties()
+        {
+            var s = new Stem("vocals", new float[] { 0f, 0f, 1f, 1f }, 2);
+            Assert.Equal("vocals", s.Name);
+            Assert.Equal(2, s.PerChannelSamples);
+            Assert.Equal(4, s.Interleaved.Length);
+        }
+
+        [Fact]
+        public void TabEmissions_Indexing()
+        {
+            var t = new TabEmissions(2, 6, 21, new float[2 * 6 * 21], 20, 0.0232f, new[] { 40, 45, 50, 55, 59, 64 });
+            Assert.Equal(6, t.Strings);
+            Assert.Equal(20, t.SilentClass);
+            Assert.Equal(6, t.StringOpenMidi.Length);
+            Assert.Equal(2 * 6 * 21, t.LogProbs.Length);
         }
     }
 }

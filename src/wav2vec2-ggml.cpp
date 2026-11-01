@@ -25,6 +25,8 @@
 #include "core/ctc.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
+#include "core/parallel_for.h"
 
 #include <unordered_map>
 
@@ -41,6 +43,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `WAV2VEC2_BENCH=1` for per-stage timings.
@@ -49,7 +52,7 @@
 static bool wav2vec2_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("WAV2VEC2_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_WAV2VEC2_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -149,7 +152,7 @@ bool wav2vec2_load(const char* fname, wav2vec2_model& model) {
     // for ops that need direct weight pointer access (via read_f32_vec).
     model.backend = crispasr_init_gpu_backend();
     if (!model.backend)
-        model.backend = ggml_backend_cpu_init();
+        model.backend = core_cpu_backend::init();
     if (!model.backend) {
         fprintf(stderr, "[wav2vec2] failed to init any backend\n");
         return false;
@@ -292,22 +295,31 @@ static const float* tensor_data_f32(const wav2vec2_model& m, const ggml_tensor* 
 // Manual compute primitives (F32)
 // ===========================================================================
 
+// The model's request budget also applies to manual CNN/normalization fallbacks.
+static int wav2vec2_cpu_threads(int n_threads) {
+    const char* serial = std::getenv("CRISPASR_WAV2VEC2_SERIAL");
+    return serial && *serial && std::strcmp(serial, "0") != 0 ? 1 : n_threads;
+}
+
 // LayerNorm over last dim: x[T, C] → y[T, C] (in-place OK)
-static void layer_norm(const float* x, float* y, const float* w, const float* b, int T, int C, float eps) {
-    for (int t = 0; t < T; t++) {
-        const float* xt = x + t * C;
-        float* yt = y + t * C;
-        double sum = 0.0, sq = 0.0;
-        for (int c = 0; c < C; c++) {
-            sum += xt[c];
-            sq += (double)xt[c] * xt[c];
+static void layer_norm(const float* x, float* y, const float* w, const float* b, int T, int C, float eps,
+                       int n_threads = 1) {
+    core_parallel::for_each_chunk_work(T, wav2vec2_cpu_threads(n_threads), (uint64_t)C * 6, 65536, [&](int t0, int t1) {
+        for (int t = t0; t < t1; t++) {
+            const float* xt = x + t * C;
+            float* yt = y + t * C;
+            double sum = 0.0, sq = 0.0;
+            for (int c = 0; c < C; c++) {
+                sum += xt[c];
+                sq += (double)xt[c] * xt[c];
+            }
+            float mean = (float)(sum / C);
+            float var = (float)(sq / C) - mean * mean;
+            float inv = 1.f / sqrtf(var + eps);
+            for (int c = 0; c < C; c++)
+                yt[c] = (xt[c] - mean) * inv * w[c] + b[c];
         }
-        float mean = (float)(sum / C);
-        float var = (float)(sq / C) - mean * mean;
-        float inv = 1.f / sqrtf(var + eps);
-        for (int c = 0; c < C; c++)
-            yt[c] = (xt[c] - mean) * inv * w[c] + b[c];
-    }
+    });
 }
 
 // GELU (exact tanh approximation)
@@ -317,45 +329,51 @@ static inline float gelu(float x) {
 
 // InstanceNorm (GroupNorm with num_groups=C) on channel-first data [C, L].
 // Used by feat_extract_norm="group", layer 0.
-static void instance_norm_1d(const float* x, float* y, const float* w, const float* b, int C, int L, float eps) {
-    for (int c = 0; c < C; c++) {
-        const float* xc = x + c * L;
-        float* yc = y + c * L;
-        double sum = 0.0, sq = 0.0;
-        for (int l = 0; l < L; l++) {
-            sum += xc[l];
-            sq += (double)xc[l] * xc[l];
+static void instance_norm_1d(const float* x, float* y, const float* w, const float* b, int C, int L, float eps,
+                             int n_threads = 1) {
+    core_parallel::for_each_chunk_work(C, wav2vec2_cpu_threads(n_threads), (uint64_t)L * 6, 65536, [&](int c0, int c1) {
+        for (int c = c0; c < c1; c++) {
+            const float* xc = x + c * L;
+            float* yc = y + c * L;
+            double sum = 0.0, sq = 0.0;
+            for (int l = 0; l < L; l++) {
+                sum += xc[l];
+                sq += (double)xc[l] * xc[l];
+            }
+            float mean = (float)(sum / L);
+            float var = (float)(sq / L) - mean * mean;
+            float inv = 1.f / sqrtf(var + eps);
+            for (int l = 0; l < L; l++)
+                yc[l] = (xc[l] - mean) * inv * w[c] + b[c];
         }
-        float mean = (float)(sum / L);
-        float var = (float)(sq / L) - mean * mean;
-        float inv = 1.f / sqrtf(var + eps);
-        for (int l = 0; l < L; l++)
-            yc[l] = (xc[l] - mean) * inv * w[c] + b[c];
-    }
+    });
 }
 
 // LayerNorm on channel-first [C, L] (norm across C at each L).
 // Used by feat_extract_norm="layer", all CNN layers.
-static void layer_norm_cf(const float* x, float* y, const float* w, const float* b, int C, int L, float eps) {
-    for (int l = 0; l < L; l++) {
-        double sum = 0.0, sq = 0.0;
-        for (int c = 0; c < C; c++) {
-            float v = x[c * L + l];
-            sum += v;
-            sq += (double)v * v;
+static void layer_norm_cf(const float* x, float* y, const float* w, const float* b, int C, int L, float eps,
+                          int n_threads = 1) {
+    core_parallel::for_each_chunk_work(L, wav2vec2_cpu_threads(n_threads), (uint64_t)C * 6, 65536, [&](int l0, int l1) {
+        for (int l = l0; l < l1; l++) {
+            double sum = 0.0, sq = 0.0;
+            for (int c = 0; c < C; c++) {
+                float v = x[c * L + l];
+                sum += v;
+                sq += (double)v * v;
+            }
+            float mean = (float)(sum / C);
+            float var = (float)(sq / C) - mean * mean;
+            float inv = 1.f / sqrtf(var + eps);
+            for (int c = 0; c < C; c++)
+                y[c * L + l] = (x[c * L + l] - mean) * inv * w[c] + b[c];
         }
-        float mean = (float)(sum / C);
-        float var = (float)(sq / C) - mean * mean;
-        float inv = 1.f / sqrtf(var + eps);
-        for (int c = 0; c < C; c++)
-            y[c * L + l] = (x[c * L + l] - mean) * inv * w[c] + b[c];
-    }
+    });
 }
 
 // Conv1d (dilation=1), left_pad zero-pads on the left.
 // Weight: w[Cout][Cin][K]  Input: x[Cin][L_in]  Output: y[Cout][L_out]
 static void conv1d(const float* x, const float* w, const float* b, float* y, int Cin, int Cout, int K, int stride,
-                   int L_in, int left_pad = 0) {
+                   int L_in, int left_pad = 0, int n_threads = 1) {
     int L_pad = L_in + left_pad;
     int L_out = (L_pad - K) / stride + 1;
 
@@ -363,20 +381,22 @@ static void conv1d(const float* x, const float* w, const float* b, float* y, int
     for (int c = 0; c < Cin; c++)
         std::memcpy(padded.data() + c * L_pad + left_pad, x + c * L_in, L_in * sizeof(float));
 
-    for (int oc = 0; oc < Cout; oc++) {
-        float bv = b ? b[oc] : 0.f;
-        for (int t = 0; t < L_out; t++) {
-            float sum = bv;
-            int t0 = t * stride;
-            for (int ic = 0; ic < Cin; ic++) {
-                const float* wrow = w + (oc * Cin + ic) * K;
-                const float* xrow = padded.data() + ic * L_pad + t0;
-                for (int k = 0; k < K; k++)
-                    sum += wrow[k] * xrow[k];
-            }
-            y[oc * L_out + t] = sum;
-        }
-    }
+    core_parallel::for_each_chunk_work(Cout, wav2vec2_cpu_threads(n_threads), (uint64_t)L_out * Cin * K, 65536,
+                                       [&](int oc0, int oc1) {
+                                           for (int oc = oc0; oc < oc1; oc++) {
+                                               float bv = b ? b[oc] : 0.f;
+                                               for (int t = 0; t < L_out; t++) {
+                                                   float sum = bv;
+                                                   int t0 = t * stride;
+                                                   for (int ic = 0; ic < Cin; ic++) {
+                                                       const float* wrow = w + (oc * Cin + ic) * K;
+                                                       const float* xrow = padded.data() + ic * L_pad + t0;
+                                                       sum += crispasr::cpu_attn::cpu_dot(wrow, xrow, K);
+                                                   }
+                                                   y[oc * L_out + t] = sum;
+                                               }
+                                           }
+                                       });
 }
 
 // Grouped Conv1d with symmetric padding so output_len == input_len.
@@ -384,37 +404,43 @@ static void conv1d(const float* x, const float* w, const float* b, float* y, int
 // Weight: w[Cout][Cin/groups][K]
 // Manual grouped conv1d with "same" padding (fallback for non-ggml path)
 static void grouped_conv1d_same(const float* x, const float* w, const float* b, float* y, int C_in, int C_out, int K,
-                                int groups, int L) {
+                                int groups, int L, int n_threads = 1) {
     assert(C_in % groups == 0 && C_out % groups == 0);
     int cin_pg = C_in / groups;
     int cout_pg = C_out / groups;
-    int pad_total = K - 1;
-    int pad_l = pad_total / 2;
-    int pad_r = pad_total - pad_l;
+    // HF Wav2Vec2PositionalConvEmbedding: Conv1d(padding=K/2) then SamePad drops
+    // the LAST frame when K is even - i.e. pad_l = K/2, pad_r = K-1-pad_l.
+    // (K-1)/2 put the extra pad on the right for even K (K=128: 63/64 instead
+    // of 64/63), shifting the positional signal one frame early: wav2vec2-large
+    // / XLS-R / HuBERT-large ctc_logits cos 0.908 / 0.955 vs transformers while
+    // odd-K data2vec matched (Kaggle 2026-09-28). Odd K is unchanged.
+    int pad_l = K / 2;
+    int pad_r = K - 1 - pad_l;
     int L_pad = L + pad_l + pad_r;
 
     std::vector<float> padded(C_in * L_pad, 0.f);
     for (int c = 0; c < C_in; c++)
         std::memcpy(padded.data() + c * L_pad + pad_l, x + c * L, L * sizeof(float));
 
-#pragma omp parallel for schedule(static) collapse(2)
-    for (int g = 0; g < groups; g++) {
-        for (int oc = 0; oc < cout_pg; oc++) {
-            int ic0 = g * cin_pg, oc0 = g * cout_pg;
-            int og = oc0 + oc;
-            float bv = b ? b[og] : 0.f;
-            for (int t = 0; t < L; t++) {
-                float sum = bv;
-                for (int ic = 0; ic < cin_pg; ic++) {
-                    const float* wrow = w + (og * cin_pg + ic) * K;
-                    const float* xrow = padded.data() + (ic0 + ic) * L_pad + t;
-                    for (int k = 0; k < K; k++)
-                        sum += wrow[k] * xrow[k];
-                }
-                y[og * L + t] = sum;
-            }
-        }
-    }
+    core_parallel::for_each_chunk_work(groups * cout_pg, wav2vec2_cpu_threads(n_threads), (uint64_t)L * cin_pg * K,
+                                       65536, [&](int idx0, int idx1) {
+                                           for (int idx = idx0; idx < idx1; idx++) {
+                                               int g = idx / cout_pg;
+                                               int oc = idx % cout_pg;
+                                               int ic0 = g * cin_pg, oc0 = g * cout_pg;
+                                               int og = oc0 + oc;
+                                               float bv = b ? b[og] : 0.f;
+                                               for (int t = 0; t < L; t++) {
+                                                   float sum = bv;
+                                                   for (int ic = 0; ic < cin_pg; ic++) {
+                                                       const float* wrow = w + (og * cin_pg + ic) * K;
+                                                       const float* xrow = padded.data() + (ic0 + ic) * L_pad + t;
+                                                       sum += crispasr::cpu_attn::cpu_dot(wrow, xrow, K);
+                                                   }
+                                                   y[og * L + t] = sum;
+                                               }
+                                           }
+                                       });
 }
 
 // ggml-graph grouped conv1d with "same" padding.
@@ -430,8 +456,13 @@ static void grouped_conv1d_same(const float* x, const float* w, const float* b, 
 static bool ggml_grouped_conv1d_same(const float* x_cf, float* y_cf, int C, int K, int G, int T, const float* w_f32,
                                      const float* b_f32, ggml_backend_t backend) {
     int cpg = C / G;
-    // Asymmetric "same" padding: pad_l + pad_r = K-1, output length = T
-    int pad_l = (K - 1) / 2;
+    // HF Wav2Vec2PositionalConvEmbedding: Conv1d(padding=K/2) then SamePad drops
+    // the LAST frame when K is even - i.e. pad_l = K/2, pad_r = K-1-pad_l.
+    // (K-1)/2 put the extra pad on the right for even K (K=128: 63/64 instead
+    // of 64/63), shifting the positional signal one frame early: wav2vec2-large
+    // / XLS-R / HuBERT-large ctc_logits cos 0.908 / 0.955 vs transformers while
+    // odd-K data2vec matched (Kaggle 2026-09-28). Odd K is unchanged.
+    int pad_l = K / 2;
     int pad_r = K - 1 - pad_l;
     int T_pad = T + pad_l + pad_r;
 
@@ -555,10 +586,10 @@ static void ggml_linear_f32(std::vector<uint8_t>& scratch, ggml_tensor* W, const
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
 
-    if (be && !ggml_backend_is_cpu(be)) {
+    if (be && !core_cpu_backend::is_cpu(be)) {
         // Use scheduler with GPU primary + CPU fallback
-        ggml_backend_t cpu = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(cpu, n_threads);
+        ggml_backend_t cpu = core_cpu_backend::init();
+        core_cpu_backend::set_n_threads(cpu, n_threads);
         ggml_backend_t bks[2] = {be, cpu};
         ggml_backend_sched_t sc = ggml_backend_sched_new(bks, nullptr, 2, 64, false, false);
         ggml_backend_sched_set_tensor_backend(sc, W, be);
@@ -589,7 +620,7 @@ static void ggml_linear_f32(std::vector<uint8_t>& scratch, ggml_tensor* W, const
         out = ggml_mul_mat(ctx, W, xt);
         gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
-        ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+        core_cpu_backend::compute(ctx, gf, n_threads);
         const float* od = (const float*)out->data;
         if (bias)
             for (int t = 0; t < T; t++)
@@ -624,7 +655,7 @@ static ggml_tensor* build_pos_conv_graph(ggml_context* ctx0, ggml_cgraph* gf, gg
                                          ggml_tensor* /*w_tensor_unused*/, ggml_tensor* /*b_tensor_unused*/, int H,
                                          int T, int K, int G) {
     int cpg = H / G;
-    int pad_l = (K - 1) / 2;
+    int pad_l = K / 2; // HF pads K/2 and drops the last frame for even K (see grouped_conv1d_same)
     int pad_r = K - 1 - pad_l;
 
     // Pad: [H, T] → [H, T+pad_l+pad_r]
@@ -899,7 +930,7 @@ static void wav2vec2_debug_attention(const wav2vec2_model& m, const float* hidde
     ggml_build_forward_expand(gf, res);
     fprintf(stderr, "[wav2vec2-dbg] graph built, computing...\n");
     fflush(stderr);
-    ggml_graph_compute_with_ctx(ctx, gf, 1);
+    core_cpu_backend::compute(ctx, gf, 1);
     fprintf(stderr, "[wav2vec2-dbg] graph computed, comparing...\n");
     fflush(stderr);
 
@@ -1039,7 +1070,7 @@ static void wav2vec2_debug_single_op(const wav2vec2_model & m,
     ggml_build_forward_expand(gf, fc1);
     ggml_free(ctx0);
 
-    // Use simple ggml_graph_compute_with_ctx (same as ggml_linear_f32 uses)
+    // Use simple core_cpu_backend::compute(same as ggml_linear_f32 uses)
     // to eliminate any backend-related differences
     {
         // Rebuild graph with no_alloc=false so tensors get memory
@@ -1063,7 +1094,7 @@ static void wav2vec2_debug_single_op(const wav2vec2_model & m,
 
         ggml_tensor * fc1_2 = ggml_add(ctx2, ggml_mul_mat(ctx2, e.fc1_w, x2), e.fc1_b);
         ggml_build_forward_expand(gf2, fc1_2);
-        ggml_graph_compute_with_ctx(ctx2, gf2, 1);
+        core_cpu_backend::compute(ctx2, gf2, 1);
 
         const float * fc1_data = (const float *)fc1_2->data;
         fprintf(stderr, "[dbg] simple fc1[t=0, 0:8]:");
@@ -1118,13 +1149,15 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                                                         int n_threads) {
     const auto& hp = m.hparams;
     const int H = (int)hp.hidden_size;
-    const bool bench = (getenv("WAV2VEC2_BENCH") && getenv("WAV2VEC2_BENCH")[0]);
-    const bool verbose = (getenv("WAV2VEC2_VERBOSE") && getenv("WAV2VEC2_VERBOSE")[0]);
+    const bool bench =
+        (crispasr_env::get("CRISPASR_WAV2VEC2_BENCH") && crispasr_env::get("CRISPASR_WAV2VEC2_BENCH")[0]);
+    const bool verbose =
+        (crispasr_env::get("CRISPASR_WAV2VEC2_VERBOSE") && crispasr_env::get("CRISPASR_WAV2VEC2_VERBOSE")[0]);
     int64_t t_cnn = 0, t_proj = 0, t_pos = 0, t_enc = 0, t_lm = 0, t0;
 
     if (verbose) {
         fprintf(stderr, "wav2vec2: backend=%s, gpu=%s, hidden=%d, layers=%d, heads=%d\n", ggml_backend_name(m.backend),
-                ggml_backend_is_cpu(m.backend) ? "no" : "yes", H, (int)hp.num_hidden_layers,
+                core_cpu_backend::is_cpu(m.backend) ? "no" : "yes", H, (int)hp.num_hidden_layers,
                 (int)hp.num_attention_heads);
         fprintf(stderr, "wav2vec2: audio=%d samples (%.1fs)\n", n_samples, n_samples / 16000.0f);
     }
@@ -1157,9 +1190,9 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
     ggml_backend_t cnn_cpu = nullptr;
     int cnn_n_be = 1;
     ggml_backend_t cnn_bks[2] = {m.backend, nullptr};
-    if (!ggml_backend_is_cpu(m.backend)) {
-        cnn_cpu = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(cnn_cpu, n_threads);
+    if (!core_cpu_backend::is_cpu(m.backend)) {
+        cnn_cpu = core_cpu_backend::init();
+        core_cpu_backend::set_n_threads(cnn_cpu, n_threads);
         cnn_bks[cnn_n_be++] = cnn_cpu;
     }
     ggml_backend_sched_t cnn_sc = ggml_backend_sched_new(cnn_bks, nullptr, cnn_n_be, 128, false, false);
@@ -1170,8 +1203,8 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
     std::vector<float> cnn_buf(audio.begin(), audio.end());
     uint32_t L_cur = (uint32_t)n_samples, C_cur = 1;
 
-    if (ggml_backend_is_cpu(m.backend))
-        ggml_backend_cpu_set_n_threads(m.backend, n_threads);
+    if (core_cpu_backend::is_cpu(m.backend))
+        core_cpu_backend::set_n_threads(m.backend, n_threads);
 
     for (uint32_t li = 0; li < hp.num_feat_extract_layers; li++) {
         uint32_t C_out = hp.conv_dim[li];
@@ -1283,14 +1316,15 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                 wdata = tensor_data_f32(m, m.cnn[li].conv_w);
             }
             conv1d(cf.data(), wdata, m.cnn[li].conv_b ? tensor_data_f32(m, m.cnn[li].conv_b) : nullptr, co.data(),
-                   (int)C_cur, (int)C_out, (int)K, (int)S, (int)L_cur, 0);
+                   (int)C_cur, (int)C_out, (int)K, (int)S, (int)L_cur, 0, n_threads);
             if (m.cnn[li].has_norm) {
                 const float* nw = tensor_data_f32(m, m.cnn[li].norm_w);
                 const float* nb = tensor_data_f32(m, m.cnn[li].norm_b);
                 if (hp.feat_extract_norm_type == 1)
-                    layer_norm_cf(co.data(), co.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps);
+                    layer_norm_cf(co.data(), co.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps, n_threads);
                 else
-                    instance_norm_1d(co.data(), co.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps);
+                    instance_norm_1d(co.data(), co.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps,
+                                     n_threads);
             }
             for (float& v : co)
                 v = gelu(v);
@@ -1323,7 +1357,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
 
     // Dump CNN output for reference comparison
     {
-        const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+        const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
         if (dump && dump[0]) {
             char path[512];
             snprintf(path, sizeof(path), "%s/cnn_out.bin", dump);
@@ -1344,7 +1378,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
     // ---- 2. Feature projection: LN + Linear ----
     t0 = ggml_time_us();
     layer_norm(feat.data(), feat.data(), tensor_data_f32(m, m.fp_ln_w), tensor_data_f32(m, m.fp_ln_b), T, C_cnn,
-               hp.layer_norm_eps);
+               hp.layer_norm_eps, n_threads);
 
     std::vector<float> hidden(T * H);
     std::vector<uint8_t> scratch;
@@ -1353,7 +1387,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
 
     // Dump feature projection output
     {
-        const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+        const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
         if (dump && dump[0]) {
             char path[512];
             snprintf(path, sizeof(path), "%s/feat_proj.bin", dump);
@@ -1400,7 +1434,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
             const float* pb = b_tensor ? tensor_data_f32(m, b_tensor) : nullptr;
             std::vector<float> pos_out(H * T, 0.0f);
             if (!ggml_grouped_conv1d_same(pos_cf.data(), pos_out.data(), H, K_this, G_pos, T, pw, pb, m.backend))
-                grouped_conv1d_same(pos_cf.data(), pw, pb, pos_out.data(), H, H, K_this, G_pos, T);
+                grouped_conv1d_same(pos_cf.data(), pw, pb, pos_out.data(), H, H, K_this, G_pos, T, n_threads);
 
             if (n_layers > 1) {
                 for (int t2 = 0; t2 < T; t2++) {
@@ -1464,15 +1498,15 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
         std::vector<uint8_t> compute_meta;
         ggml_cgraph* gf = wav2vec2_build_transformer_graph(m, T, compute_meta, /*include_pos_conv=*/false);
         if (gf) {
-            if (ggml_backend_is_cpu(m.backend))
-                ggml_backend_cpu_set_n_threads(m.backend, n_threads);
+            if (core_cpu_backend::is_cpu(m.backend))
+                core_cpu_backend::set_n_threads(m.backend, n_threads);
             // Dual-backend scheduler: GPU primary + CPU fallback for unsupported ops
             ggml_backend_t enc_cpu = nullptr;
             int enc_n_be = 1;
             ggml_backend_t backends[2] = {m.backend, nullptr};
-            if (!ggml_backend_is_cpu(m.backend)) {
-                enc_cpu = ggml_backend_cpu_init();
-                ggml_backend_cpu_set_n_threads(enc_cpu, n_threads);
+            if (!core_cpu_backend::is_cpu(m.backend)) {
+                enc_cpu = core_cpu_backend::init();
+                core_cpu_backend::set_n_threads(enc_cpu, n_threads);
                 backends[enc_n_be++] = enc_cpu;
             }
             ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, enc_n_be, 16384, false, false);
@@ -1541,7 +1575,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                     if (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS) {
                         // Dump after_global_ln if available
                         {
-                            const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+                            const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
                             ggml_tensor* gln = ggml_graph_get_tensor(gf, "after_global_ln");
                             if (dump && dump[0] && gln) {
                                 int ne = (int)ggml_nelements(gln);
@@ -1566,7 +1600,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                             ggml_backend_tensor_get(out, logits_tv.data(), 0, logits_tv.size() * sizeof(float));
                             // Dump logits
                             {
-                                const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+                                const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
                                 if (dump && dump[0]) {
                                     char path[512];
                                     snprintf(path, sizeof(path), "%s/logits.bin", dump);
@@ -1670,13 +1704,13 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
         ggml_build_forward_expand(lgf, cur);
 
         // Compute — reuse pre-allocated work buffer
-        struct ggml_cplan cplan = ggml_graph_plan(lgf, n_threads, NULL);
+        struct ggml_cplan cplan = core_cpu_backend::plan(lgf, n_threads);
         if (cplan.work_size > 0) {
             if (work_buf.size() < cplan.work_size)
                 work_buf.resize(cplan.work_size);
             cplan.work_data = work_buf.data();
         }
-        ggml_graph_compute(lgf, &cplan);
+        core_cpu_backend::compute_planned(lgf, &cplan, n_threads);
 
         // Read output back into hidden_ht for the next layer
         ggml_tensor* lout = ggml_graph_get_tensor(lgf, "layer_out");
@@ -1692,7 +1726,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
     {
         // hidden_ht is [T, H] layout (same as ggml [H, T] data layout)
         layer_norm(hidden_ht.data(), hidden_ht.data(), tensor_data_f32(m, m.enc_ln_w), tensor_data_f32(m, m.enc_ln_b),
-                   T, H, ln_eps);
+                   T, H, ln_eps, n_threads);
 
         int V_size = (int)hp.vocab_size;
         std::vector<float> logits(T * V_size);
@@ -1793,13 +1827,15 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         const float* nb = m.cnn[li].has_norm ? tensor_data_f32(m, m.cnn[li].norm_b) : nullptr;
 
         conv1d(cnn_in.data(), wdata, bdata, cnn_out.data(), (int)C_cur, (int)C_out, (int)K, (int)stride, (int)L_cur,
-               /*left_pad=*/0);
+               /*left_pad=*/0, n_threads);
 
         if (m.cnn[li].has_norm) {
             if (hp.feat_extract_norm_type == 1)
-                layer_norm_cf(cnn_out.data(), cnn_out.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps);
+                layer_norm_cf(cnn_out.data(), cnn_out.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps,
+                              n_threads);
             else
-                instance_norm_1d(cnn_out.data(), cnn_out.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps);
+                instance_norm_1d(cnn_out.data(), cnn_out.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps,
+                                 n_threads);
         }
         for (float& v : cnn_out)
             v = gelu(v);
@@ -1825,7 +1861,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
     int H = (int)hp.hidden_size;
 
     layer_norm(feat.data(), feat.data(), tensor_data_f32(m, m.fp_ln_w), tensor_data_f32(m, m.fp_ln_b), T, C_cnn,
-               hp.layer_norm_eps);
+               hp.layer_norm_eps, n_threads);
 
     std::vector<float> hidden(T * H);
     std::vector<uint8_t> scratch;
@@ -1850,7 +1886,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         const float* pw = tensor_data_f32(m, m.pos_conv_w);
         const float* pb = tensor_data_f32(m, m.pos_conv_b);
         if (!ggml_grouped_conv1d_same(hcf.data(), pos_out.data(), H, K_pos, G_pos, T, pw, pb, m.backend))
-            grouped_conv1d_same(hcf.data(), pw, pb, pos_out.data(), H, H, K_pos, G_pos, T);
+            grouped_conv1d_same(hcf.data(), pw, pb, pos_out.data(), H, H, K_pos, G_pos, T, n_threads);
 
         for (int t = 0; t < T; t++)
             for (int h = 0; h < H; h++)
@@ -1873,7 +1909,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
 
     if (hp.global_ln_before_encoder)
         layer_norm(hidden.data(), hidden.data(), tensor_data_f32(m, m.enc_ln_w), tensor_data_f32(m, m.enc_ln_b), T, H,
-                   hp.layer_norm_eps);
+                   hp.layer_norm_eps, n_threads);
 
     std::vector<float> normed(T * H);
     std::vector<float> Q_buf(T * H), K_buf(T * H), V_buf(T * H);
@@ -1888,7 +1924,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         const float* attn_src = hidden.data();
         if (pre_norm) {
             layer_norm(hidden.data(), normed.data(), tensor_data_f32(m, e.ln1_w), tensor_data_f32(m, e.ln1_b), T, H,
-                       hp.layer_norm_eps);
+                       hp.layer_norm_eps, n_threads);
             attn_src = normed.data();
         }
 
@@ -1905,16 +1941,34 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         // same treatment as firered_asr (#229). Q/K/V are [T, H] row-major; for
         // head h the values live at column offset h*head_dim with row stride H.
         std::fill(attn_out.begin(), attn_out.end(), 0.f);
-#pragma omp parallel for collapse(2) schedule(static)
-        for (int h = 0; h < n_heads; h++) {
-            for (int tq = 0; tq < T; tq++) {
-                const int off = h * head_dim;
-                const float* q = Q_buf.data() + tq * H + off;
-                crispasr::cpu_attn::cpu_online_softmax_accumulate(
-                    T, head_dim, V_buf.data() + off, H, attn_out.data() + tq * H + off, [&](int tk) {
-                        return crispasr::cpu_attn::cpu_dot(q, K_buf.data() + tk * H + off, head_dim) * scale;
-                    });
+        const char* w2v_serial_env = std::getenv("CRISPASR_WAV2VEC2_SERIAL");
+        const bool force_w2v_serial = (w2v_serial_env != nullptr && std::strcmp(w2v_serial_env, "0") != 0);
+        if (force_w2v_serial) {
+            for (int h = 0; h < n_heads; h++) {
+                for (int tq = 0; tq < T; tq++) {
+                    const int off = h * head_dim;
+                    const float* q = Q_buf.data() + tq * H + off;
+                    crispasr::cpu_attn::cpu_online_softmax_accumulate(
+                        T, head_dim, V_buf.data() + off, H, attn_out.data() + tq * H + off, [&](int tk) {
+                            return crispasr::cpu_attn::cpu_dot(q, K_buf.data() + tk * H + off, head_dim) * scale;
+                        });
+                }
             }
+        } else {
+            const int total_queries = n_heads * T;
+            core_parallel::for_each_chunk_work(
+                total_queries, n_threads, (uint64_t)T * head_dim * 2, 65536, [&](int begin_idx, int end_idx) {
+                    for (int idx = begin_idx; idx < end_idx; idx++) {
+                        const int h = idx / T;
+                        const int tq = idx % T;
+                        const int off = h * head_dim;
+                        const float* q = Q_buf.data() + tq * H + off;
+                        crispasr::cpu_attn::cpu_online_softmax_accumulate(
+                            T, head_dim, V_buf.data() + off, H, attn_out.data() + tq * H + off, [&](int tk) {
+                                return crispasr::cpu_attn::cpu_dot(q, K_buf.data() + tk * H + off, head_dim) * scale;
+                            });
+                    }
+                });
         }
 
         ggml_linear_f32(scratch, e.o_w, tensor_data_f32(m, e.o_b), attn_out.data(), normed.data(), H, H, T, n_threads,
@@ -1924,13 +1978,13 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         // Post-norm applies the attention LN after the residual add.
         if (!pre_norm)
             layer_norm(hidden.data(), hidden.data(), tensor_data_f32(m, e.ln1_w), tensor_data_f32(m, e.ln1_b), T, H,
-                       hp.layer_norm_eps);
+                       hp.layer_norm_eps, n_threads);
 
         // FFN input: pre-norm normalizes first; post-norm feeds hidden.
         const float* ffn_src = hidden.data();
         if (pre_norm) {
             layer_norm(hidden.data(), normed.data(), tensor_data_f32(m, e.ln2_w), tensor_data_f32(m, e.ln2_b), T, H,
-                       hp.layer_norm_eps);
+                       hp.layer_norm_eps, n_threads);
             ffn_src = normed.data();
         }
 
@@ -1945,7 +1999,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         // Post-norm applies the FFN LN after the residual add.
         if (!pre_norm)
             layer_norm(hidden.data(), hidden.data(), tensor_data_f32(m, e.ln2_w), tensor_data_f32(m, e.ln2_b), T, H,
-                       hp.layer_norm_eps);
+                       hp.layer_norm_eps, n_threads);
     }
 
     // ------------------------------------------------------------------
@@ -1953,7 +2007,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
     // ------------------------------------------------------------------
     if (!hp.global_ln_before_encoder)
         layer_norm(hidden.data(), hidden.data(), tensor_data_f32(m, m.enc_ln_w), tensor_data_f32(m, m.enc_ln_b), T, H,
-                   hp.layer_norm_eps);
+                   hp.layer_norm_eps, n_threads);
 
     // ------------------------------------------------------------------
     // 6. LM head: Linear(H → V) — raw logits (no softmax)

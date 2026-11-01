@@ -11,6 +11,8 @@
 #include "ggml-cpu.h"
 
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
+#include "core/bert_words.h"
 
 #include <algorithm>
 #include <cassert>
@@ -22,6 +24,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `BERT_ENCODER_BENCH=1` for per-stage timings.
@@ -30,7 +33,7 @@
 static bool bert_encoder_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("BERT_ENCODER_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_BERT_ENCODER_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -59,45 +62,23 @@ struct bert_tokenizer {
     int pad_id = 0;   // [PAD]
 };
 
-static std::string to_lower_bert(const std::string& s) {
-    std::string out;
-    for (char c : s)
-        out += (char)tolower((unsigned char)c);
-    return out;
-}
-
-static std::vector<int> bert_tokenize(const bert_tokenizer& tok, const std::string& text) {
+static std::vector<int> bert_tokenize(const bert_tokenizer& tok, const std::string& text,
+                                      std::vector<int>* word_counts = nullptr) {
     std::vector<int> ids;
     ids.push_back(tok.cls_id);
-
-    // Simple whitespace tokenization + WordPiece
-    std::string lower = to_lower_bert(text);
-    std::vector<std::string> words;
-    std::string cur;
-    for (char c : lower) {
-        if (c == ' ' || c == '\t' || c == '\n') {
-            if (!cur.empty()) {
-                words.push_back(cur);
-                cur.clear();
-            }
-        } else {
-            cur += c;
+    if (word_counts)
+        word_counts->clear();
+    for (const auto& word : core_bert::uncased_words(text)) {
+        size_t offset = 0;
+        int characters = 0;
+        while (offset < word.size()) {
+            core_unicode::utf8_next(word.data(), word.size(), offset);
+            ++characters;
         }
-    }
-    if (!cur.empty())
-        words.push_back(cur);
-
-    for (const auto& word : words) {
-        // Try to find the whole word first
-        auto it = tok.vocab.find(word);
-        if (it != tok.vocab.end()) {
-            ids.push_back(it->second);
-            continue;
-        }
-
-        // WordPiece: greedy longest-match from left
+        std::vector<int> pieces;
+        bool unknown = characters > 100;
         size_t start = 0;
-        while (start < word.size()) {
+        while (!unknown && start < word.size()) {
             size_t end = word.size();
             int best_id = tok.unk_id;
             while (end > start) {
@@ -109,12 +90,19 @@ static std::vector<int> bert_tokenize(const bert_tokenizer& tok, const std::stri
                 }
                 end--;
             }
-            ids.push_back(best_id);
-            if (end == start)
-                start++; // skip char if nothing found
-            else
-                start = end;
+            if (end == start) {
+                unknown = true;
+                break;
+            }
+            pieces.push_back(best_id);
+            start = end;
         }
+        // HF rolls back every partial piece if any part of the word fails.
+        if (unknown)
+            pieces = {tok.unk_id};
+        ids.insert(ids.end(), pieces.begin(), pieces.end());
+        if (word_counts)
+            word_counts->push_back(static_cast<int>(pieces.size()));
     }
 
     ids.push_back(tok.sep_id);
@@ -312,8 +300,8 @@ extern "C" struct bert_encoder_context* bert_encoder_init(const char* gguf_path,
     ctx->n_threads = n_threads;
 
     // Backend
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     ctx->backend = ctx->backend_cpu;
 
     // Metadata
@@ -448,7 +436,7 @@ extern "C" void bert_encoder_free(struct bert_encoder_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu)
@@ -496,55 +484,11 @@ extern "C" int bert_encoder_word_subtokens(const struct bert_encoder_context* ct
     if (!ctx || !text || !out_subtokens)
         return 0;
 
-    // Tokenize to get the subword tokens
-    auto ids = bert_tokenize(ctx->tok, text);
-    // ids[0] = [CLS], ids[n-1] = [SEP], content = ids[1..n-2]
-
-    // Reconstruct which content tokens belong to which whitespace word
-    // Approach: re-tokenize word by word, count subwords per word
-    std::string lower = to_lower_bert(text);
-    std::vector<std::string> words;
-    std::string cur;
-    for (char c : lower) {
-        if (c == ' ' || c == '\t' || c == '\n') {
-            if (!cur.empty()) {
-                words.push_back(cur);
-                cur.clear();
-            }
-        } else {
-            cur += c;
-        }
-    }
-    if (!cur.empty())
-        words.push_back(cur);
-
-    // For each word, count how many BERT subwords it produces
     std::vector<int> subtokens;
-    for (const auto& word : words) {
-        // Tokenize this single word
-        int n_sub = 0;
-        auto it = ctx->tok.vocab.find(word);
-        if (it != ctx->tok.vocab.end()) {
-            n_sub = 1;
-        } else {
-            // WordPiece split
-            size_t start = 0;
-            while (start < word.size()) {
-                size_t end = word.size();
-                while (end > start) {
-                    std::string sub = (start == 0) ? word.substr(0, end) : "##" + word.substr(start, end - start);
-                    if (ctx->tok.vocab.count(sub))
-                        break;
-                    end--;
-                }
-                n_sub++;
-                if (end == start)
-                    start++;
-                else
-                    start = end;
-            }
-        }
-        subtokens.push_back(n_sub);
+    bert_tokenize(ctx->tok, text, &subtokens);
+    if (subtokens.empty()) {
+        *out_subtokens = nullptr;
+        return 0;
     }
 
     int n_words = (int)subtokens.size();

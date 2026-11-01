@@ -1,0 +1,54 @@
+{
+  "framework": "kiyotaka",
+  "version": "1.0.0",
+  "installed_at": "2026-06-25T02:53:14.348Z",
+  "selected_mode": "plan_interrogation",
+  "installed_modes": [
+    "plan_interrogation"
+  ],
+  "installed_agents": [
+    "kiyotaka",
+    "kiyotaka-observer",
+    "kiyotaka-excavator",
+    "kiyotaka-architect-reader",
+    "kiyotaka-recorder",
+    "kiyotaka-verifier",
+    "kiyotaka-interrogator",
+    "kiyotaka-assumption-hunter",
+    "kiyotaka-source-tracer",
+    "kiyotaka-coverage-mapper",
+    "kiyotaka-hallucination-detector",
+    "kiyotaka-blocker-judge",
+    "kiyotaka-plan-corrector",
+    "kiyotaka-facade-operator",
+    "kiyotaka-incentive-mapper",
+    "kiyotaka-authority-reader",
+    "kiyotaka-humanity-guard",
+    "kiyotaka-mimic",
+    "kiyotaka-chameleon",
+    "kiyotaka-shadow",
+    "kiyotaka-mentor",
+    "kiyotaka-trainer",
+    "kiyotaka-pair"
+  ],
+  "installed_engines": [
+    "claude-code",
+    "codex",
+    "opencode"
+  ],
+  "optional_capabilities": [
+    "strategic_persona",
+    "style_replication",
+    "support_companions",
+    "security_hardening",
+    "clean_architecture",
+    "documentation",
+    "test_strategy",
+    "adr",
+    "mermaid"
+  ],
+  "output_folders": [
+    "_kiyotaka_interrogation",
+    "_kiyotaka_replication"
+  ]
+}

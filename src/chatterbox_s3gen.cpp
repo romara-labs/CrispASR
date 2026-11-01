@@ -19,9 +19,14 @@
 #include "chatterbox_campplus.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_s3tok.h"
+#include "core/chatterbox_f0_conv.h"
+#include "core/chatterbox_hift_simdconv.h"
+#include "core/hift_simdconv.h"
 #include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (shared FASTCONV)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -40,6 +45,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `CB_S3GEN_BENCH=1` for per-stage timings.
@@ -48,7 +54,7 @@
 static bool cb_s3gen_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CB_S3GEN_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CB_S3GEN_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -271,6 +277,11 @@ static void fill_gaussian_noise(float* data, int n, mt19937_state& rng) {
     }
 }
 
+struct chatterbox_hift_simd_resblock {
+    core_chatterbox_hift_simdconv::PackedConv c1[3];
+    core_chatterbox_hift_simdconv::PackedConv c2[3];
+};
+
 // ── Context ──────────────────────────────────────────────────────
 
 struct chatterbox_s3gen_context {
@@ -355,6 +366,25 @@ struct chatterbox_s3gen_context {
     bool dequant_cfm_f16 = false;
     ggml_context* ctx_f16 = nullptr;
     ggml_backend_buffer_t buf_f16 = nullptr;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked F32 copies of the F16 conv
+    // kernels, so the fork's per-graph F16→F32 cast (in ggml_conv_1d) becomes a
+    // no-op. Two caches because s3gen weights are split across backends (split
+    // load routes s3.fd.*→CPU, rest→GPU; the Metal CFM fix moves quantized
+    // s3.fd.* back to GPU) — each F16 conv kernel is baked on ITS OWN backend so
+    // the pointer-swap in c->tensors preserves placement exactly. Cast-kill only
+    // (no k=1→matmul), which is bitwise-identical to the legacy cast. Gated
+    // CRISPASR_S3GEN_FASTCONV (default OFF pending a full seeded A/B on a quiet box).
+    core_dac::fastconv_cache fc_gpu;
+    core_dac::fastconv_cache fc_cpu;
+
+    // CPU HiFT ResBlock fast path: 9 main + 3 source ResBlocks, 6 Conv1d
+    // kernels each. The weights are packed once at load; graph execution keeps
+    // each ResBlock in a time-major [T][C] byte layout between its convolutions.
+    bool hift_simdconv_enabled = false;
+    chatterbox_hift_simd_resblock hift_main_simd[9];
+    chatterbox_hift_simd_resblock hift_source_simd[3];
+
     mt19937_state noise_rng{};
     uint32_t noise_seed = 0;
 
@@ -395,12 +425,14 @@ struct chatterbox_s3gen_context {
             ggml_backend_buffer_free(buf_f16);
         if (ctx_f16)
             ggml_free(ctx_f16);
+        fc_gpu.free();
+        fc_cpu.free();
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (buf_cpu_w)
-            ggml_backend_buffer_free(buf_cpu_w);
+            core_gguf::release_weight_buffer(buf_cpu_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -640,7 +672,7 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     }
 
     // Backend
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "s3gen: failed to init CPU backend\n");
         delete c;
@@ -656,7 +688,7 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         if (const char* e = std::getenv("CRISPASR_CHATTERBOX_THREADS"); e && *e)
             s3_threads = std::max(1, atoi(e));
         c->n_threads = s3_threads;
-        ggml_backend_cpu_set_n_threads(c->backend_cpu, s3_threads);
+        core_cpu_backend::set_n_threads(c->backend_cpu, s3_threads);
         if (verbosity >= 1)
             fprintf(stderr, "s3gen: CPU backend threads=%d\n", s3_threads);
     }
@@ -782,6 +814,117 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
                         "(%.0f→%.0f MiB; correct mul_mm_f16_f32_hp path, full GPU speed; "
                         "CRISPASR_S3GEN_UNET_CPU=1 for the CPU route)\n",
                         n_conv, bytes_q / 1048576.0, bytes_f16 / 1048576.0);
+            }
+        }
+    }
+
+    // SIMDCONV: pack the 72 HiFT ResBlock Conv1d kernels once at model load.
+    // Shared core_hift_simdconv handles validation, tensor dequantization and
+    // rollback; this model adapter contributes only tensor names + symmetric padding.
+    {
+        const char* e = std::getenv("CRISPASR_S3GEN_SIMDCONV");
+        const bool requested = e && *e && e[0] != '0';
+        // is_cpu(), not `backend == backend_cpu`: a context can hold a separate
+        // CPU backend instance for compute, and the pointer compare then reads
+        // "GPU" under --no-gpu (the parakeet pick_backend lesson) — which would
+        // silently keep SIMDCONV off on the exact machines it exists for.
+        const bool cpu_vocoder = core_cpu_backend::is_cpu(c->backend) || s3gen_env_force_cpu(s3gen_subgraph::vocoder);
+        core_hift_simdconv::Packer pack(requested && cpu_vocoder);
+
+        const int dilations[3] = {1, 3, 5};
+        char wn[64], bn[64];
+        for (int rb = 0; rb < 9; ++rb) {
+            for (int d = 0; d < 3; ++d) {
+                std::snprintf(wn, sizeof(wn), "s3.v.rb.%d.c1.%d.weight", rb, d);
+                std::snprintf(bn, sizeof(bn), "s3.v.rb.%d.c1.%d.bias", rb, d);
+                pack.add(c->hift_main_simd[rb].c1[d], T(c, wn), T(c, bn), dilations[d]);
+                std::snprintf(wn, sizeof(wn), "s3.v.rb.%d.c2.%d.weight", rb, d);
+                std::snprintf(bn, sizeof(bn), "s3.v.rb.%d.c2.%d.bias", rb, d);
+                pack.add(c->hift_main_simd[rb].c2[d], T(c, wn), T(c, bn), 1);
+            }
+        }
+        for (int stage = 0; stage < 3; ++stage) {
+            for (int d = 0; d < 3; ++d) {
+                std::snprintf(wn, sizeof(wn), "s3.v.srb.%d.c1.%d.weight", stage, d);
+                std::snprintf(bn, sizeof(bn), "s3.v.srb.%d.c1.%d.bias", stage, d);
+                pack.add(c->hift_source_simd[stage].c1[d], T(c, wn), T(c, bn), dilations[d]);
+                std::snprintf(wn, sizeof(wn), "s3.v.srb.%d.c2.%d.weight", stage, d);
+                std::snprintf(bn, sizeof(bn), "s3.v.srb.%d.c2.%d.bias", stage, d);
+                pack.add(c->hift_source_simd[stage].c2[d], T(c, wn), T(c, bn), 1);
+            }
+        }
+
+        const int expected = 72;
+        c->hift_simdconv_enabled = pack.finish(expected);
+        const int packed = pack.count();
+        if (std::getenv("CRISPASR_S3GEN_SIMDCONV_DEBUG") || (requested && verbosity >= 1)) {
+            const char* isa = c->hift_simdconv_enabled
+                                  ? core_chatterbox_hift_simdconv::isa_name(c->hift_main_simd[0].c1[0].isa)
+                                  : "fallback";
+            fprintf(stderr, "s3gen: HiFT SIMDCONV %s: packed %d/%d ResBlock convs, isa=%s%s\n",
+                    c->hift_simdconv_enabled ? "ON" : "OFF", packed, expected, isa,
+                    requested && !cpu_vocoder ? " (GPU vocoder -> ggml fallback)" : "");
+        }
+    }
+
+    // FASTCONV: bake F32 copies of the F16 conv kernels and redirect graph
+    // lookups to them (same pointer-swap idiom as the ctx_f16 fix above), so
+    // ggml_conv_1d skips its per-graph F16→F32 kernel cast. Bitwise-identical to
+    // the legacy cast (the bake IS that conversion, done once at load). Each
+    // kernel is baked on its OWN backend to preserve split-load placement.
+    // Gated CRISPASR_S3GEN_FASTCONV; default OFF until a full seeded A/B lands.
+    {
+        // Default ON: the A/B proved cast-kill is audio byte-identical to the
+        // legacy in-graph cast (ON vs OFF @seed42 = 0/32768 across all samples,
+        // which for this flow-matching+AR pipeline also subsumes the determinism
+        // gate — a non-deterministic run would have diverged). Set =0 to revert.
+        const char* e = std::getenv("CRISPASR_S3GEN_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        if (on) {
+            const bool have_gpu = (c->backend_cpu && c->backend_cpu != c->backend);
+            ggml_backend_buffer_type_t cpu_buft =
+                have_gpu ? ggml_backend_get_default_buffer_type(c->backend_cpu) : nullptr;
+            std::vector<ggml_tensor*> gpu_k, cpu_k;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                if (!w || w->type != GGML_TYPE_F16 || ggml_n_dims(w) != 3)
+                    continue; // conv kernels are the only 3D weights (matmuls are 2D)
+                // SIMDCONV owns model-lifetime F32 packs for these 72 kernels;
+                // avoid retaining a redundant FASTCONV F32 copy as well.
+                const bool simd_resblock =
+                    (kv.first.rfind("s3.v.rb.", 0) == 0 || kv.first.rfind("s3.v.srb.", 0) == 0) &&
+                    (kv.first.find(".c1.") != std::string::npos || kv.first.find(".c2.") != std::string::npos);
+                if (c->hift_simdconv_enabled && simd_resblock)
+                    continue;
+                // Exclude ConvTranspose1d upsample weights (.ups.): they go through
+                // core_convt's decomposed permute path, not ggml_conv_1d, and the
+                // permute below reads the F16 original from c->tensors — swapping
+                // them to F32 would feed garbage to permute_convt1d_weight.
+                if (kv.first.find(".ups.") != std::string::npos)
+                    continue;
+                // Route each kernel to a cache on ITS OWN backend so the swap
+                // preserves split-load placement. CPU-only mode → all on c->backend.
+                const bool on_cpu =
+                    have_gpu && w->buffer && cpu_buft && ggml_backend_buffer_get_type(w->buffer) == cpu_buft;
+                (on_cpu ? cpu_k : gpu_k).push_back(w);
+            }
+            c->fc_gpu.bake(c->backend, gpu_k, true);
+            if (have_gpu)
+                c->fc_cpu.bake(c->backend_cpu, cpu_k, true);
+            size_t swapped = 0;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                ggml_tensor* f = c->fc_gpu.get(w);
+                if (f == w)
+                    f = c->fc_cpu.get(w);
+                if (f != w) {
+                    kv.second = f;
+                    swapped++;
+                }
+            }
+            if (verbosity >= 1 || std::getenv("CRISPASR_S3GEN_FASTCONV_DEBUG")) {
+                fprintf(stderr, "s3gen: FASTCONV ON — baked %zu GPU + %zu CPU F16 conv kernels → F32 (%zu swapped)\n",
+                        c->fc_gpu.f32.size(), c->fc_cpu.f32.size(), swapped);
             }
         }
     }
@@ -2613,7 +2756,28 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
     // The batch=2 graph fuses both into one Metal dispatch so attention GEMMs (≈90% of
     // compute) run as batched matmuls rather than two sequential single-batch calls.
     // Opt out with CRISPASR_S3GEN_UNET_CFG_SINGLE=1 to force the old sequential path.
-    const bool use_cfg_b2 = (cfg_rate > 0.0f && !meanflow) && !std::getenv("CRISPASR_S3GEN_UNET_CFG_SINGLE");
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond UNet pass only every K CFM Euler steps and reuse the cached uncond
+    // velocity in between; the cond pass stays fresh every step; the first and last
+    // step always recompute. K>1 forces the SEQUENTIAL single-UNet path (the batched
+    // B2 graph fuses cond+uncond in one dispatch, so there is nothing to skip), then
+    // skips the uncond pass. Only active when K>1 && cfg_rate>0 && !meanflow, so at the
+    // default the batched B2 path below is byte-for-byte unchanged (K=1 = exact).
+    // Gated CRISPASR_S3GEN_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_S3GEN_CFG_INTERVAL");
+        const int k = e ? std::atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool cfg_interval_on = cfg_interval > 1 && cfg_rate > 0.0f && !meanflow;
+    std::vector<float> v_uncond_cache; // last computed uncond velocity; reused between recomputes
+    if (cfg_interval_on && c->verbosity >= 1)
+        fprintf(stderr, "s3gen: interval-CFG K=%d (uncond UNet pass recomputed every %d steps; first+last always)\n",
+                cfg_interval, cfg_interval);
+
+    // B2 fuses cond+uncond; interval needs the standalone uncond pass to skip → force single.
+    const bool use_cfg_b2 =
+        (cfg_rate > 0.0f && !meanflow) && !std::getenv("CRISPASR_S3GEN_UNET_CFG_SINGLE") && !cfg_interval_on;
 
     // Reusable input buffer for batch=2: (T, 320, 2) — cond in batch 0, uncond in batch 1.
     std::vector<float> b2_input(use_cfg_b2 ? T_mel * 320 * 2 : 0, 0.0f);
@@ -2702,7 +2866,7 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             } else {
                 // ── Legacy ggml_backend_sched path (default) ──────────────────
                 // Rebuild graph each step (sched mutates it on alloc; not reusable).
-                const bool bench_alloc = std::getenv("CHATTERBOX_BENCH") != nullptr;
+                const bool bench_alloc = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH") != nullptr;
                 int64_t t_alloc0 = bench_alloc ? ggml_time_us() : 0;
                 gf_b2 = build_graph_unet1d_b2(c, T_mel);
                 ggml_backend_sched_reset(c->sched);
@@ -2814,8 +2978,19 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             break;
 
         std::vector<float> v_uncond;
-        if (cfg_rate > 0.0f && !meanflow)
-            v_uncond = run_denoiser(std::vector<float>(T_mel * 320, 0.0f));
+        if (cfg_rate > 0.0f && !meanflow) {
+            // Interval-CFG: recompute the uncond pass on the first + last step and
+            // every K-th step; otherwise reuse the cached uncond velocity (the approximation).
+            const bool recompute_unc =
+                !cfg_interval_on || v_uncond_cache.empty() || (step % cfg_interval == 0) || (step == n_steps - 1);
+            if (recompute_unc) {
+                v_uncond = run_denoiser(std::vector<float>(T_mel * 320, 0.0f));
+                if (cfg_interval_on && !v_uncond.empty())
+                    v_uncond_cache = v_uncond;
+            } else {
+                v_uncond = v_uncond_cache; // reuse stale uncond velocity
+            }
+        }
 
         ggml_tensor* out_t = ggml_graph_get_tensor(gf, "denoiser_out");
         int out_T = (int)out_t->ne[0];
@@ -2926,31 +3101,13 @@ static std::vector<float> run_f0_predictor(chatterbox_s3gen_context* c,
         if (bt)
             ggml_backend_tensor_get(bt, b.data(), 0, C_out * sizeof(float));
 
-        // Conv1d with padding=1 (symmetric): out[t] = sum over k,c_in
-        // Input x is (T, C_in), weight is (C_out, C_in, K) in memory
-        // PyTorch Conv1d: out[co, t] = bias[co] + sum_ci sum_k w[co,ci,k] * x[ci, t+k-pad]
-        // Our layout: x[t * C_in + ci], w[co * C_in * K + ci * K + k]
+        // Conv1d(k=3,p=1) + ELU. Runtime dispatch selects AVX-512F, AVX2
+        // or NEON when supported, with a scalar fallback. Each SIMD lane
+        // preserves the original k -> ci accumulation order, and rows are
+        // partitioned using the Chatterbox thread budget in c->n_threads.
         std::vector<float> out(T_mel * C_out, 0.0f);
-        for (int t = 0; t < T_mel; t++) {
-            for (int co = 0; co < C_out; co++) {
-                float sum = b[co];
-                for (int k = 0; k < K; k++) {
-                    int tt = t + k - 1; // padding=1
-                    if (tt < 0 || tt >= T_mel)
-                        continue;
-                    for (int ci = 0; ci < C_in; ci++) {
-                        // w layout: (K, C_in, C_out) → w[k * C_in * C_out + ci * C_out + co]
-                        // Actually ggml stores as ne[0]=K, ne[1]=C_in, ne[2]=C_out
-                        // Memory: w[co * C_in * K + ci * K + k]
-                        sum += w_f32[co * C_in * K + ci * K + k] * x[tt * C_in + ci];
-                    }
-                }
-                // ELU activation
-                if (sum < 0)
-                    sum = std::exp(sum) - 1.0f;
-                out[t * C_out + co] = sum;
-            }
-        }
+        core_chatterbox_f0::Conv1dEluK3{x.data(), w_f32.data(), b.data(), out.data(), T_mel, C_in, C_out}.run(
+            c->n_threads);
         x = std::move(out);
     }
 
@@ -2989,6 +3146,43 @@ static std::vector<float> run_f0_predictor(chatterbox_s3gen_context* c,
     }
 
     return f0;
+}
+
+// Model-specific ResBlock logic; layout conversion + custom Conv1d execution
+// live in core_hift_simdconv and are shared with CosyVoice3.
+static ggml_tensor* hift_simd_to_tm(ggml_context* ctx, ggml_tensor* x) {
+    return core_hift_simdconv::to_time_major(ctx, x);
+}
+
+static ggml_tensor* hift_simd_from_tm(ggml_context* ctx, ggml_tensor* x_tm) {
+    return core_hift_simdconv::from_time_major(ctx, x_tm);
+}
+
+static ggml_tensor* hift_snake_tm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
+    if (!alpha)
+        return x;
+    ggml_tensor* a = ggml_reshape_2d(ctx, alpha, (int)alpha->ne[0], 1);
+    ggml_tensor* ax = ggml_mul(ctx, x, a);
+    ggml_tensor* s = ggml_sin(ctx, ax);
+    ggml_tensor* s2 = ggml_mul(ctx, s, s);
+    ggml_tensor* a_safe = ggml_scale_bias(ctx, a, 1.0f, 1e-9f);
+    return ggml_add(ctx, x, ggml_div(ctx, s2, a_safe));
+}
+
+static ggml_tensor* hift_resblock_simd_tm(ggml_context* ctx, chatterbox_s3gen_context* c, ggml_tensor* x,
+                                          const char* prefix, int index, const chatterbox_hift_simd_resblock& rb) {
+    for (int d = 0; d < 3; ++d) {
+        ggml_tensor* residual = x;
+        char key[64];
+        std::snprintf(key, sizeof(key), "%s.%d.a1.%d.alpha", prefix, index, d);
+        x = hift_snake_tm(ctx, x, T(c, key));
+        x = core_hift_simdconv::conv_tm(ctx, x, rb.c1[d], c->n_threads);
+        std::snprintf(key, sizeof(key), "%s.%d.a2.%d.alpha", prefix, index, d);
+        x = hift_snake_tm(ctx, x, T(c, key));
+        x = core_hift_simdconv::conv_tm(ctx, x, rb.c2[d], c->n_threads);
+        x = ggml_add(ctx, x, residual);
+    }
+    return x;
 }
 
 // HiFTGenerator vocoder: mel (80, T) → waveform via learned upsampling + iSTFT
@@ -3062,6 +3256,9 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
     ggml_set_name(s_stft, "source_stft");
     ggml_set_input(s_stft);
 
+    // Detailed stage dumps retain the legacy layout so their byte interpretation stays stable.
+    const bool use_simdconv = c->hift_simdconv_enabled && stage_dump == nullptr;
+
     // 3 upsample stages
     const int strides[] = {8, 5, 3};
     const int kernels[] = {16, 11, 7};
@@ -3127,56 +3324,62 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
                 si = ggml_add(ctx0, si, ggml_reshape_2d(ctx0, sd_b, 1, (int)sd_b->ne[0]));
             const int srb_kernels[] = {7, 7, 11};
             const int srb_dilations[][3] = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
-            ggml_tensor* srb_in = si;
-            for (int d = 0; d < 3; d++) {
-                char key2[48];
-                int dil = srb_dilations[stage][d];
-                int k2 = srb_kernels[stage];
-                int pad2 = (k2 * dil - dil) / 2;
-                std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.a1.%d.alpha", stage, d);
-                ggml_tensor* sa1 = T(c, key2);
-                if (sa1) {
-                    ggml_tensor* a = ggml_reshape_2d(ctx0, sa1, 1, (int)sa1->ne[0]);
-                    ggml_tensor* ax = ggml_mul(ctx0, si, a);
-                    ggml_tensor* s_ax = ggml_sin(ctx0, ax);
-                    // Snake: x + sin^2(α x) / (α + ε). Python applies ε = 1e-9 inside the
-                    // divisor (chatterbox/models/s3gen/transformer/activation.py:71,82) to
-                    // tame the trained-α-near-zero case; we must match it bit-for-bit, since
-                    // small post-training α values at specific channels otherwise blow up
-                    // the source-resblock branch and contaminate the late upsample stages.
-                    ggml_tensor* a_safe = ggml_scale_bias(ctx0, a, 1.0f, 1e-9f);
-                    si = ggml_add(ctx0, si, ggml_div(ctx0, ggml_mul(ctx0, s_ax, s_ax), a_safe));
+            if (use_simdconv) {
+                ggml_tensor* si_tm = hift_simd_to_tm(ctx0, si);
+                si_tm = hift_resblock_simd_tm(ctx0, c, si_tm, "s3.v.srb", stage, c->hift_source_simd[stage]);
+                si = hift_simd_from_tm(ctx0, si_tm);
+            } else {
+                ggml_tensor* srb_in = si;
+                for (int d = 0; d < 3; d++) {
+                    char key2[48];
+                    int dil = srb_dilations[stage][d];
+                    int k2 = srb_kernels[stage];
+                    int pad2 = (k2 * dil - dil) / 2;
+                    std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.a1.%d.alpha", stage, d);
+                    ggml_tensor* sa1 = T(c, key2);
+                    if (sa1) {
+                        ggml_tensor* a = ggml_reshape_2d(ctx0, sa1, 1, (int)sa1->ne[0]);
+                        ggml_tensor* ax = ggml_mul(ctx0, si, a);
+                        ggml_tensor* s_ax = ggml_sin(ctx0, ax);
+                        // Snake: x + sin^2(α x) / (α + ε). Python applies ε = 1e-9 inside the
+                        // divisor (chatterbox/models/s3gen/transformer/activation.py:71,82) to
+                        // tame the trained-α-near-zero case; we must match it bit-for-bit, since
+                        // small post-training α values at specific channels otherwise blow up
+                        // the source-resblock branch and contaminate the late upsample stages.
+                        ggml_tensor* a_safe = ggml_scale_bias(ctx0, a, 1.0f, 1e-9f);
+                        si = ggml_add(ctx0, si, ggml_div(ctx0, ggml_mul(ctx0, s_ax, s_ax), a_safe));
+                    }
+                    std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c1.%d.weight", stage, d);
+                    ggml_tensor* sc1w = T(c, key2);
+                    std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c1.%d.bias", stage, d);
+                    ggml_tensor* sc1b = T(c, key2);
+                    if (sc1w) {
+                        si = ggml_conv_1d(ctx0, sc1w, si, 1, pad2, dil);
+                        if (sc1b)
+                            si = ggml_add(ctx0, si, ggml_reshape_2d(ctx0, sc1b, 1, (int)sc1b->ne[0]));
+                    }
+                    std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.a2.%d.alpha", stage, d);
+                    ggml_tensor* sa2 = T(c, key2);
+                    if (sa2) {
+                        ggml_tensor* a2 = ggml_reshape_2d(ctx0, sa2, 1, (int)sa2->ne[0]);
+                        ggml_tensor* ax2 = ggml_mul(ctx0, si, a2);
+                        ggml_tensor* s_ax2 = ggml_sin(ctx0, ax2);
+                        ggml_tensor* a2_safe = ggml_scale_bias(ctx0, a2, 1.0f, 1e-9f);
+                        si = ggml_add(ctx0, si, ggml_div(ctx0, ggml_mul(ctx0, s_ax2, s_ax2), a2_safe));
+                    }
+                    std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c2.%d.weight", stage, d);
+                    ggml_tensor* sc2w = T(c, key2);
+                    std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c2.%d.bias", stage, d);
+                    ggml_tensor* sc2b = T(c, key2);
+                    if (sc2w) {
+                        int p2 = (k2 - 1) / 2;
+                        si = ggml_conv_1d(ctx0, sc2w, si, 1, p2, 1);
+                        if (sc2b)
+                            si = ggml_add(ctx0, si, ggml_reshape_2d(ctx0, sc2b, 1, (int)sc2b->ne[0]));
+                    }
+                    si = ggml_add(ctx0, si, srb_in);
+                    srb_in = si;
                 }
-                std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c1.%d.weight", stage, d);
-                ggml_tensor* sc1w = T(c, key2);
-                std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c1.%d.bias", stage, d);
-                ggml_tensor* sc1b = T(c, key2);
-                if (sc1w) {
-                    si = ggml_conv_1d(ctx0, sc1w, si, 1, pad2, dil);
-                    if (sc1b)
-                        si = ggml_add(ctx0, si, ggml_reshape_2d(ctx0, sc1b, 1, (int)sc1b->ne[0]));
-                }
-                std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.a2.%d.alpha", stage, d);
-                ggml_tensor* sa2 = T(c, key2);
-                if (sa2) {
-                    ggml_tensor* a2 = ggml_reshape_2d(ctx0, sa2, 1, (int)sa2->ne[0]);
-                    ggml_tensor* ax2 = ggml_mul(ctx0, si, a2);
-                    ggml_tensor* s_ax2 = ggml_sin(ctx0, ax2);
-                    ggml_tensor* a2_safe = ggml_scale_bias(ctx0, a2, 1.0f, 1e-9f);
-                    si = ggml_add(ctx0, si, ggml_div(ctx0, ggml_mul(ctx0, s_ax2, s_ax2), a2_safe));
-                }
-                std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c2.%d.weight", stage, d);
-                ggml_tensor* sc2w = T(c, key2);
-                std::snprintf(key2, sizeof(key2), "s3.v.srb.%d.c2.%d.bias", stage, d);
-                ggml_tensor* sc2b = T(c, key2);
-                if (sc2w) {
-                    int p2 = (k2 - 1) / 2;
-                    si = ggml_conv_1d(ctx0, sc2w, si, 1, p2, 1);
-                    if (sc2b)
-                        si = ggml_add(ctx0, si, ggml_reshape_2d(ctx0, sc2b, 1, (int)sc2b->ne[0]));
-                }
-                si = ggml_add(ctx0, si, srb_in);
-                srb_in = si;
             }
             int T_x = (int)x->ne[0];
             int T_si = (int)si->ne[0];
@@ -3213,121 +3416,133 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
         // then outputs averaged: x = (rb0(x) + rb1(x) + rb2(x)) / 3
         const int rb_kernels[] = {3, 7, 11};
         const int rb_dilations[][3] = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
-        ggml_tensor* rb_sum = nullptr;
-        ggml_tensor* rb_input = x; // save input for each independent ResBlock
-        for (int rb = 0; rb < 3; rb++) {
-            x = rb_input; // reset to same input for each ResBlock
-            int rb_idx = stage * 3 + rb;
-            // ResBlock: for each of 3 dilated passes: snake1 → conv1(dilated) → snake2 → conv2 → residual
-            ggml_tensor* rb_residual = x;
-            for (int d = 0; d < 3; d++) {
-                char key[48];
-                int dil = rb_dilations[rb][d];
-                int k = rb_kernels[rb];
-                int pad = (k * dil - dil) / 2; // get_padding(k, dil)
+        if (use_simdconv) {
+            ggml_tensor* rb_input_tm = hift_simd_to_tm(ctx0, x);
+            ggml_tensor* rb_sum_tm = nullptr;
+            for (int rb = 0; rb < 3; ++rb) {
+                const int rb_idx = stage * 3 + rb;
+                ggml_tensor* r =
+                    hift_resblock_simd_tm(ctx0, c, rb_input_tm, "s3.v.rb", rb_idx, c->hift_main_simd[rb_idx]);
+                rb_sum_tm = rb_sum_tm ? ggml_add(ctx0, rb_sum_tm, r) : r;
+            }
+            x = hift_simd_from_tm(ctx0, ggml_scale(ctx0, rb_sum_tm, 1.0f / 3.0f));
+        } else {
+            ggml_tensor* rb_sum = nullptr;
+            ggml_tensor* rb_input = x; // save input for each independent ResBlock
+            for (int rb = 0; rb < 3; rb++) {
+                x = rb_input; // reset to same input for each ResBlock
+                int rb_idx = stage * 3 + rb;
+                // ResBlock: for each of 3 dilated passes: snake1 → conv1(dilated) → snake2 → conv2 → residual
+                ggml_tensor* rb_residual = x;
+                for (int d = 0; d < 3; d++) {
+                    char key[48];
+                    int dil = rb_dilations[rb][d];
+                    int k = rb_kernels[rb];
+                    int pad = (k * dil - dil) / 2; // get_padding(k, dil)
 
-                // Snake activation 1: x + (1/alpha) * sin²(alpha * x)
-                std::snprintf(key, sizeof(key), "s3.v.rb.%d.a1.%d.alpha", rb_idx, d);
-                ggml_tensor* alpha1 = T(c, key);
-                if (alpha1) {
-                    ggml_tensor* a = ggml_reshape_2d(ctx0, alpha1, 1, (int)alpha1->ne[0]);
-                    ggml_tensor* ax = ggml_mul(ctx0, x, a);
-                    ggml_tensor* sin_ax = ggml_sin(ctx0, ax);
-                    ggml_tensor* sin2 = ggml_mul(ctx0, sin_ax, sin_ax);
-                    // ε = 1e-9 to match Python's Snake.no_div_by_zero
-                    // (s3gen/transformer/activation.py:71). Same fix as in source-resblock above.
-                    ggml_tensor* a_safe = ggml_scale_bias(ctx0, a, 1.0f, 1e-9f);
-                    ggml_tensor* sin2_over_a = ggml_div(ctx0, sin2, a_safe);
-                    x = ggml_add(ctx0, x, sin2_over_a);
-                }
-                // Debug markers for sub-operations within snake1
-                if (stage_dump && stage == 0 && rb == 0) {
-                    char dname[48];
-                    std::snprintf(dname, sizeof(dname), "voc_rb0k0_snake1_d%d", d);
-                    ggml_set_name(x, dname);
-                    ggml_set_output(x);
-                    if (d == 0) {
-                        // Also dump the alpha*x and sin²/alpha intermediates
-                        if (alpha1) {
-                            ggml_tensor* a = ggml_reshape_2d(ctx0, alpha1, 1, (int)alpha1->ne[0]);
-                            ggml_set_name(a, "dbg_alpha_reshaped");
-                            ggml_set_output(a);
+                    // Snake activation 1: x + (1/alpha) * sin²(alpha * x)
+                    std::snprintf(key, sizeof(key), "s3.v.rb.%d.a1.%d.alpha", rb_idx, d);
+                    ggml_tensor* alpha1 = T(c, key);
+                    if (alpha1) {
+                        ggml_tensor* a = ggml_reshape_2d(ctx0, alpha1, 1, (int)alpha1->ne[0]);
+                        ggml_tensor* ax = ggml_mul(ctx0, x, a);
+                        ggml_tensor* sin_ax = ggml_sin(ctx0, ax);
+                        ggml_tensor* sin2 = ggml_mul(ctx0, sin_ax, sin_ax);
+                        // ε = 1e-9 to match Python's Snake.no_div_by_zero
+                        // (s3gen/transformer/activation.py:71). Same fix as in source-resblock above.
+                        ggml_tensor* a_safe = ggml_scale_bias(ctx0, a, 1.0f, 1e-9f);
+                        ggml_tensor* sin2_over_a = ggml_div(ctx0, sin2, a_safe);
+                        x = ggml_add(ctx0, x, sin2_over_a);
+                    }
+                    // Debug markers for sub-operations within snake1
+                    if (stage_dump && stage == 0 && rb == 0) {
+                        char dname[48];
+                        std::snprintf(dname, sizeof(dname), "voc_rb0k0_snake1_d%d", d);
+                        ggml_set_name(x, dname);
+                        ggml_set_output(x);
+                        if (d == 0) {
+                            // Also dump the alpha*x and sin²/alpha intermediates
+                            if (alpha1) {
+                                ggml_tensor* a = ggml_reshape_2d(ctx0, alpha1, 1, (int)alpha1->ne[0]);
+                                ggml_set_name(a, "dbg_alpha_reshaped");
+                                ggml_set_output(a);
+                            }
                         }
                     }
-                }
 
-                // Conv1d with dilation
-                std::snprintf(key, sizeof(key), "s3.v.rb.%d.c1.%d.weight", rb_idx, d);
-                ggml_tensor* c1w = T(c, key);
-                std::snprintf(key, sizeof(key), "s3.v.rb.%d.c1.%d.bias", rb_idx, d);
-                ggml_tensor* c1b = T(c, key);
-                if (c1w) {
-                    x = ggml_conv_1d(ctx0, c1w, x, 1, pad, dil);
-                    if (c1b)
-                        x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, c1b, 1, (int)c1b->ne[0]));
-                }
-                if (stage_dump && stage == 0 && rb == 0) {
-                    char dname[48];
-                    std::snprintf(dname, sizeof(dname), "voc_rb0k0_conv1_d%d", d);
-                    ggml_set_name(x, dname);
-                    ggml_set_output(x);
-                }
+                    // Conv1d with dilation
+                    std::snprintf(key, sizeof(key), "s3.v.rb.%d.c1.%d.weight", rb_idx, d);
+                    ggml_tensor* c1w = T(c, key);
+                    std::snprintf(key, sizeof(key), "s3.v.rb.%d.c1.%d.bias", rb_idx, d);
+                    ggml_tensor* c1b = T(c, key);
+                    if (c1w) {
+                        x = ggml_conv_1d(ctx0, c1w, x, 1, pad, dil);
+                        if (c1b)
+                            x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, c1b, 1, (int)c1b->ne[0]));
+                    }
+                    if (stage_dump && stage == 0 && rb == 0) {
+                        char dname[48];
+                        std::snprintf(dname, sizeof(dname), "voc_rb0k0_conv1_d%d", d);
+                        ggml_set_name(x, dname);
+                        ggml_set_output(x);
+                    }
 
-                // Snake activation 2
-                std::snprintf(key, sizeof(key), "s3.v.rb.%d.a2.%d.alpha", rb_idx, d);
-                ggml_tensor* alpha2 = T(c, key);
-                if (alpha2) {
-                    ggml_tensor* a2 = ggml_reshape_2d(ctx0, alpha2, 1, (int)alpha2->ne[0]);
-                    ggml_tensor* ax2 = ggml_mul(ctx0, x, a2);
-                    ggml_tensor* sin_ax2 = ggml_sin(ctx0, ax2);
-                    ggml_tensor* sin2_2 = ggml_mul(ctx0, sin_ax2, sin_ax2);
-                    ggml_tensor* a2_safe = ggml_scale_bias(ctx0, a2, 1.0f, 1e-9f);
-                    ggml_tensor* sin2_over_a2 = ggml_div(ctx0, sin2_2, a2_safe);
-                    x = ggml_add(ctx0, x, sin2_over_a2);
-                }
-                if (stage_dump && stage == 0 && rb == 0) {
-                    char dname[48];
-                    std::snprintf(dname, sizeof(dname), "voc_rb0k0_snake2_d%d", d);
-                    ggml_set_name(x, dname);
-                    ggml_set_output(x);
-                }
+                    // Snake activation 2
+                    std::snprintf(key, sizeof(key), "s3.v.rb.%d.a2.%d.alpha", rb_idx, d);
+                    ggml_tensor* alpha2 = T(c, key);
+                    if (alpha2) {
+                        ggml_tensor* a2 = ggml_reshape_2d(ctx0, alpha2, 1, (int)alpha2->ne[0]);
+                        ggml_tensor* ax2 = ggml_mul(ctx0, x, a2);
+                        ggml_tensor* sin_ax2 = ggml_sin(ctx0, ax2);
+                        ggml_tensor* sin2_2 = ggml_mul(ctx0, sin_ax2, sin_ax2);
+                        ggml_tensor* a2_safe = ggml_scale_bias(ctx0, a2, 1.0f, 1e-9f);
+                        ggml_tensor* sin2_over_a2 = ggml_div(ctx0, sin2_2, a2_safe);
+                        x = ggml_add(ctx0, x, sin2_over_a2);
+                    }
+                    if (stage_dump && stage == 0 && rb == 0) {
+                        char dname[48];
+                        std::snprintf(dname, sizeof(dname), "voc_rb0k0_snake2_d%d", d);
+                        ggml_set_name(x, dname);
+                        ggml_set_output(x);
+                    }
 
-                // Conv2 (dilation=1)
-                std::snprintf(key, sizeof(key), "s3.v.rb.%d.c2.%d.weight", rb_idx, d);
-                ggml_tensor* c2w = T(c, key);
-                std::snprintf(key, sizeof(key), "s3.v.rb.%d.c2.%d.bias", rb_idx, d);
-                ggml_tensor* c2b = T(c, key);
-                if (c2w) {
-                    int pad2 = (k - 1) / 2; // dilation=1, symmetric padding
-                    x = ggml_conv_1d(ctx0, c2w, x, 1, pad2, 1);
-                    if (c2b)
-                        x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, c2b, 1, (int)c2b->ne[0]));
-                }
-                if (stage_dump && stage == 0 && rb == 0) {
-                    char dname[48];
-                    std::snprintf(dname, sizeof(dname), "voc_rb0k0_conv2_d%d", d);
-                    ggml_set_name(x, dname);
-                    ggml_set_output(x);
-                }
+                    // Conv2 (dilation=1)
+                    std::snprintf(key, sizeof(key), "s3.v.rb.%d.c2.%d.weight", rb_idx, d);
+                    ggml_tensor* c2w = T(c, key);
+                    std::snprintf(key, sizeof(key), "s3.v.rb.%d.c2.%d.bias", rb_idx, d);
+                    ggml_tensor* c2b = T(c, key);
+                    if (c2w) {
+                        int pad2 = (k - 1) / 2; // dilation=1, symmetric padding
+                        x = ggml_conv_1d(ctx0, c2w, x, 1, pad2, 1);
+                        if (c2b)
+                            x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, c2b, 1, (int)c2b->ne[0]));
+                    }
+                    if (stage_dump && stage == 0 && rb == 0) {
+                        char dname[48];
+                        std::snprintf(dname, sizeof(dname), "voc_rb0k0_conv2_d%d", d);
+                        ggml_set_name(x, dname);
+                        ggml_set_output(x);
+                    }
 
-                // Residual
-                x = ggml_add(ctx0, x, rb_residual);
-                rb_residual = x;
-                if (stage_dump && stage == 0 && rb == 0) {
-                    char dname[48];
-                    std::snprintf(dname, sizeof(dname), "voc_rb0k0_res_d%d", d);
-                    ggml_set_name(x, dname);
-                    ggml_set_output(x);
+                    // Residual
+                    x = ggml_add(ctx0, x, rb_residual);
+                    rb_residual = x;
+                    if (stage_dump && stage == 0 && rb == 0) {
+                        char dname[48];
+                        std::snprintf(dname, sizeof(dname), "voc_rb0k0_res_d%d", d);
+                        ggml_set_name(x, dname);
+                        ggml_set_output(x);
+                    }
                 }
+                // Accumulate for averaging
+                if (!rb_sum)
+                    rb_sum = x;
+                else
+                    rb_sum = ggml_add(ctx0, rb_sum, x);
             }
-            // Accumulate for averaging
-            if (!rb_sum)
-                rb_sum = x;
-            else
-                rb_sum = ggml_add(ctx0, rb_sum, x);
+            // Average the 3 ResBlock outputs
+            x = ggml_scale(ctx0, rb_sum, 1.0f / 3.0f);
         }
-        // Average the 3 ResBlock outputs
-        x = ggml_scale(ctx0, rb_sum, 1.0f / 3.0f);
         {
             char rname[32];
             std::snprintf(rname, sizeof(rname), "voc_rb_%d", stage);

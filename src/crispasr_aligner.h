@@ -33,10 +33,17 @@
 #include <string>
 #include <vector>
 
+struct CrispasrAlignedCharacter {
+    std::string text;
+    int64_t t0_cs = 0;
+    int64_t t1_cs = 0;
+};
+
 struct CrispasrAlignedWord {
     std::string text;
     int64_t t0_cs = 0; // centiseconds, absolute (includes t_offset_cs)
     int64_t t1_cs = 0;
+    std::vector<CrispasrAlignedCharacter> characters{}; // measured wav2vec2 CTC labels only
 };
 
 /// A re-timed segment: one input SRT cue (or one text line) with timings
@@ -49,6 +56,21 @@ struct CrispasrAlignedSegment {
     size_t word_end = 0;
 };
 
+// Absolute sample interval used when aligning one ASR segment.  Keeping this
+// calculation beside the aligner prevents per-slice callers from accidentally
+// feeding every segment the whole VAD slice (issue #444), which resets each
+// segment's timestamps to the same slice origin.
+struct CrispasrAlignmentAudioRange {
+    int start = 0;         // absolute sample index, inclusive
+    int end = 0;           // absolute sample index, exclusive
+    int64_t offset_cs = 0; // timestamp corresponding to start
+
+    bool valid() const { return end > start; }
+};
+
+CrispasrAlignmentAudioRange crispasr_alignment_audio_range(int64_t segment_t0_cs, int64_t segment_t1_cs,
+                                                           int slice_start, int slice_end, int sample_rate);
+
 /// Split text into alignment "words": whitespace-delimited for
 /// space-delimited languages, per-character for CJK. This is the exact
 /// splitter the aligner backends use — callers that map aligned words back
@@ -56,9 +78,22 @@ struct CrispasrAlignedSegment {
 /// naive space count.
 std::vector<std::string> crispasr_tokenise_align_words(const std::string& text);
 
+/// The same alignment units with punctuation reattached to the neighbouring
+/// unit for display. Alignment models must not receive punctuation timestamp
+/// slots, but subtitle splitting still needs sentence-ending marks on the
+/// returned words so it can use their measured times instead of interpolation.
+std::vector<std::string> crispasr_tokenise_align_display_words(const std::string& text);
+
 /// Parse SRT content into cue texts (indices and timestamps discarded,
 /// multi-line cue text joined with spaces, whitespace-only cues dropped).
 std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw);
+
+/// Parse CrispASR JSON output into segment texts. Extracts the "text" field
+/// from each object in the "transcription" array. Works with both the full
+/// JSON format (--output-json-full) and the plain format (--output-json).
+/// Also accepts the align-only JSON format (array of {text, start, end}).
+/// Returns empty on parse failure or missing transcription data.
+std::vector<std::string> crispasr_parse_json_segments(const std::string& raw);
 
 /// Group a flat word alignment back into the segment texts it was built
 /// from. `segment_texts` joined with spaces must equal the transcript the
@@ -77,10 +112,24 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// or GGUF architecture identifies that family. Models load and free inside the call —
 /// cost is dominated by the ASR pass upstream, not the aligner load.
 ///
+/// Canary/FastConformer inference uses overlapping encoder windows for long
+/// input (30-second cores by default), then one global transcript alignment.
+/// chunk_seconds changes the core duration; zero explicitly disables windowing.
+/// Host logits/DP memory still scales with recording length. VAD is not applied.
+///
 /// Returns an empty vector on any failure (error printed to stderr).
+///
+/// When `out_load_failed` is non-null it is set to `true` iff the aligner
+/// MODEL could not be loaded (as opposed to loading fine but yielding no words),
+/// so issue #311 --strict-pipeline can fail even when the backend's native word
+/// timestamps would otherwise mask an explicitly-requested aligner that never
+/// ran. Best-effort: covers the canary-CTC path (and any unrecognized/corrupt
+/// GGUF, which routes there); it stays `false` otherwise and never
+/// false-positives.
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads);
+                                                      int n_threads, bool* out_load_failed = nullptr,
+                                                      int chunk_seconds = 30);
 
 /// Free the cached aligner model context (§176e). Call at shutdown.
 void crispasr_aligner_free_cache();

@@ -19,6 +19,8 @@
 #include "core/lfr.h"
 #include "core/sanm.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
+#include "core/parallel_for.h"
 
 #include <algorithm>
 #include <cassert>
@@ -31,6 +33,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -43,7 +46,7 @@
 static bool sensevoice_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("SENSEVOICE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_SENSEVOICE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -130,8 +133,12 @@ struct sensevoice_model {
     sensevoice_hparams hparams;
     sensevoice_encoder enc;
     ggml_tensor* query_embed_w = nullptr; // (16, 560)
+    std::vector<float> query_embed_f32;   // cached dequantized query table (16 * 560)
     ggml_tensor* ctc_w = nullptr;         // (25055, 512)
     ggml_tensor* ctc_b = nullptr;         // (25055,)
+    // am.mvn: x = (x + shift) * scale on the LFR features. Upstream applies it;
+    // GGUFs converted before 2026-09 lack it (empty vectors).
+    std::vector<float> cmvn_shift, cmvn_scale;
 
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -282,8 +289,23 @@ static bool sensevoice_load_model(sensevoice_model& model, sensevoice_vocab& voc
     model.enc.tp_norm_w = require(model, "sensevoice.enc.tp_norm.w");
     model.enc.tp_norm_b = require(model, "sensevoice.enc.tp_norm.b");
     model.query_embed_w = require(model, "sensevoice.query_embed.w");
+    if (model.query_embed_w) {
+        model.query_embed_f32 = core_cpu::to_f32(model.query_embed_w);
+    }
     model.ctc_w = require(model, "sensevoice.ctc.w");
     model.ctc_b = require(model, "sensevoice.ctc.b");
+    ggml_tensor* cs = core_gguf::try_get(model.tensors, "sensevoice.cmvn_shift");
+    ggml_tensor* cc = core_gguf::try_get(model.tensors, "sensevoice.cmvn_scale");
+    if (cs && cc && ggml_nelements(cs) == (int64_t)model.hparams.input_size &&
+        ggml_nelements(cc) == (int64_t)model.hparams.input_size) {
+        model.cmvn_shift.resize((size_t)ggml_nelements(cs));
+        model.cmvn_scale.resize((size_t)ggml_nelements(cc));
+        ggml_backend_tensor_get(cs, model.cmvn_shift.data(), 0, ggml_nbytes(cs));
+        ggml_backend_tensor_get(cc, model.cmvn_scale.data(), 0, ggml_nbytes(cc));
+    } else {
+        fprintf(stderr, "sensevoice: this GGUF has no CMVN (am.mvn) tensors — it predates the fix, and its "
+                        "features differ from upstream's; re-download it from cstr/sensevoice-small-GGUF\n");
+    }
 
     compute_encoder_pe(model, 8192);
     return true;
@@ -310,6 +332,27 @@ static std::vector<float> sensevoice_compute_features(sensevoice_context* ctx, c
         return {};
     int T_lfr = 0;
     std::vector<float> lfr = core_lfr::stack(mel.data(), T, (int)hp.n_mels, (int)hp.lfr_m, (int)hp.lfr_n, T_lfr);
+    // CMVN, as upstream's WavFrontend (am.mvn): x = (x + shift) * scale
+    const auto& sh = ctx->model.cmvn_shift;
+    const auto& sc = ctx->model.cmvn_scale;
+    if (!sh.empty()) {
+        const size_t D = sh.size();
+        const float* sh_ptr = sh.data();
+        const float* sc_ptr = sc.data();
+        float* lfr_ptr = lfr.data();
+        auto apply_cmvn = [&](int t0, int t1) {
+            for (int t = t0; t < t1; t++) {
+                float* row = lfr_ptr + (size_t)t * D;
+                for (size_t d = 0; d < D; d++)
+                    row[d] = (row[d] + sh_ptr[d]) * sc_ptr[d];
+            }
+        };
+        if (T_lfr >= 16) {
+            core_parallel::for_each_chunk_work(T_lfr, ctx->n_threads, D * 2, 65536, apply_cmvn);
+        } else {
+            apply_cmvn(0, T_lfr);
+        }
+    }
     T_lfr_out = T_lfr;
     D_lfr_out = (int)hp.input_size;
     return lfr;
@@ -453,13 +496,21 @@ static std::vector<float> sensevoice_gather_query_rows(sensevoice_context* ctx, 
     const int row_ids[4] = {lang_id, (int)hp.event_query, (int)hp.emo_query, textnorm_id};
 
     std::vector<float> out((size_t)4 * (size_t)D_in, 0.0f);
-    ggml_tensor* emb = ctx->model.query_embed_w;
-    // emb is tiny (D_in, 16); dequantize the whole table (F32/F16/quantized-safe)
-    // and gather the 4 query rows. ggml layout ne0=D_in → row rid at [rid*D_in ...].
-    std::vector<float> emb_f32 = core_cpu::to_f32(emb);
-    for (int r = 0; r < 4; r++) {
-        const int rid = row_ids[r];
-        std::memcpy(out.data() + (size_t)r * D_in, emb_f32.data() + (size_t)rid * D_in, (size_t)D_in * sizeof(float));
+    const auto& emb_f32 = ctx->model.query_embed_f32;
+    if (!emb_f32.empty()) {
+        for (int r = 0; r < 4; r++) {
+            const int rid = row_ids[r];
+            std::memcpy(out.data() + (size_t)r * D_in, emb_f32.data() + (size_t)rid * D_in,
+                        (size_t)D_in * sizeof(float));
+        }
+    } else {
+        ggml_tensor* emb = ctx->model.query_embed_w;
+        std::vector<float> tmp_emb = core_cpu::to_f32(emb);
+        for (int r = 0; r < 4; r++) {
+            const int rid = row_ids[r];
+            std::memcpy(out.data() + (size_t)r * D_in, tmp_emb.data() + (size_t)rid * D_in,
+                        (size_t)D_in * sizeof(float));
+        }
     }
     return out;
 }
@@ -469,7 +520,9 @@ static std::vector<float> sensevoice_gather_query_rows(sensevoice_context* ctx, 
 // ===========================================================================
 
 static std::vector<int32_t> sensevoice_ctc_greedy(const float* logits, int T_total, int vocab, int blank_id) {
-    std::vector<int32_t> raw((size_t)T_total);
+    std::vector<int32_t> kept;
+    kept.reserve(T_total);
+    int32_t prev = -1;
     for (int t = 0; t < T_total; t++) {
         const float* row = logits + (size_t)t * vocab;
         int best = 0;
@@ -480,23 +533,13 @@ static std::vector<int32_t> sensevoice_ctc_greedy(const float* logits, int T_tot
                 best = v;
             }
         }
-        raw[(size_t)t] = best;
+        if (best != prev) {
+            prev = best;
+            if (best != (int32_t)blank_id) {
+                kept.push_back(best);
+            }
+        }
     }
-    // unique_consecutive — drop adjacent duplicates first
-    std::vector<int32_t> uc;
-    uc.reserve(raw.size());
-    int32_t prev = -1;
-    for (int32_t id : raw) {
-        if (id != prev)
-            uc.push_back(id);
-        prev = id;
-    }
-    // then drop blank_id
-    std::vector<int32_t> kept;
-    kept.reserve(uc.size());
-    for (int32_t id : uc)
-        if (id != (int32_t)blank_id)
-            kept.push_back(id);
     return kept;
 }
 
@@ -628,16 +671,23 @@ static std::string sensevoice_transcribe_impl(sensevoice_context* ctx, const flo
         // Convert raw logits to log-softmax first.
         const int V = (int)hp.vocab_size;
         std::vector<float> logprobs((size_t)T_total * V);
-        for (int t = 0; t < T_total; t++) {
-            const float* row = logits.data() + (size_t)t * V;
-            float* lp = logprobs.data() + (size_t)t * V;
-            float mx = *std::max_element(row, row + V);
-            double sum = 0.0;
-            for (int v = 0; v < V; v++)
-                sum += std::exp((double)(row[v] - mx));
-            double log_sum = (double)mx + std::log(sum);
-            for (int v = 0; v < V; v++)
-                lp[v] = (float)((double)row[v] - log_sum);
+        auto compute_logprobs = [&](int t0, int t1) {
+            for (int t = t0; t < t1; t++) {
+                const float* row = logits.data() + (size_t)t * V;
+                float* lp = logprobs.data() + (size_t)t * V;
+                float mx = *std::max_element(row, row + V);
+                double sum = 0.0;
+                for (int v = 0; v < V; v++)
+                    sum += std::exp((double)(row[v] - mx));
+                double log_sum = (double)mx + std::log(sum);
+                for (int v = 0; v < V; v++)
+                    lp[v] = (float)((double)row[v] - log_sum);
+            }
+        };
+        if (T_total >= 4) {
+            core_parallel::for_each_chunk_work(T_total, ctx->n_threads, (uint64_t)V * 4, 65536, compute_logprobs);
+        } else {
+            compute_logprobs(0, T_total);
         }
         auto br = core_ctc::prefix_beam_search(logprobs.data(), T_total, V, (int)hp.blank_id, /*shift=*/0,
                                                ctx->beam_size, ctx->beam_gamma);
@@ -665,17 +715,17 @@ extern "C" sensevoice_context* sensevoice_init_from_file(const char* path, sense
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!sensevoice_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        sensevoice_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -689,7 +739,7 @@ extern "C" sensevoice_context* sensevoice_init_from_file(const char* path, sense
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
-    if (const char* s = std::getenv("SENSEVOICE_NO_FA")) {
+    if (const char* s = crispasr_env::get("CRISPASR_SENSEVOICE_NO_FA")) {
         if (*s && *s != '0')
             ctx->enc_flash_attn = false;
     }
@@ -718,9 +768,9 @@ extern "C" void sensevoice_free(sensevoice_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)
@@ -728,19 +778,6 @@ extern "C" void sensevoice_free(sensevoice_context* ctx) {
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
         ggml_backend_free(ctx->backend_cpu);
     delete ctx;
-}
-
-extern "C" char* sensevoice_transcribe(sensevoice_context* ctx, const float* samples, int n_samples,
-                                       const char* language, bool use_itn) {
-    if (!ctx || !samples || n_samples <= 0)
-        return nullptr;
-    std::string s = sensevoice_transcribe_impl(ctx, samples, n_samples, language, use_itn, nullptr, nullptr);
-    char* out = (char*)std::malloc(s.size() + 1);
-    if (!out)
-        return nullptr;
-    std::memcpy(out, s.data(), s.size());
-    out[s.size()] = '\0';
-    return out;
 }
 
 namespace {
@@ -751,6 +788,11 @@ namespace {
 // not by the input query-embed order. Content classification is robust
 // to ordering surprises and to the model dropping a marker on degenerate
 // audio.
+//
+// The emotion marker is parsed only so it can be DROPPED. Its value is
+// classified into `emotion` and then discarded by both public entry points —
+// see the header for why CrispASR ships no emotion-recognition capability
+// (EU AI Act Art. 5(1)(f) / Annex III(1)(c); docs/eu-ai-act.md).
 struct sv_prefix {
     std::string language;
     std::string emotion;
@@ -808,6 +850,41 @@ static char* sv_dup(const std::string& s) {
 
 } // namespace
 
+extern "C" char* sensevoice_transcribe(sensevoice_context* ctx, const float* samples, int n_samples,
+                                       const char* language, bool use_itn) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::string s = sensevoice_transcribe_impl(ctx, samples, n_samples, language, use_itn, nullptr, nullptr);
+    // Strip the `<|lang|><|emotion|><|event|><|itn|>` annotation prefix. It used
+    // to be returned verbatim, so every session-ABI consumer (Python/Rust/Go/
+    // Dart/Java/C#/JS/WASM — src/crispasr_c_api.cpp routes sensevoice through
+    // here) got transcripts that literally began "<|en|><|HAPPY|><|Speech|>
+    // <|withitn|>". That both corrupted the transcript (docs/learnings.md:149
+    // logs it as a WER-normalisation problem) and leaked a per-utterance
+    // emotion inference onto every binding. Both entry points now drop it:
+    // sensevoice_transcribe_structured() keeps language/event/itn as fields,
+    // this one keeps nothing but the words.
+    const sv_prefix pre = sv_parse_prefix(s);
+    // Resolve the prefix and the SentencePiece ▁ artefact on the first
+    // post-prefix token into ONE offset. Erasing them in turn would memmove the
+    // whole transcript twice before the copy below copies it a third time.
+    // find_first_not_of, not a advance-past-whitespace loop: when everything
+    // after the prefix is whitespace the structured path leaves it alone
+    // (lead == npos short-circuits its erase), and the two entry points must
+    // not disagree about that.
+    size_t off = pre.consumed;
+    const size_t lead = s.find_first_not_of(" \t", off);
+    if (lead != std::string::npos)
+        off = lead;
+    const size_t n = s.size() - off;
+    char* out = (char*)std::malloc(n + 1);
+    if (!out)
+        return nullptr;
+    std::memcpy(out, s.data() + off, n);
+    out[n] = '\0';
+    return out;
+}
+
 extern "C" sensevoice_result* sensevoice_transcribe_structured(sensevoice_context* ctx, const float* samples,
                                                                int n_samples, const char* language, bool use_itn) {
     if (!ctx || !samples || n_samples <= 0)
@@ -826,12 +903,13 @@ extern "C" sensevoice_result* sensevoice_transcribe_structured(sensevoice_contex
     if (!r)
         return nullptr;
     r->language = sv_dup(pre.language);
-    r->emotion = sv_dup(pre.emotion);
+    // pre.emotion is intentionally NOT copied out — parsed only so the marker is
+    // stripped from `text`. See sensevoice.h / docs/eu-ai-act.md.
     r->audio_event = sv_dup(pre.audio_event);
     r->itn = sv_dup(pre.itn);
     r->text = sv_dup(text);
     r->raw = sv_dup(raw);
-    if (!r->language || !r->emotion || !r->audio_event || !r->itn || !r->text || !r->raw) {
+    if (!r->language || !r->audio_event || !r->itn || !r->text || !r->raw) {
         sensevoice_result_free(r);
         return nullptr;
     }
@@ -842,7 +920,6 @@ extern "C" void sensevoice_result_free(sensevoice_result* r) {
     if (!r)
         return;
     std::free(r->language);
-    std::free(r->emotion);
     std::free(r->audio_event);
     std::free(r->itn);
     std::free(r->text);

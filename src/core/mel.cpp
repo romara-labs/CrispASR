@@ -3,13 +3,24 @@
 
 #include "mel.h"
 
+#include "parallel_for.h"
+#include "crispasr_env.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+#if defined(__AVX__) || defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #if defined(HAVE_BLAS)
 #if defined(__APPLE__)
@@ -38,26 +49,26 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
     //     zero pad) — see NeMo FilterbankFeatures.forward.
     // -----------------------------------------------------------------
     std::vector<float> preemph_in;
-    const float* base_ptr = samples;
-    if (p.preemph != 0.0f && n_samples > 0) {
-        preemph_in.resize((size_t)n_samples);
-        preemph_in[0] = samples[0];
-        const float a = p.preemph;
-        for (int i = 1; i < n_samples; i++)
-            preemph_in[i] = samples[i] - a * samples[i - 1];
-        base_ptr = preemph_in.data();
-    }
+    std::vector<float> padded_in;
+    const float* in_ptr;
+    int in_len;
 
     // -----------------------------------------------------------------
     // 1b. Optional center-pad of the input by n_fft/2 on each side.
     // -----------------------------------------------------------------
-    std::vector<float> padded_in;
-    const float* in_ptr;
-    int in_len;
     if (p.center_pad) {
         const int pad = n_fft / 2;
         padded_in.assign((size_t)(pad + n_samples + pad), 0.0f);
-        std::memcpy(padded_in.data() + pad, base_ptr, (size_t)n_samples * sizeof(float));
+        float* dst = padded_in.data() + pad;
+        if (p.preemph != 0.0f && n_samples > 0) {
+            dst[0] = samples[0];
+            const float a = p.preemph;
+            for (int i = 1; i < n_samples; i++)
+                dst[i] = samples[i] - a * samples[i - 1];
+        } else if (n_samples > 0) {
+            std::memcpy(dst, samples, (size_t)n_samples * sizeof(float));
+        }
+        const float* base_ptr = dst;
         if (p.center_pad_reflect) {
             // Reflect-pad matching PyTorch's torch.nn.functional.pad(x, (pad, pad), "reflect").
             // Left: padded[pad-1-i] = base_ptr[i+1] for i in [0, pad)
@@ -75,6 +86,15 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         in_ptr = padded_in.data();
         in_len = (int)padded_in.size();
     } else {
+        const float* base_ptr = samples;
+        if (p.preemph != 0.0f && n_samples > 0) {
+            preemph_in.resize((size_t)n_samples);
+            preemph_in[0] = samples[0];
+            const float a = p.preemph;
+            for (int i = 1; i < n_samples; i++)
+                preemph_in[i] = samples[i] - a * samples[i - 1];
+            base_ptr = preemph_in.data();
+        }
         in_ptr = base_ptr;
         in_len = n_samples;
     }
@@ -123,7 +143,12 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
     // (audit: see Params::allow_parallel_stft) AND benched faster on the arch.
     // Measured (cohere, M1, 8 cores): warm STFT ~2.4× (43→18 ms / 800 frames).
     // Enabled by the global env var OR the per-backend Params flag.
-    const bool mel_parallel = (std::getenv("CRISPASR_MEL_PARALLEL") != nullptr) || p.allow_parallel_stft;
+    // #305: parallel STFT is now DEFAULT ON (opt out with CRISPASR_MEL_SERIAL=1).
+    // The §176f OpenMP path was `#ifdef _OPENMP` only and AppleClang ships no
+    // libomp → it was compiled out on macOS, so the win never reached this box;
+    // the portable std::thread path below fixes that. CRISPASR_MEL_PARALLEL and
+    // Params::allow_parallel_stft are kept for back-compat (now redundant).
+    const bool mel_parallel = (std::getenv("CRISPASR_MEL_SERIAL") == nullptr);
     const auto t_stft0 = std::chrono::steady_clock::now();
     bool ran_parallel = false;
 
@@ -132,7 +157,21 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         const bool use_magnitude = (p.spec_kind == SpecKind::Magnitude);
         auto compute_frame = [&](int t, float* fft_in, float* fft_out) {
             const float* frame = in_ptr + (size_t)(t + t_start) * hop;
-            for (int n = 0; n < n_fft; n++)
+            int n = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            for (; n + 3 < n_fft; n += 4) {
+                float32x4_t vf = vld1q_f32(frame + n);
+                float32x4_t vw = vld1q_f32(window.data() + n);
+                vst1q_f32(fft_in + n, vmulq_f32(vf, vw));
+            }
+#elif defined(__AVX__)
+            for (; n + 7 < n_fft; n += 8) {
+                __m256 vf = _mm256_loadu_ps(frame + n);
+                __m256 vw = _mm256_loadu_ps(window.data() + n);
+                _mm256_storeu_ps(fft_in + n, _mm256_mul_ps(vf, vw));
+            }
+#endif
+            for (; n < n_fft; n++)
                 fft_in[n] = frame[n] * window[n];
             fft(fft_in, n_fft, fft_out);
             for (int k = 0; k < n_freqs; k++) {
@@ -142,12 +181,17 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
                 power[(size_t)t * n_freqs + k] = use_magnitude ? std::sqrt(pw) : pw;
             }
         };
-#ifdef _OPENMP
         // Threshold: below ~256 frames (≈2.5 s at 100 fps) thread-spawn overhead
         // dominates the handful of FFTs, so stay serial regardless of the flag.
         if (mel_parallel && T >= 256) {
             ran_parallel = true;
-#pragma omp parallel
+#ifdef _OPENMP
+            // Scope the thread count to this region via num_threads() rather than
+            // omp_set_num_threads() so a caller-supplied budget (p.n_threads) can't
+            // race with concurrent callers of the global OpenMP state. p.n_threads=0
+            // keeps the previous omp_get_max_threads() default.
+            const int omp_nt = p.n_threads > 0 ? p.n_threads : omp_get_max_threads();
+#pragma omp parallel num_threads(omp_nt)
             {
                 std::vector<float> fft_in((size_t)n_fft);
                 std::vector<float> fft_out((size_t)n_fft * 2);
@@ -155,9 +199,22 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
                 for (int t = 0; t < T; t++)
                     compute_frame(t, fft_in.data(), fft_out.data());
             }
-        } else
+#else
+            // Portable std::thread path (§305): AppleClang ships no libomp, so the
+            // OpenMP path above is compiled out on macOS — without this the STFT
+            // stayed single-threaded there. Each chunk owns its FFT scratch and
+            // frames write disjoint `power` rows → data-race free, bit-identical.
+            // The 8-thread default cap is deliberate and predates the shared
+            // helper, so it is passed in rather than left to hardware_concurrency.
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            core_parallel::for_each_chunk(T, cap, [&](int t0, int t1) {
+                std::vector<float> fft_in((size_t)n_fft), fft_out((size_t)n_fft * 2);
+                for (int t = t0; t < t1; t++)
+                    compute_frame(t, fft_in.data(), fft_out.data());
+            });
 #endif
-        {
+        } else {
             std::vector<float> fft_in((size_t)n_fft);
             std::vector<float> fft_out((size_t)n_fft * 2);
             for (int t = 0; t < T; t++)
@@ -169,10 +226,15 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         const double stft_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stft0).count();
         int nthreads = 1;
+        if (ran_parallel) {
 #ifdef _OPENMP
-        if (ran_parallel)
-            nthreads = omp_get_max_threads();
+            nthreads = p.n_threads > 0 ? p.n_threads : omp_get_max_threads();
+#else
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            nthreads = std::min(cap, T);
 #endif
+        }
         fprintf(stderr, "core_mel: STFT %d frames (n_fft=%d) %.2f ms [%d thread(s)%s]\n", T, n_fft, stft_ms, nthreads,
                 ran_parallel ? "" : ", serial");
     }
@@ -184,8 +246,64 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
     // -----------------------------------------------------------------
     std::vector<float> mel_tn((size_t)T * nmels, 0.0f);
 
+// Independent rows preserve the original reduction order. Keep the
+// author's OpenMP path opt-in until each platform wins the full A/B.
+#ifdef _OPENMP
+    const bool projection_parallel = crispasr_env::truthy("CRISPASR_MEL_PROJECTION_PARALLEL");
+#endif
+    const auto t_projection0 = std::chrono::steady_clock::now();
+    int projection_threads = 1;
     auto do_matmul = [&](auto acc_zero) {
         using Acc = decltype(acc_zero);
+#ifdef _OPENMP
+        if (projection_parallel && T >= 64) {
+            const int omp_nt = p.n_threads > 0 ? p.n_threads : omp_get_max_threads();
+            projection_threads = omp_nt;
+#pragma omp parallel for num_threads(omp_nt) schedule(static)
+            for (int t = 0; t < T; t++) {
+                const float* pp = power.data() + (size_t)t * n_freqs;
+                float* mp = mel_tn.data() + (size_t)t * nmels;
+                for (int m = 0; m < nmels; m++) {
+                    Acc s = 0;
+                    if (p.fb_layout == FbLayout::MelsFreqs) {
+                        const float* fb = mel_fb + (size_t)m * n_freqs;
+                        for (int k = 0; k < n_freqs; k++)
+                            s += static_cast<Acc>(pp[k]) * static_cast<Acc>(fb[k]);
+                    } else {
+                        for (int k = 0; k < n_freqs; k++)
+                            s += static_cast<Acc>(pp[k]) * static_cast<Acc>(mel_fb[(size_t)k * nmels + m]);
+                    }
+                    mp[m] = (float)s;
+                }
+            }
+            return;
+        }
+#else
+        if (mel_parallel && T >= 64) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            projection_threads = std::min(cap, T);
+            core_parallel::for_each_chunk(T, cap, [&](int t0, int t1) {
+                for (int t = t0; t < t1; t++) {
+                    const float* pp = power.data() + (size_t)t * n_freqs;
+                    float* mp = mel_tn.data() + (size_t)t * nmels;
+                    for (int m = 0; m < nmels; m++) {
+                        Acc s = 0;
+                        if (p.fb_layout == FbLayout::MelsFreqs) {
+                            const float* fb = mel_fb + (size_t)m * n_freqs;
+                            for (int k = 0; k < n_freqs; k++)
+                                s += static_cast<Acc>(pp[k]) * static_cast<Acc>(fb[k]);
+                        } else {
+                            for (int k = 0; k < n_freqs; k++)
+                                s += static_cast<Acc>(pp[k]) * static_cast<Acc>(mel_fb[(size_t)k * nmels + m]);
+                        }
+                        mp[m] = (float)s;
+                    }
+                }
+            });
+            return;
+        }
+#endif
         for (int t = 0; t < T; t++) {
             const float* pp = power.data() + (size_t)t * n_freqs;
             float* mp = mel_tn.data() + (size_t)t * nmels;
@@ -224,6 +342,12 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
 #endif
     }
 
+    if (mel_timing) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_projection0).count();
+        fprintf(stderr, "core_mel: projection %d frames %.3f ms [%d thread(s)]\n", T, ms, projection_threads);
+    }
+
     // -----------------------------------------------------------------
     // 5. log with guard (no-op when log_base == None)
     // -----------------------------------------------------------------
@@ -244,8 +368,19 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         }
     };
     if (p.log_base != LogBase::None) {
-        for (size_t i = 0; i < mel_tn.size(); i++) {
-            mel_tn[i] = apply_log(mel_tn[i]);
+        const size_t total_elements = mel_tn.size();
+        if (mel_parallel && total_elements >= 2048) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            core_parallel::for_each_chunk((int)total_elements, cap, [&](int i0, int i1) {
+                for (int i = i0; i < i1; i++) {
+                    mel_tn[(size_t)i] = apply_log(mel_tn[(size_t)i]);
+                }
+            });
+        } else {
+            for (size_t i = 0; i < total_elements; i++) {
+                mel_tn[i] = apply_log(mel_tn[i]);
+            }
         }
     }
 
@@ -288,22 +423,47 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         // shift downstream encoder activations enough to cause TDT token
         // deletions on conversational JA audio (issue #37).
         const int denom = (T_final > 1) ? (T_final - 1) : 1;
-        for (int m = 0; m < nmels; m++) {
-            double sum = 0.0, sq = 0.0;
-            for (int t = 0; t < T_final; t++)
-                sum += mel_tn[(size_t)t * nmels + m];
-            const double mean = sum / T_final;
-            for (int t = 0; t < T_final; t++) {
-                const double d = mel_tn[(size_t)t * nmels + m] - mean;
-                sq += d * d;
-            }
-            float std_val = std::sqrt((float)(sq / denom));
-            if (!(std_val == std_val))
-                std_val = 0.0f;
-            std_val += 1e-5f;
-            const float inv_std = 1.0f / std_val;
-            for (int t = 0; t < T_final; t++) {
-                mel_tn[(size_t)t * nmels + m] = (float)(mel_tn[(size_t)t * nmels + m] - mean) * inv_std;
+        if (mel_parallel) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            core_parallel::for_each_chunk(nmels, cap, [&](int m0, int m1) {
+                for (int m = m0; m < m1; m++) {
+                    double sum = 0.0, sq = 0.0;
+                    for (int t = 0; t < T_final; t++)
+                        sum += mel_tn[(size_t)t * nmels + m];
+                    const double mean = sum / T_final;
+                    for (int t = 0; t < T_final; t++) {
+                        const double d = mel_tn[(size_t)t * nmels + m] - mean;
+                        sq += d * d;
+                    }
+                    float std_val = std::sqrt((float)(sq / denom));
+                    if (!(std_val == std_val))
+                        std_val = 0.0f;
+                    std_val += 1e-5f;
+                    const float inv_std = 1.0f / std_val;
+                    for (int t = 0; t < T_final; t++) {
+                        mel_tn[(size_t)t * nmels + m] = (float)(mel_tn[(size_t)t * nmels + m] - mean) * inv_std;
+                    }
+                }
+            });
+        } else {
+            for (int m = 0; m < nmels; m++) {
+                double sum = 0.0, sq = 0.0;
+                for (int t = 0; t < T_final; t++)
+                    sum += mel_tn[(size_t)t * nmels + m];
+                const double mean = sum / T_final;
+                for (int t = 0; t < T_final; t++) {
+                    const double d = mel_tn[(size_t)t * nmels + m] - mean;
+                    sq += d * d;
+                }
+                float std_val = std::sqrt((float)(sq / denom));
+                if (!(std_val == std_val))
+                    std_val = 0.0f;
+                std_val += 1e-5f;
+                const float inv_std = 1.0f / std_val;
+                for (int t = 0; t < T_final; t++) {
+                    mel_tn[(size_t)t * nmels + m] = (float)(mel_tn[(size_t)t * nmels + m] - mean) * inv_std;
+                }
             }
         }
         break;
@@ -365,9 +525,21 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
 
     // Transpose to (n_mels, T_final) row-major.
     std::vector<float> out((size_t)nmels * T_final, 0.0f);
-    for (int t = 0; t < T_final; t++) {
-        for (int m = 0; m < nmels; m++) {
-            out[(size_t)m * T_final + t] = mel_tn[(size_t)t * nmels + m];
+    if (mel_parallel && (size_t)nmels * T_final >= 2048) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+        core_parallel::for_each_chunk(nmels, cap, [&](int m0, int m1) {
+            for (int m = m0; m < m1; m++) {
+                for (int t = 0; t < T_final; t++) {
+                    out[(size_t)m * T_final + t] = mel_tn[(size_t)t * nmels + m];
+                }
+            }
+        });
+    } else {
+        for (int t = 0; t < T_final; t++) {
+            for (int m = 0; m < nmels; m++) {
+                out[(size_t)m * T_final + t] = mel_tn[(size_t)t * nmels + m];
+            }
         }
     }
     return out;

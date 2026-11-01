@@ -20,7 +20,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+#include "core/crispasr_env.h"
+#include "core/parallel_for.h"
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -33,7 +37,7 @@
 static bool marblenet_vad_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MARBLENET_VAD_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MARBLENET_VAD_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -100,6 +104,22 @@ struct marblenet_vad_context {
     ggml_backend_sched_t sched = nullptr;
 };
 
+// #305 audit: the ggml graph is multi-threaded (CPU backend), but the mel FFT
+// front-end was single-threaded — the recurring VAD bottleneck (see whisper-vad
+// / firered). Parallelize over frames. Opt out with CRISPASR_MARBLENET_VAD_SERIAL=1.
+static int marblenet_vad_nthreads() {
+    static int v = -1;
+    if (v < 0) {
+        if (crispasr_env::get("CRISPASR_MARBLENET_VAD_SERIAL") != nullptr) {
+            v = 1;
+        } else {
+            unsigned hw = std::thread::hardware_concurrency();
+            v = (hw == 0) ? 1 : (int)std::min(hw, 8u);
+        }
+    }
+    return v;
+}
+
 // ── Mel ────────────────────────────────────────────────────────────────────
 
 static void mbn_fft_dft(const float* in, int N, float* out) {
@@ -163,24 +183,28 @@ static std::vector<float> mbn_compute_mel(const float* pcm, int n_samples, const
     }
 
     std::vector<float> mel((size_t)n_mels * n_frames, 0);
-    std::vector<float> si(4 * n_fft, 0), so(8 * n_fft, 0);
 
-    for (int t = 0; t < n_frames; t++) {
-        // Window (win_len) centered in n_fft-sized frame, zero-padded
-        for (int i = 0; i < n_fft; i++)
-            si[i] = 0;
-        int frame_start = t * hop;
-        for (int i = 0; i < win_len && (frame_start + i) < padded_len; i++)
-            si[i] = padded[frame_start + i] * hann[i];
-        mbn_fft(si.data(), n_fft, so.data());
-        // Power spectrum
-        for (int f = 0; f < n_freqs; f++) {
-            float pw = so[2 * f] * so[2 * f] + so[2 * f + 1] * so[2 * f + 1];
-            // Mel projection: fb is [n_mels, n_freqs]
-            for (int m = 0; m < n_mels; m++)
-                mel[(size_t)m * n_frames + t] += pw * fb[m * n_freqs + f];
+    // Frames are independent (each writes its own mel column t); give each thread
+    // its own FFT scratch. Bit-identical to the serial loop (#305).
+    core_parallel::for_each_chunk(n_frames, marblenet_vad_nthreads(), [&](int t0, int t1) {
+        std::vector<float> si(4 * n_fft, 0), so(8 * n_fft, 0);
+        for (int t = t0; t < t1; t++) {
+            // Window (win_len) centered in n_fft-sized frame, zero-padded
+            for (int i = 0; i < n_fft; i++)
+                si[i] = 0;
+            int frame_start = t * hop;
+            for (int i = 0; i < win_len && (frame_start + i) < padded_len; i++)
+                si[i] = padded[frame_start + i] * hann[i];
+            mbn_fft(si.data(), n_fft, so.data());
+            // Power spectrum
+            for (int f = 0; f < n_freqs; f++) {
+                float pw = so[2 * f] * so[2 * f] + so[2 * f + 1] * so[2 * f + 1];
+                // Mel projection: fb is [n_mels, n_freqs]
+                for (int m = 0; m < n_mels; m++)
+                    mel[(size_t)m * n_frames + t] += pw * fb[m * n_freqs + f];
+            }
         }
-    }
+    });
     // Log + dither
     for (auto& v : mel)
         v = logf(v + 1e-5f);
@@ -236,8 +260,8 @@ extern "C" struct marblenet_vad_context* marblenet_vad_init(const char* path) {
     gguf_free(gctx);
 
     // Load weights
-    ctx->backend = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend, 4);
+    ctx->backend = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend, 4);
 
     struct gguf_init_params gp2 = {true, &m.ctx_w};
     gguf_context* gctx2 = gguf_init_from_file(path, gp2);

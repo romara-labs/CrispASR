@@ -59,10 +59,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+from csm_rope_config import write_csm_rope_metadata
+
 
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
@@ -360,6 +369,7 @@ def main():
                     help="HF model ID (e.g. sesame/csm-1b) or local dir")
     ap.add_argument("--output", required=True, help="Output GGUF path")
     ap.add_argument("--outtype", default="f16", choices=["f32", "f16"])
+    add_speaker_identity_arg(ap)
     args = ap.parse_args()
 
     model_dir = load_model_dir(args.input)
@@ -390,6 +400,7 @@ def main():
     dd_head_dim = int(dd_cfg.get("head_dim", dd_d_model // dd_n_heads))
     dd_ff_dim = int(dd_cfg.get("intermediate_size", 8192))
     dd_bb_hidden = int(dd_cfg.get("backbone_hidden_size", bb_d_model))
+    dd_max_pos = int(dd_cfg.get("max_position_embeddings", 33))
 
     # --- Mimi codec hparams ---
     mc_cfg = cfg.get("codec_config", {})
@@ -454,6 +465,7 @@ def main():
 
     # Metadata
     w.add_name("csm-1b")
+    stamp_speaker_identity(w, args)
 
     def u32(k, v): w.add_uint32(k, int(v))
     def f32(k, v): w.add_float32(k, float(v))
@@ -477,6 +489,8 @@ def main():
     u32("csm.depth.head_dim", dd_head_dim)
     u32("csm.depth.ff_dim", dd_ff_dim)
     u32("csm.depth.backbone_hidden", dd_bb_hidden)
+    write_csm_rope_metadata(w, cfg, bb_max_pos=bb_max_pos, dd_max_pos=dd_max_pos,
+                            bb_theta=rope_theta)
 
     # Audio / text vocab
     u32("csm.text_vocab_size", text_vocab_size)

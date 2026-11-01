@@ -11,6 +11,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -27,6 +28,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `OMNIASR_BENCH=1` for per-stage timings.
@@ -35,7 +37,7 @@
 static bool omniasr_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("OMNIASR_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_OMNIASR_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -176,7 +178,7 @@ struct omniasr_perf {
 };
 
 static void omniasr_perf_print(const omniasr_perf& p, int n_samples, int verbosity) {
-    const char* bench = getenv("OMNIASR_BENCH");
+    const char* bench = crispasr_env::get("CRISPASR_OMNIASR_BENCH");
     if (verbosity < 2 && (!bench || !bench[0]))
         return;
     const double audio_s = n_samples / 16000.0;
@@ -262,6 +264,57 @@ static ggml_tensor* build_ln(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, 
 // OmniASR/Wav2Vec2 positional convolution: grouped Conv1d + GELU + residual.
 // ggml has no grouped conv op, so build it as one conv branch per group.
 // h: [C, T], w: [K, C_per_group, C], b: [C].
+// Greedy CTC decode of a frame-major [T, V] logit grid (logits[t * V + v]):
+// argmax per frame, collapse repeats, drop blanks, SentencePiece detokenize
+// (U+2581 -> space), trim. Blank is always index 0: fairseq2 uses <s>=0, HF
+// uses <pad>=0, both trained with PyTorch CTC loss (blank=0 default).
+static std::string ctc_greedy_text(const omniasr_context* ctx, const float* logits, int V, int T) {
+    const auto& hp = ctx->model.hp;
+    const auto& m = ctx->model;
+    const int blank_id = 0;
+    std::vector<int> tokens;
+    int prev_id = -1;
+    for (int t = 0; t < T; t++) {
+        int best = 0;
+        float best_val = logits[(size_t)t * V];
+        for (int v = 1; v < V; v++) {
+            if (logits[(size_t)t * V + v] > best_val) {
+                best_val = logits[(size_t)t * V + v];
+                best = v;
+            }
+        }
+        if (best != blank_id && best != prev_id)
+            tokens.push_back(best);
+        prev_id = best;
+    }
+
+    std::string result;
+    for (int tid : tokens) {
+        if (tid == hp.bos_id || tid == hp.eos_id || tid == hp.pad_id || tid == hp.unk_id)
+            continue;
+        if (tid < (int)m.vocab.size()) {
+            const std::string& piece = m.vocab[tid];
+            for (size_t i = 0; i < piece.size(); i++) {
+                if ((unsigned char)piece[i] == 0xE2 && i + 2 < piece.size() && (unsigned char)piece[i + 1] == 0x96 &&
+                    (unsigned char)piece[i + 2] == 0x81) {
+                    result += ' ';
+                    i += 2;
+                } else {
+                    result += piece[i];
+                }
+            }
+        }
+    }
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "omniasr: decoded %d tokens → %zu chars\n", (int)tokens.size(), result.size());
+
+    while (!result.empty() && result.front() == ' ')
+        result.erase(result.begin());
+    while (!result.empty() && result.back() == ' ')
+        result.pop_back();
+    return result;
+}
+
 static ggml_tensor* build_grouped_pos_conv(ggml_context* ctx, ggml_tensor* h, ggml_tensor* w, ggml_tensor* b) {
     const int64_t K = w->ne[0];
     const int64_t C_per_group = w->ne[1];
@@ -449,9 +502,9 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
         ctx->backend = crispasr_init_gpu_backend();
     }
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         if (ctx->backend) {
             ggml_backend_free(ctx->backend);
@@ -459,9 +512,9 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
     }
 
     // PLAN #69a: when CRISPASR_N_GPU_LAYERS is set and < total decoder
@@ -572,10 +625,11 @@ extern "C" void omniasr_free(struct omniasr_context* ctx) {
         ggml_backend_sched_free(ctx->sched);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
-    if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
-    if (ctx->buf_cpu)
-        ggml_backend_buffer_free(ctx->buf_cpu);
+    // Weight buffers come from core_gguf::load_weights, so on a zero-copy
+    // backend they carry a host mmap the backend does not own. Release them
+    // through the loader rather than ggml_backend_buffer_free().
+    core_gguf::release_weight_buffer(ctx->buf);
+    core_gguf::release_weight_buffer(ctx->buf_cpu);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
         ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)
@@ -665,7 +719,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     ggml_context* ctx0 = ggml_init(gp);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
 
-    const char* dump_dir = getenv("OMNIASR_DUMP_DIR");
+    const char* dump_dir = crispasr_env::get("CRISPASR_OMNIASR_DUMP_DIR");
 
     // Input normalization: layer_norm(waveform) — zero mean, unit variance
     // This is a wav2vec2 convention, required for OmniASR.
@@ -946,55 +1000,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "omniasr: logits [%d, %d], CTC decoding...\n", V, T);
 
-    // Greedy CTC decode: argmax per frame, collapse repeats, remove blanks
-    // CTC blank is always index 0: fairseq2 uses <s>=0, HF uses <pad>=0.
-    // Both trained with PyTorch CTC loss (blank=0 default).
-    int blank_id = 0;
-    std::vector<int> tokens;
-    int prev_id = -1;
-    for (int t = 0; t < T; t++) {
-        // logits layout: [V, T] col-major → logits[t * V + v]
-        int best = 0;
-        float best_val = logits[t * V];
-        for (int v = 1; v < V; v++) {
-            if (logits[t * V + v] > best_val) {
-                best_val = logits[t * V + v];
-                best = v;
-            }
-        }
-        if (best != blank_id && best != prev_id) {
-            tokens.push_back(best);
-        }
-        prev_id = best;
-    }
-
-    // Detokenize: SentencePiece convention — ▁ (U+2581) = space
-    std::string result;
-    for (int tid : tokens) {
-        if (tid == hp.bos_id || tid == hp.eos_id || tid == hp.pad_id || tid == hp.unk_id)
-            continue;
-        if (tid < (int)m.vocab.size()) {
-            std::string piece = m.vocab[tid];
-            for (size_t i = 0; i < piece.size(); i++) {
-                if ((unsigned char)piece[i] == 0xE2 && i + 2 < piece.size() && (unsigned char)piece[i + 1] == 0x96 &&
-                    (unsigned char)piece[i + 2] == 0x81) {
-                    result += ' ';
-                    i += 2;
-                } else {
-                    result += piece[i];
-                }
-            }
-        }
-    }
-
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "omniasr: decoded %d tokens → %zu chars\n", (int)tokens.size(), result.size());
-
-    // Trim
-    while (!result.empty() && result.front() == ' ')
-        result.erase(result.begin());
-    while (!result.empty() && result.back() == ' ')
-        result.pop_back();
+    std::string result = ctc_greedy_text(ctx, logits.data(), V, T);
 
     if (result.empty())
         return nullptr;
@@ -1604,6 +1610,8 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<floa
             };
 
             core_beam_decode::Config cfg;
+            cfg.semantics =
+                core_beam_decode::Semantics::Legacy; // upstream = fairseq2 beam search, not transformers generate()
             cfg.max_new_tokens = max_gen;
             cfg.eos_id = hp.eos_id;
             cfg.vocab_size = (int)step_logits.size();
@@ -1757,6 +1765,20 @@ extern "C" void omniasr_result_free(struct omniasr_result* r) {
     free(r->token_ids);
     free(r->token_probs);
     free(r);
+}
+
+extern "C" char* omniasr_ctc_decode_logits(struct omniasr_context* ctx, const float* logits, int n_vocab,
+                                           int n_frames) {
+    if (!ctx || !logits || n_vocab <= 0 || n_frames <= 0 || ctx->model.hp.model_type != 0)
+        return nullptr;
+    std::string text = ctc_greedy_text(ctx, logits, n_vocab, n_frames);
+    if (text.empty())
+        return nullptr;
+    char* out = (char*)malloc(text.size() + 1);
+    if (!out)
+        return nullptr;
+    memcpy(out, text.c_str(), text.size() + 1);
+    return out;
 }
 
 extern "C" const char* omniasr_token_text(struct omniasr_context* ctx, int id) {

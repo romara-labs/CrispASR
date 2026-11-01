@@ -32,6 +32,15 @@ public:
 
     uint32_t capabilities() const override { return CAP_AUTO_DOWNLOAD | CAP_PUNCTUATION_NATIVE | CAP_BEAM_SEARCH; }
 
+    // Upstream model card: "This model is intended for English automatic
+    // speech recognition" — verified 2026-09-02 while closing the PLAN
+    // multilingual checkbox: zh and de audio come back as rough ENGLISH
+    // translations at rc 0 (the prompt is instruction-less, mirroring the
+    // upstream processor exactly; the behavior is the model's, not the
+    // port's). Declaring en-only turns that silent wrong-language output
+    // into an explicit pre-dispatch rejection and skips pointless LID.
+    const char* sole_language() const override { return "en"; }
+
     bool init(const whisper_params& p) override {
         auto cp = moss_transcribe_context_default_params();
         cp.n_threads = p.n_threads;
@@ -50,6 +59,8 @@ public:
         if (!ctx_)
             return {};
         moss_transcribe_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        moss_transcribe_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
 
         char* result = moss_transcribe_transcribe(ctx_, samples, n_samples);
         if (!result)

@@ -1,9 +1,19 @@
-"""Smoke test: every CA_EXPORT symbol from crispasr_c_api.cpp is reachable
-from the Python ctypes binding.
+"""Smoke test: the maintained shared C-ABI symbol set is reachable from
+the Python ctypes binding.
 
 Does NOT instantiate models or run inference — purely checks that the
-binding declares (and can look up) all 150 exported C-ABI functions.
+binding declares (and can look up) every symbol in this smoke-test set.
 Requires CRISPASR_LIB_PATH pointing at a built libcrispasr.{so,dylib}.
+
+KNOWN GAP: this list is a curated subset, NOT the full export surface.
+This test does not enumerate the full export surface and would not notice if
+an unlisted binding symbol disappeared. Treat a green run as "the listed
+symbols are reachable", not as
+"the ABI is fully covered". When adding symbols here, prefer closing the gap
+over matching the existing count. Regenerate the true export list with:
+
+    grep -oE 'CA_EXPORT[[:space:]]+[A-Za-z_]+[[:space:]*]+crispasr_[A-Za-z0-9_]+' \\
+        src/crispasr_c_api.cpp | grep -oE 'crispasr_[A-Za-z0-9_]+' | sort -u
 
     CRISPASR_LIB_PATH=build/src/libcrispasr.so python -m pytest tests/test_binding_parity.py -v
 """
@@ -14,7 +24,7 @@ import sys
 
 import pytest
 
-# All 150 CA_EXPORT symbols (sorted, from:
+# Maintained shared C-ABI smoke-test symbols (sorted; additions can be found with:
 #   grep -oP 'CA_EXPORT\s+\w+[\s*]+\K(crispasr_\w+)' src/crispasr_c_api.cpp | sort -u
 # )
 ALL_SYMBOLS = [
@@ -29,7 +39,9 @@ ALL_SYMBOLS = [
     "crispasr_detect_language",
     "crispasr_detect_language_pcm",
     "crispasr_diarize_segments_abi",
+    "crispasr_diarize_segments_turns_abi",
     "crispasr_enhance_audio_rnnoise",
+    "crispasr_free_aligner_cache",
     "crispasr_kokoro_lang_has_native_voice_abi",
     "crispasr_kokoro_lang_is_german_abi",
     "crispasr_kokoro_resolve_fallback_voice_abi",
@@ -78,6 +90,8 @@ ALL_SYMBOLS = [
     "crispasr_pyannote_cache_apply_abi",
     "crispasr_pyannote_cache_compute_abi",
     "crispasr_pyannote_cache_free_abi",
+    "crispasr_registry_default_bundle_artifact_abi",
+    "crispasr_registry_default_bundle_info_abi",
     "crispasr_registry_list_backends_abi",
     "crispasr_registry_lookup_abi",
     "crispasr_registry_lookup_by_filename_abi",
@@ -94,6 +108,11 @@ ALL_SYMBOLS = [
     "crispasr_session_result_free",
     "crispasr_session_result_n_segments",
     "crispasr_session_result_n_words",
+    "crispasr_session_result_n_tokens",
+    "crispasr_session_result_token_text",
+    "crispasr_session_result_token_t0",
+    "crispasr_session_result_token_t1",
+    "crispasr_session_result_token_p",
     "crispasr_session_result_segment_t0",
     "crispasr_session_result_segment_t1",
     "crispasr_session_result_word_alt_p",
@@ -101,6 +120,7 @@ ALL_SYMBOLS = [
     "crispasr_session_result_word_p",
     "crispasr_session_result_word_t0",
     "crispasr_session_result_word_t1",
+    "crispasr_session_score_texts",
     "crispasr_session_set_alt_n",
     "crispasr_session_set_ask",
     "crispasr_session_set_beam_size",
@@ -110,6 +130,7 @@ ALL_SYMBOLS = [
     "crispasr_session_set_exaggeration",
     "crispasr_session_set_fallback_thresholds",
     "crispasr_session_set_frequency_penalty",
+    "crispasr_session_set_grammar_strict",
     "crispasr_session_set_grammar_text",
     "crispasr_session_set_instruct",
     "crispasr_session_set_length_scale",
@@ -119,11 +140,17 @@ ALL_SYMBOLS = [
     "crispasr_session_set_punc_model",
     "crispasr_session_set_punctuation",
     "crispasr_session_set_repetition_penalty",
+    "crispasr_session_set_sensitivity",
     "crispasr_session_set_source_language",
     "crispasr_session_set_speaker_name",
     "crispasr_session_set_target_language",
     "crispasr_session_set_temperature",
     "crispasr_session_set_top_p",
+    "crispasr_session_set_tts_reference_language",
+    # EU AI Act Art. 50(4): whose voice a PRESET voice is. Listed here so the
+    # parity suite proves every binding can actually resolve it — the mechanism
+    # shipped reachable only from the C ABI once already.
+    "crispasr_session_set_speaker_identity",
     "crispasr_session_set_translate",
     "crispasr_session_set_tts_seed",
     "crispasr_session_set_tts_steps",
@@ -139,10 +166,10 @@ ALL_SYMBOLS = [
     "crispasr_session_translate_text_free",
     "crispasr_speaker_cluster_abi",
     "crispasr_speaker_db_count",
-    "crispasr_speaker_db_enroll",
+    "crispasr_speaker_db_enroll2",
     "crispasr_speaker_db_free",
-    "crispasr_speaker_db_load",
     "crispasr_speaker_db_match",
+    "crispasr_speaker_db_open",
     "crispasr_speaker_embedder_dim_abi",
     "crispasr_speaker_embedder_embed_abi",
     "crispasr_speaker_embedder_free_abi",
@@ -173,12 +200,11 @@ ALL_SYMBOLS = [
 
 @pytest.fixture(scope="module")
 def lib():
-    lib_path = os.environ.get("CRISPASR_LIB_PATH")
+    lib_path = os.environ.get("CRISPASR_LIB_PATH") or os.environ.get("CRISPASR_LIB")
     if not lib_path:
         # Try common build paths
         for candidate in [
             "build/src/libcrispasr.so",
-            "/mnt/volume1/build-main/src/libcrispasr.so",
             "build/libcrispasr.so",
         ]:
             if os.path.exists(candidate):
@@ -195,9 +221,9 @@ def test_symbol_resolves(lib, symbol):
     assert hasattr(lib, symbol), f"symbol {symbol} not found in loaded libcrispasr"
 
 
-def test_symbol_count(lib):
-    """Sanity: we expect exactly 150 crispasr_* symbols."""
-    assert len(ALL_SYMBOLS) == 150, f"expected 150 symbols, got {len(ALL_SYMBOLS)}"
+def test_symbol_count():
+    """The curated subset has no duplicates; full coverage comes from the header."""
+    assert len(ALL_SYMBOLS) == len(set(ALL_SYMBOLS))
 
 
 def test_python_binding_imports():
@@ -213,7 +239,7 @@ def test_python_binding_imports():
 
 
 def test_python_binding_declares_all_symbols():
-    """Every CA_EXPORT symbol must appear somewhere in _binding.py."""
+    """The legacy curated smoke subset remains declared in _binding.py."""
     binding_path = os.path.join(
         os.path.dirname(__file__), "..", "python", "crispasr", "_binding.py"
     )
@@ -221,3 +247,11 @@ def test_python_binding_declares_all_symbols():
         content = f.read()
     missing = [s for s in ALL_SYMBOLS if s not in content]
     assert missing == [], f"Python binding missing symbols: {missing}"
+
+
+def test_complete_public_session_header_coverage():
+    """The curated smoke list is supplemented by a complete header census."""
+    import runpy
+    from pathlib import Path
+    check = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools/check-python-api-coverage.py"))
+    check["main"]([])

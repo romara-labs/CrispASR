@@ -10,11 +10,10 @@ namespace CrispASR.Tests
     /// </summary>
     public class TitaNetTests
     {
-        private static bool CanLoadLibrary()
-        {
-            try { _ = Session.AvailableBackends(); return true; }
-            catch { return false; }
-        }
+        // Routed through Live so CRISPASR_CS_REQUIRE_LIVE can turn a silent
+        // skip into a failure (issue #291 — nothing in CI ever loaded the
+        // library, so the suite was green either way).
+        private static bool CanLoadLibrary() => Live.LibraryLoadable();
 
         [Fact]
         public void TitaNet_ImplementsIDisposable()
@@ -70,24 +69,57 @@ namespace CrispASR.Tests
 
     public class SpeakerDbTests
     {
-        private static bool CanLoadLibrary()
-        {
-            try { _ = Session.AvailableBackends(); return true; }
-            catch { return false; }
-        }
-
         [Fact]
         public void SpeakerDb_ImplementsIDisposable()
         {
             Assert.True(typeof(IDisposable).IsAssignableFrom(typeof(SpeakerDb)));
         }
 
-        [Fact]
-        public void SpeakerDb_Load_ThrowsOnBadPath()
+        [Theory]
+        [InlineData("Alice")]
+        [InlineData("")]
+        [InlineData(" \t\r\n")]
+        [InlineData(null)]
+        public void SpeakerDb_Open_ThrowsWithoutConsent(string? expectedNames)
         {
-            if (!CanLoadLibrary()) return;
+            // Consent is checked before argument validation or native access.
             Assert.Throws<InvalidOperationException>(() =>
-                SpeakerDb.Load("/nonexistent/speakers"));
+                SpeakerDb.Open("/nonexistent/speakers", expectedNames!, consentAttested: false));
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData(" ")]
+        [InlineData("\t\r\n")]
+        public void SpeakerDb_Open_ThrowsOnEmptyOrWhitespaceRoster(string expectedNames)
+        {
+            // Closed-roster validation is managed-side; no native library needed.
+            var error = Assert.Throws<ArgumentException>(() =>
+                SpeakerDb.Open("/nonexistent/speakers", expectedNames, consentAttested: true));
+            Assert.Equal("expectedNames", error.ParamName);
+        }
+
+        [Fact]
+        public void SpeakerDb_Open_ThrowsOnNullRoster()
+        {
+            var error = Assert.Throws<ArgumentNullException>(() =>
+                SpeakerDb.Open("/nonexistent/speakers", null!, consentAttested: true));
+            Assert.Equal("expectedNames", error.ParamName);
+        }
+
+        [Fact]
+        public void SpeakerDb_Open_ThrowsOnNullDirectory()
+        {
+            var error = Assert.Throws<ArgumentNullException>(() =>
+                SpeakerDb.Open(null!, "Alice", consentAttested: true));
+            Assert.Equal("dirPath", error.ParamName);
+        }
+
+        [Fact]
+        public void SpeakerDb_Enroll_ThrowsWithoutConsent()
+        {
+            Assert.Throws<InvalidOperationException>(() =>
+                SpeakerDb.Enroll("/nonexistent/speakers", "alice", new float[] { 1, 0 }, consentAttested: false));
         }
     }
 }

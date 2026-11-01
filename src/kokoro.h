@@ -55,6 +55,9 @@ struct kokoro_context_params kokoro_context_default_params(void);
 // Load Kokoro / StyleTTS2 GGUF. Returns nullptr on failure.
 struct kokoro_context* kokoro_init_from_file(const char* path_model, struct kokoro_context_params params);
 
+// Lightweight test context without loading weights. Free with kokoro_free().
+struct kokoro_context* kokoro_context_create_for_testing(struct kokoro_context_params params);
+
 void kokoro_free(struct kokoro_context* ctx);
 void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads);
 
@@ -65,11 +68,19 @@ void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads);
 // scalar. Clamped to [0.25, 4.0] — outside that range the predictor
 // output goes unusable. Read on every kokoro_synthesize call.
 void kokoro_set_length_scale(struct kokoro_context* ctx, float scale);
+float kokoro_get_length_scale(const struct kokoro_context* ctx);
 
 // Load a voice-pack GGUF (arch="kokoro-voice"). Each pack stores ONE
 // voice — single tensor `voice.pack[max_phon, 1, 256]`, plus
 // `kokoro_voice.name` metadata. Returns 0 on success.
 int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* path);
+
+// Full Kokoro GGUFs can embed multiple voices as `voices.<id>.style`
+// tensors. These helpers expose the loaded voice ids and select one by id.
+// Loading a separate voice pack later overrides the embedded selection.
+int kokoro_embedded_voice_count(struct kokoro_context* ctx);
+const char* kokoro_embedded_voice_id(struct kokoro_context* ctx, int index);
+int kokoro_select_embedded_voice(struct kokoro_context* ctx, const char* voice_id);
 
 // Override the espeak-ng language (default "en-us"). Returns 0 on success.
 int kokoro_set_language(struct kokoro_context* ctx, const char* espeak_lang);
@@ -189,4 +200,9 @@ int crispasr_kokoro_resolve_fallback_voice(const char* model_path, const char* l
 
 #ifdef __cplusplus
 }
+
+namespace kokoro_test {
+void test_make_har_dft(const float* padded, int hop, int n_fft, int n_bins, float* har, int T_har);
+void test_f0_upsample(const float* f0_curve, int L_low, int upsample_scale, float* f0_up);
+} // namespace kokoro_test
 #endif

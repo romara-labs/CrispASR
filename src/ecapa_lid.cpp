@@ -5,6 +5,7 @@
 
 #include "ecapa_lid.h"
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -23,6 +24,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -35,7 +37,7 @@
 // non-Apple.
 static bool ecapa_use_scalar() {
 #if defined(HAVE_ACCELERATE)
-    static const bool force_scalar = std::getenv("ECAPA_FORCE_SCALAR") != nullptr;
+    static const bool force_scalar = crispasr_env::get("CRISPASR_ECAPA_FORCE_SCALAR") != nullptr;
     return force_scalar;
 #else
     return true;
@@ -49,7 +51,7 @@ static bool ecapa_use_scalar() {
 static bool ecapa_lid_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("ECAPA_LID_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_ECAPA_LID_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -306,12 +308,12 @@ extern "C" struct ecapa_lid_context* ecapa_lid_init(const char* model_path, int 
     // produces garbage embeddings. Use the CPU backend: it's fast enough for a
     // 43 MB model, is correct, and keeps the sched's last backend CPU (ggml
     // asserts on a GPU-only sched). The ASP head is Accelerate-GEMM'd below.
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "ecapa-tdnn-lid", wl)) {
@@ -349,7 +351,7 @@ extern "C" void ecapa_lid_free(struct ecapa_lid_context* ctx) {
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;
@@ -391,7 +393,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         return nullptr;
 
     // Debug: optionally load reference fbank
-    const char* ref_path = getenv("ECAPA_REF_FBANK");
+    const char* ref_path = crispasr_env::get("CRISPASR_ECAPA_REF_FBANK");
     if (ref_path && *ref_path) {
         FILE* f = fopen(ref_path, "rb");
         if (f) {
@@ -805,7 +807,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
             emb[i] = (float)s;
         }
 
-        if (std::getenv("ECAPA_TIMING")) {
+        if (crispasr_env::get("CRISPASR_ECAPA_TIMING")) {
             double asp_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - asp_t0).count();
             fprintf(stderr, "ecapa_lid: ASP head (T=%d) %.1f ms %s\n", T_mfa, asp_ms,

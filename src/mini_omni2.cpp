@@ -22,6 +22,7 @@
 #include "core/mel.h"
 #include "core/snac.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `MINI_OMNI2_BENCH=1` for per-stage timings.
@@ -45,7 +47,7 @@
 static bool mini_omni2_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MINI_OMNI2_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MINI_OMNI2_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -192,6 +194,8 @@ struct mini_omni2_context {
 
     int n_threads = 4;
     std::string ask; // custom instruction (empty = default)
+    // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
+    int max_new_tokens = 512;
 
     // SNAC decoder for TTS/S2S output
     void* snac_ctx = nullptr; // snac_decoder_ctx*
@@ -211,13 +215,13 @@ extern "C" struct mini_omni2_context* mini_omni2_init_from_file(const char* path
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     auto& m = ctx->model;
     auto& hp = m.hp;
@@ -417,9 +421,9 @@ extern "C" void mini_omni2_free(struct mini_omni2_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -441,6 +445,12 @@ extern "C" void mini_omni2_set_ask(struct mini_omni2_context* ctx, const char* p
     if (!ctx)
         return;
     ctx->ask = (prompt && *prompt) ? prompt : "";
+}
+
+// #292: forward --max-new-tokens; <= 0 keeps the backend's 512 default.
+extern "C" void mini_omni2_set_max_new_tokens(struct mini_omni2_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
 }
 
 extern "C" bool mini_omni2_load_snac(struct mini_omni2_context* ctx, const char* snac_path) {
@@ -1207,8 +1217,8 @@ extern "C" char* mini_omni2_transcribe(struct mini_omni2_context* ctx, const flo
     if (!logits)
         return nullptr;
 
-    // Greedy decode
-    const int max_tokens = 512;
+    // Greedy decode  (#292: honor --max-new-tokens; text tokens only)
+    const int max_tokens = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 512;
     std::vector<int32_t> gen_ids;
 
     // Only look at text logits (first text_vocab_size)

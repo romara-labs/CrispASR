@@ -51,9 +51,22 @@ public:
         // omitted; users who need them should run without --backend on
         // a ggml-*.bin file, which keeps the byte-identical historical
         // path.
+        // #308: Whisper emits cased + punctuated text natively — declare
+        // CAP_PUNCTUATION_NATIVE so crispasr_should_auto_enable_punctuation does
+        // NOT run FireRedPunc on top. That second pass double-capitalised the
+        // first word ("Hello" -> "HEllo") and appended a spurious full stop.
+        // This matches the historical no-`--backend` path, which never
+        // post-punctuates whisper output.
+        // Every Whisper model already handles long recordings in whisper_full's
+        // native seek/window loop. Without CAP_INTERNAL_CHUNKING the unified
+        // `--backend whisper` path first cut ordinary models with CrispASR's
+        // generic energy chunker, so no-VAD output differed from the legacy
+        // byte-identical path (#463). Tiron additionally uses its own
+        // non-overlapping 30 s speaker-token windows inside that same loop.
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_LANGUAGE_DETECT |
                CAP_TRANSLATE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_GRAMMAR | CAP_FLASH_ATTN | CAP_VAD_INTERNAL |
-               CAP_PARALLEL_PROCESSORS | CAP_DIARIZE | CAP_AUTO_DOWNLOAD;
+               CAP_PARALLEL_PROCESSORS | CAP_DIARIZE | CAP_AUTO_DOWNLOAD | CAP_PUNCTUATION_NATIVE |
+               CAP_INTERNAL_CHUNKING;
     }
 
     bool init(const whisper_params& p) override {
@@ -92,6 +105,21 @@ public:
         wp.max_len = p.max_len;
         wp.split_on_word = p.split_on_word;
         wp.audio_ctx = p.audio_ctx;
+        if (wp.audio_ctx == 0 && p.stream && n_samples > 0) {
+            static const int stream_ac_gate = []() {
+                const char* e = getenv("CRISPASR_WHISPER_STREAM_AUDIO_CTX");
+                return e ? atoi(e) : 0;
+            }();
+            if (stream_ac_gate != 0) {
+                if (stream_ac_gate > 1) {
+                    wp.audio_ctx = std::min(1500, stream_ac_gate);
+                } else {
+                    const int enc_frames = (int)((n_samples + 319) / 320);
+                    const int enc_ctx = std::min(1500, std::max(64, ((enc_frames + 31) / 32) * 32));
+                    wp.audio_ctx = enc_ctx;
+                }
+            }
+        }
 
         wp.tdrz_enable = p.tinydiarize;
 
@@ -149,6 +177,7 @@ public:
                 wp.n_grammar_rules = grammar_rules.size();
                 wp.i_start_rule = it->second;
                 wp.grammar_penalty = p.grammar_penalty;
+                wp.grammar_strict = p.grammar_strict;
                 // Beam search is required for grammar-constrained decoding.
                 wp.strategy = CRISPASR_SAMPLING_BEAM_SEARCH;
             } else {

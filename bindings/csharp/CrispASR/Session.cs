@@ -19,9 +19,24 @@ namespace CrispASR
     /// </code>
     /// </para>
     /// </summary>
-    public sealed class Session : IDisposable
+    public sealed partial class Session : IDisposable
     {
         private IntPtr _handle;
+        private readonly System.Collections.Generic.HashSet<StreamDecoder> _streams = new();
+
+        // The session C ABI reports every time in centiseconds; this binding
+        // exposes seconds throughout (issue #291). ONE constant, used by every
+        // conversion site, so a future time-bearing accessor cannot pick a
+        // different unit by accident.
+        internal const double CentisecondsPerSecond = 100.0;
+
+        // The C ABI uses -1 for "this backend produced no timing for this
+        // unit" — moonshine sets every token t0/t1 to -1, exactly as p = -1
+        // means "no per-word confidence". Dividing that sentinel by 100 would
+        // hand the caller -0.01, which reads like a real timestamp; keep it
+        // recognisable instead.
+        internal static double Seconds(long centiseconds)
+            => centiseconds < 0 ? -1.0 : centiseconds / CentisecondsPerSecond;
 
         private Session(IntPtr handle) => _handle = handle;
 
@@ -31,6 +46,7 @@ namespace CrispASR
             {
                 if (_handle == IntPtr.Zero)
                     throw new ObjectDisposedException(nameof(Session));
+                if (_inCallback) throw new InvalidOperationException("Do not re-enter a session from its callback");
                 return _handle;
             }
         }
@@ -38,6 +54,22 @@ namespace CrispASR
         /// <summary>
         /// Open a session with automatic backend detection from GGUF metadata.
         /// </summary>
+        /// <remarks>
+        /// The model is loaded once and stays resident for the life of the
+        /// <see cref="Session"/>. To transcribe many clips WITHOUT reloading the
+        /// model (issue #291), open one session and call
+        /// <see cref="Transcribe(float[])"/> repeatedly:
+        /// <code>
+        /// using var asr = Session.Open("parakeet.gguf");
+        /// foreach (var clip in clips)
+        ///     Process(asr.Transcribe(clip));   // model loaded once, reused
+        /// </code>
+        /// A <see cref="Session"/> is not thread-safe; use one per thread, or
+        /// serialize calls. Standalone <see cref="VadSegments"/> is the exception —
+        /// it loads and frees its VAD model on every call, so a hot VAD-only loop
+        /// still reloads. Prefer session-integrated VAD (the vad transcribe path)
+        /// when you also transcribe, so the one session covers both.
+        /// </remarks>
         public static Session Open(string modelPath, int nThreads = 4)
         {
             var p = NativeMethods.crispasr_session_open(modelPath, nThreads);
@@ -83,8 +115,10 @@ namespace CrispASR
 
         public void Dispose()
         {
+            if (_inCallback) throw new InvalidOperationException("Do not dispose a session from its callback");
             if (_handle != IntPtr.Zero)
             {
+                foreach (var stream in new System.Collections.Generic.List<StreamDecoder>(_streams)) stream.Dispose();
                 NativeMethods.crispasr_session_close(_handle);
                 _handle = IntPtr.Zero;
             }
@@ -94,9 +128,12 @@ namespace CrispASR
         // Session-state setters
         // ----------------------------------------------------------------
 
-        private static void Check(int rc, string name)
+        // Optional tuning controls use -2 for an unsupported backend. Explicit
+        // resource/identity operations also use -2 for invalid input or load
+        // failure, so those callers require zero-success.
+        private static void Check(int rc, string name, bool allowUnsupported = true)
         {
-            if (rc != 0 && rc != -2)
+            if (rc != 0 && !(allowUnsupported && rc == -2))
                 throw new InvalidOperationException($"{name} failed (rc={rc})");
         }
 
@@ -106,7 +143,7 @@ namespace CrispASR
 
         /// <summary>Load a voice prompt GGUF or WAV reference. refText is for qwen3-tts WAV refs.</summary>
         public void SetVoice(string path, string? refText = null)
-            => Check(NativeMethods.crispasr_session_set_voice(Handle, path, refText), "set_voice");
+            => Check(NativeMethods.crispasr_session_set_voice(Handle, path, refText), "set_voice", allowUnsupported: false);
 
         /// <summary>Select a preset speaker by name (orpheus).</summary>
         public void SetSpeakerName(string name)
@@ -119,7 +156,7 @@ namespace CrispASR
 
         /// <summary>Select a multi-speaker backend's speaker by index.</summary>
         public void SetSpeakerId(int id)
-            => Check(NativeMethods.crispasr_session_set_speaker_id(Handle, id), "set_speaker_id");
+            => Check(NativeMethods.crispasr_session_set_speaker_id(Handle, id), "set_speaker_id", allowUnsupported: false);
 
         /// <summary>Return the list of preset speaker names for the active backend.</summary>
         public string[] Speakers()
@@ -139,6 +176,20 @@ namespace CrispASR
             if (rc != 0) throw new InvalidOperationException($"set_instruct failed (rc={rc})");
         }
 
+        /// <summary>#316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2).</summary>
+        public void SetTtsPhonemes(string phonemes)
+        {
+            int rc = NativeMethods.crispasr_session_set_tts_phonemes(Handle, phonemes ?? "");
+            if (rc == -2) throw new InvalidOperationException("Backend has no phonemes-in entry point (kokoro and piper do)");
+            if (rc != 0) throw new InvalidOperationException($"set_tts_phonemes failed (rc={rc})");
+        }
+
+        /// <summary>Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk.</summary>
+        public void SetTtsPadSilenceMs(int ms)
+        {
+            NativeMethods.crispasr_session_set_tts_pad_silence_ms(Handle, ms);
+        }
+
         /// <summary>Whether the loaded model is a qwen3-tts CustomVoice variant.</summary>
         public bool IsCustomVoice => NativeMethods.crispasr_session_is_custom_voice(Handle) != 0;
 
@@ -147,11 +198,34 @@ namespace CrispASR
 
         /// <summary>Select + load a punctuation-restoration model.</summary>
         public void SetPuncModel(string puncModel)
-            => Check(NativeMethods.crispasr_session_set_punc_model(Handle, puncModel), "set_punc_model");
+            => Check(NativeMethods.crispasr_session_set_punc_model(Handle, puncModel), "set_punc_model", allowUnsupported: false);
 
         /// <summary>Comma-separated hotwords for contextual biasing.</summary>
         public void SetHotwords(string hotwords, float boost)
             => Check(NativeMethods.crispasr_session_set_hotwords(Handle, hotwords, boost), "set_hotwords");
+
+        /// <summary>
+        /// Apply a named bundle of the four decoder fallback thresholds:
+        /// "conservative", "balanced" (the shipped defaults, a no-op) or
+        /// "aggressive". "strict"/"default"/"loose" are aliases. Mirrors the
+        /// CLI's --sensitivity.
+        /// </summary>
+        /// <exception cref="ArgumentException">The preset is unrecognised.</exception>
+        public void SetSensitivity(string preset)
+        {
+            // Deliberately NOT routed through Check(): that helper treats
+            // rc == -2 as success, because for most setters -2 means "this
+            // backend does not support the knob". Here -2 means "unknown
+            // preset", and swallowing it would silently decode at the default
+            // thresholds after a typo — exactly what this API exists to prevent.
+            int rc = NativeMethods.crispasr_session_set_sensitivity(Handle, preset);
+            if (rc == -2)
+                throw new ArgumentException(
+                    $"unknown sensitivity preset '{preset}' (expected: conservative, balanced, aggressive)",
+                    nameof(preset));
+            if (rc != 0)
+                throw new InvalidOperationException($"set_sensitivity failed (rc={rc})");
+        }
 
         /// <summary>Select the G2P pronunciation dictionary for TTS.</summary>
         public void SetG2pDict(string source)
@@ -164,6 +238,15 @@ namespace CrispASR
         /// <summary>Sticky target-language. Different from source triggers translation on canary/cohere.</summary>
         public void SetTargetLanguage(string? lang)
             => Check(NativeMethods.crispasr_session_set_target_language(Handle, lang ?? ""), "set_target_language");
+
+        /// <summary>Language a voice-cloning reference clip is spoken in (#329). Cross-lingual TTS
+        /// backends (cosyvoice3) drop the reference transcript when it differs from the requested
+        /// output language, so the clone speaks that language instead of carrying the reference's
+        /// accent. Optional — inferred from the voice bank or reference transcript otherwise, and
+        /// that inference declines rather than guesses on a short transcript.</summary>
+        public void SetTtsReferenceLanguage(string? lang)
+            => Check(NativeMethods.crispasr_session_set_tts_reference_language(Handle, lang ?? ""),
+                     "set_tts_reference_language");
 
         /// <summary>Toggle punctuation + capitalisation. Default true.</summary>
         public void SetPunctuation(bool enable)
@@ -233,6 +316,10 @@ namespace CrispASR
         public void SetMaxSpeechTokens(int n)
             => Check(NativeMethods.crispasr_session_set_max_speech_tokens(Handle, n), "set_max_speech_tokens");
 
+        /// <summary>Floor on generated audio length (MOSS TTS): codec frames at 12.5 Hz (80 ms each); other backends no-op.</summary>
+        public void SetMinSpeechTokens(int n)
+            => Check(NativeMethods.crispasr_session_set_min_speech_tokens(Handle, n), "set_min_speech_tokens");
+
         /// <summary>Per-phoneme length-scale / speaking-rate scalar (kokoro).</summary>
         public void SetLengthScale(float scale)
             => Check(NativeMethods.crispasr_session_set_length_scale(Handle, scale), "set_length_scale");
@@ -290,7 +377,7 @@ namespace CrispASR
         // ----------------------------------------------------------------
 
         /// <summary>
-        /// Synthesize text to 24 kHz mono float32 PCM.
+        /// Synthesize text to mono float32 PCM at OutputSampleRate().
         /// Requires a TTS-capable backend (kokoro, vibevoice, qwen3-tts, orpheus, chatterbox).
         /// </summary>
         public float[] Synthesize(string text)
@@ -310,20 +397,211 @@ namespace CrispASR
             }
         }
 
+        /// <summary>
+        /// Attest acceptance of AI-content marking/disclosure responsibility (EU
+        /// AI Act Art. 50). REQUIRED before <see cref="SynthesizeRaw"/> will return
+        /// unmarked audio; the default <see cref="Synthesize"/> is watermarked and
+        /// needs no attestation. <paramref name="attestation"/> is recorded for audit.
+        /// </summary>
+        public void AcceptMarkingResponsibility(string attestation = "")
+            => Check(NativeMethods.crispasr_session_accept_marking_responsibility(Handle, attestation ?? ""),
+                     "accept_marking_responsibility");
+
+        /// <summary>
+        /// Declare whose voice a PRESET voice is: <c>real_person</c>,
+        /// <c>synthetic</c> or <c>unknown</c>.
+        /// <para>
+        /// Cloning is not the only way to produce a deep fake: a preset voice
+        /// shipped inside a model can be an identifiable individual — a named
+        /// donor, or a corpus speaker such as VCTK's <c>p225</c> — and EU AI Act
+        /// Art. 3(60) attaches to the audio resembling that person, not to which
+        /// pipeline produced it. Setting <c>real_person</c> makes the Art. 50(4)
+        /// reminder fire for a non-cloned voice.
+        /// </para>
+        /// <para>
+        /// It does <b>not</b> require a consent attestation: whether that donor
+        /// agreed to the model being trained is a licensing matter settled
+        /// upstream that you cannot attest to.
+        /// </para>
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown on an unrecognised value, rather than silently downgrading it
+        /// to <c>unknown</c>.
+        /// </exception>
+        public void SetSpeakerIdentity(string identity)
+        {
+            int rc = NativeMethods.crispasr_session_set_speaker_identity(Handle, identity ?? "");
+            if (rc == -2)
+                throw new ArgumentException(
+                    $"unrecognised speaker_identity '{identity}' " +
+                    "(expected real_person, synthetic or unknown)", nameof(identity));
+            Check(rc, "set_speaker_identity");
+        }
+
+        /// <summary>
+        /// UNMARKED synthesis (no watermark), for callers that post-process before
+        /// embedding the mark themselves. Hard-refused (throws) unless
+        /// <see cref="AcceptMarkingResponsibility"/> was called first. Prefer
+        /// <see cref="Synthesize"/> for the default watermarked output.
+        /// </summary>
+        public float[] SynthesizeRaw(string text)
+        {
+            var ptr = NativeMethods.crispasr_session_synthesize_raw(Handle, text, out int nSamples);
+            if (ptr == IntPtr.Zero || nSamples <= 0)
+                throw new InvalidOperationException(
+                    "SynthesizeRaw returned no audio (attestation required? call AcceptMarkingResponsibility first)");
+            try
+            {
+                var pcm = new float[nSamples];
+                Marshal.Copy(ptr, pcm, 0, nSamples);
+                return pcm;
+            }
+            finally
+            {
+                NativeMethods.crispasr_pcm_free(ptr);
+            }
+        }
+
+        /// <summary>
+        /// Embed the AI-content watermark into mono float32 PCM, in place.
+        /// <para>
+        /// The other half of <see cref="SynthesizeRaw"/>: opting out of automatic
+        /// marking makes marking the result your duty under EU AI Act Art. 50(2),
+        /// and this is what discharges it. Do the post-processing you opted out
+        /// for — resample, mix, concatenate — then mark the finished buffer.
+        /// </para>
+        /// <para>
+        /// Uses the robust, reliably detectable default strength; AudioSeal
+        /// instead when a model has been loaded. Static because marking is a
+        /// property of the samples, not of the session that produced them.
+        /// </para>
+        /// </summary>
+        public static void WatermarkEmbed(float[] pcm)
+        {
+            if (pcm == null || pcm.Length == 0)
+                return;
+            NativeMethods.crispasr_watermark_embed(pcm, pcm.Length, -1.0f);
+        }
+
+        /// <summary>
+        /// Confidence in [0, 1] that <paramref name="pcm"/> carries the watermark.
+        /// A weak diagnostic, not proof: the spread-spectrum detector's null mean
+        /// is 0.5, not 0, and a negative result on a short clip is mostly evidence
+        /// that the clip was short. See <c>docs/eu-ai-act.md</c> §6.7.
+        /// </summary>
+        public static float WatermarkDetect(float[] pcm)
+        {
+            if (pcm == null || pcm.Length == 0)
+                return 0.0f;
+            return NativeMethods.crispasr_watermark_detect(pcm, pcm.Length);
+        }
+
+        /// <summary>
+        /// Speech-to-speech: audio in → audio out through a single model pass,
+        /// on backends with S2S capability (lfm2-audio, mini-omni2, sidon,
+        /// voxcpm2-vae). Input is 16 kHz mono float32 PCM. Returns the output
+        /// PCM plus the intermediate ASR transcript (may be <c>null</c>).
+        /// </summary>
+        public (float[] pcm, string? transcript) SpeechToSpeech(float[] input)
+        {
+            var ptr = NativeMethods.crispasr_session_speech_to_speech(
+                Handle, input, input.Length, out IntPtr textPtr, out int nSamples);
+            if (ptr == IntPtr.Zero || nSamples <= 0)
+                throw new InvalidOperationException(
+                    "SpeechToSpeech returned no audio (backend may not support S2S)");
+            try
+            {
+                var pcm = new float[nSamples];
+                Marshal.Copy(ptr, pcm, 0, nSamples);
+                string? transcript = null;
+                if (textPtr != IntPtr.Zero)
+                {
+                    transcript = Marshal.PtrToStringUTF8(textPtr);
+                    NativeMethods.crispasr_session_translate_text_free(textPtr);
+                }
+                return (pcm, transcript);
+            }
+            finally
+            {
+                NativeMethods.crispasr_pcm_free(ptr);
+            }
+        }
+
+        /// <summary>
+        /// The sample rate the backend expects for input PCM (16000 for
+        /// Whisper-family backends, 0 on error).
+        /// </summary>
+        public int InputSampleRate() => NativeMethods.crispasr_session_input_sample_rate(Handle);
+
+        /// <summary>
+        /// Sample rate of the PCM Synthesize/SpeechToSpeech produce for this
+        /// backend; 0 when the backend has no audio output (ASR-only). (#332)
+        /// </summary>
+        public int OutputSampleRate() => NativeMethods.crispasr_session_output_sample_rate(Handle);
+
+        /// <summary>
+        /// Channel count for audio input: 1 (mono) for every current backend,
+        /// 0 on error. Source separation is the stereo exception. (#332)
+        /// </summary>
+        public int InputChannels() => NativeMethods.crispasr_session_input_channels(Handle);
+
+        /// <summary>
+        /// Channel count for synthesized / s2s output audio: 1 (mono), or 0
+        /// when the backend has no audio output. (#332)
+        /// </summary>
+        public int OutputChannels() => NativeMethods.crispasr_session_output_channels(Handle);
+
         // ----------------------------------------------------------------
         // ASR Transcription
         // ----------------------------------------------------------------
 
         /// <summary>Transcribe 16 kHz mono float32 PCM.</summary>
+        /// <remarks>
+        /// Long audio is auto-chunked natively (30 s windows), so a full
+        /// recording can be passed in one call.
+        /// </remarks>
         public Segment[] Transcribe(float[] pcm)
             => TranscribeLang(pcm, null);
+
+        /// <summary>
+        /// Decode an audio file and transcribe it — the binding equivalent of
+        /// <c>crispasr -m model.gguf -f audio.wav</c> (issue #291). Handles any
+        /// format and sample rate the CLI handles; see <see cref="Audio.Load(string)"/>.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// using var s = Session.Open("moonshine-base-de-fidoriel-q4_k.gguf");
+        /// foreach (var seg in s.TranscribeFile("speech.wav"))
+        ///     Console.WriteLine($"[{seg.T0:F2}-{seg.T1:F2}] {seg.Text}");
+        /// </code>
+        /// </example>
+        public Segment[] TranscribeFile(string path, string? language = null)
+            => TranscribeLang(Audio.Load(path), language);
 
         /// <summary>Transcribe with explicit language hint.</summary>
         public Segment[] TranscribeLang(float[] pcm, string? language)
         {
             var r = NativeMethods.crispasr_session_transcribe_lang(Handle, pcm, pcm.Length, language);
             if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
-            try { return ExtractSegments(r); }
+            try { return ExtractSegmentsWithCallbacks(r); }
+            finally { NativeMethods.crispasr_session_result_free(r); }
+        }
+
+        /// <summary>
+        /// Chunked-encode transcribe (issue #208): forces the Parakeet backend
+        /// through its bounded overlapping-window long-form path so long audio
+        /// transcribes in bounded time without dropping sections. Inert
+        /// (== <see cref="TranscribeLang"/>) on non-Parakeet backends.
+        /// <paramref name="chunkSeconds"/> &lt;= 0 keeps the per-model default
+        /// window; <paramref name="overlapSeconds"/> &lt; 0 keeps the default overlap.
+        /// </summary>
+        public Segment[] TranscribeChunked(float[] pcm, int chunkSeconds = 0, int overlapSeconds = -1,
+                                           string? language = null)
+        {
+            var r = NativeMethods.crispasr_session_transcribe_chunked_lang(
+                Handle, pcm, pcm.Length, chunkSeconds, overlapSeconds, language);
+            if (r == IntPtr.Zero) throw new InvalidOperationException("Chunked transcription failed");
+            try { return ExtractSegmentsWithCallbacks(r); }
             finally { NativeMethods.crispasr_session_result_free(r); }
         }
 
@@ -340,7 +618,7 @@ namespace CrispASR
             SetReturnLogits(true);
             var r = NativeMethods.crispasr_session_transcribe_lang(Handle, pcm, pcm.Length, language);
             if (r == IntPtr.Zero) { SetReturnLogits(false); throw new InvalidOperationException("Transcription failed"); }
-            try { return (ExtractSegments(r), ExtractLogits(r)); }
+            try { return (ExtractSegmentsWithCallbacks(r), ExtractLogits(r)); }
             finally { SetReturnLogits(false); NativeMethods.crispasr_session_result_free(r); }
         }
 
@@ -375,14 +653,30 @@ namespace CrispASR
             return vocab;
         }
 
-        /// <summary>Transcribe with VAD segmentation.</summary>
+        /// <summary>Transcribe with default VAD segmentation.</summary>
         public Segment[] TranscribeVad(float[] pcm, int sampleRate, string vadModelPath)
+            => TranscribeVad(pcm, sampleRate, vadModelPath, null, null);
+
+        /// <summary>Transcribe with VAD settings and an optional per-call language.</summary>
+        public Segment[] TranscribeVad(float[] pcm, int sampleRate, string vadModelPath,
+            string? language, VadOptions? options = null)
         {
-            var r = NativeMethods.crispasr_session_transcribe_vad(
-                Handle, pcm, pcm.Length, sampleRate, vadModelPath, IntPtr.Zero);
-            if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription with VAD failed");
-            try { return ExtractSegments(r); }
-            finally { NativeMethods.crispasr_session_result_free(r); }
+            var handle = Handle;
+            ArgumentNullException.ThrowIfNull(pcm);
+            ArgumentNullException.ThrowIfNull(vadModelPath);
+            if (pcm.Length == 0) throw new ArgumentException("PCM must not be empty", nameof(pcm));
+            if (sampleRate <= 0) throw new ArgumentOutOfRangeException(nameof(sampleRate));
+            IntPtr opts = options?.Allocate() ?? IntPtr.Zero;
+            try
+            {
+                var r = language == null
+                    ? NativeMethods.crispasr_session_transcribe_vad(handle, pcm, pcm.Length, sampleRate, vadModelPath, opts)
+                    : NativeMethods.crispasr_session_transcribe_vad_lang(handle, pcm, pcm.Length, sampleRate, vadModelPath, opts, language);
+                if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription with VAD failed");
+                try { return ExtractSegmentsWithCallbacks(r); }
+                finally { NativeMethods.crispasr_session_result_free(r); }
+            }
+            finally { if (opts != IntPtr.Zero) Marshal.FreeHGlobal(opts); }
         }
 
         private static Segment[] ExtractSegments(IntPtr r)
@@ -393,8 +687,10 @@ namespace CrispASR
             {
                 string text = NativeMethods.PtrToUtf8(
                     NativeMethods.crispasr_session_result_segment_text(r, i)) ?? "";
-                long t0 = NativeMethods.crispasr_session_result_segment_t0(r, i);
-                long t1 = NativeMethods.crispasr_session_result_segment_t1(r, i);
+                // The C ABI reports centiseconds; every public time value in this
+                // binding is seconds (issue #291), so convert once, here.
+                double t0 = Seconds(NativeMethods.crispasr_session_result_segment_t0(r, i));
+                double t1 = Seconds(NativeMethods.crispasr_session_result_segment_t1(r, i));
 
                 int nWords = NativeMethods.crispasr_session_result_n_words(r, i);
                 var words = new Word[nWords];
@@ -410,15 +706,36 @@ namespace CrispASR
                     }
                     words[j] = new Word(
                         NativeMethods.PtrToUtf8(NativeMethods.crispasr_session_result_word_text(r, i, j)) ?? "",
-                        NativeMethods.crispasr_session_result_word_t0(r, i, j),
-                        NativeMethods.crispasr_session_result_word_t1(r, i, j),
+                        Seconds(NativeMethods.crispasr_session_result_word_t0(r, i, j)),
+                        Seconds(NativeMethods.crispasr_session_result_word_t1(r, i, j)),
                         NativeMethods.crispasr_session_result_word_p(r, i, j),
                         alts);
                 }
                 float noSpeechProb = NativeMethods.crispasr_session_result_segment_no_speech_prob(r, i);
-                segs[i] = new Segment(text, t0, t1, words, noSpeechProb);
+                string speaker = NativeMethods.PtrToUtf8(NativeMethods.crispasr_session_result_segment_speaker(r, i)) ?? "";
+                segs[i] = new Segment(text, t0, t1, words, noSpeechProb, speaker, ExtractTokens(r, i));
             }
             return segs;
+        }
+
+        private static SessionToken[] ExtractTokens(IntPtr result, int segment)
+        {
+            try
+            {
+                int n = NativeMethods.crispasr_session_result_n_tokens(result, segment);
+                var tokens = new SessionToken[n];
+                for (int j = 0; j < n; j++)
+                {
+                    byte[] raw = NativeMethods.CopyUtf8Bytes(NativeMethods.crispasr_session_result_token_text(result, segment, j));
+                    long t0 = NativeMethods.crispasr_session_result_token_t0(result, segment, j);
+                    long t1 = NativeMethods.crispasr_session_result_token_t1(result, segment, j);
+                    bool timed = t0 >= 0 && t1 >= t0;
+                    tokens[j] = new SessionToken(raw, timed ? Seconds(t0) : -1, timed ? Seconds(t1) : -1,
+                                                 NativeMethods.crispasr_session_result_token_p(result, segment, j));
+                }
+                return tokens;
+            }
+            catch (EntryPointNotFoundException) { return Array.Empty<SessionToken>(); }
         }
 
         // ----------------------------------------------------------------
@@ -481,17 +798,26 @@ namespace CrispASR
         // ----------------------------------------------------------------
 
         /// <summary>
-        /// Open a rolling-window streaming decoder. Whisper-only at the C-ABI level today.
+        /// Streaming mode: 0 unavailable, 1 rolling windows, 2 persistent
+        /// model caches, 3 text-prefix streaming.
         /// </summary>
+        public int StreamKind() => NativeMethods.crispasr_session_stream_kind(Handle);
+
+        /// <summary>Open a streaming decoder for this session's backend.</summary>
         public StreamDecoder StreamOpen(int stepMs = 3000, int lengthMs = 10000, int keepMs = 200,
                                         string? language = null, bool translate = false, int nThreads = 4)
         {
             var p = NativeMethods.crispasr_session_stream_open(
                 Handle, nThreads, stepMs, lengthMs, keepMs, language ?? "", translate ? 1 : 0);
             if (p == IntPtr.Zero)
-                throw new InvalidOperationException("stream_open failed (whisper-only today)");
-            return new StreamDecoder(p);
+                throw new InvalidOperationException("stream_open failed");
+            var stream = new StreamDecoder(this, p);
+            _streams.Add(stream);
+            return stream;
         }
+
+        internal void CheckStreamOwner() { _ = Handle; }
+        internal void StreamClosed(StreamDecoder stream) => _streams.Remove(stream);
 
         // ----------------------------------------------------------------
         // Forced alignment (static)
@@ -499,8 +825,9 @@ namespace CrispASR
 
         /// <summary>Run CTC forced alignment on transcript + audio.</summary>
         public static AlignedWord[] AlignWords(string alignerModel, string transcript,
-                                                float[] pcm, long tOffsetCs = 0, int nThreads = 4)
+                                                float[] pcm, double tOffsetSeconds = 0.0, int nThreads = 4)
         {
+            long tOffsetCs = (long)Math.Round(tOffsetSeconds * CentisecondsPerSecond);
             var r = NativeMethods.crispasr_align_words_abi(alignerModel, transcript, pcm, pcm.Length, tOffsetCs, nThreads);
             if (r == IntPtr.Zero) throw new InvalidOperationException("Alignment failed");
             try
@@ -509,10 +836,17 @@ namespace CrispASR
                 var words = new AlignedWord[n];
                 for (int i = 0; i < n; i++)
                 {
+                    int nc = NativeMethods.crispasr_align_result_n_characters(r, i);
+                    var characters = new AlignedCharacter[nc];
+                    for (int j = 0; j < nc; j++)
+                        characters[j] = new AlignedCharacter(
+                            NativeMethods.PtrToUtf8(NativeMethods.crispasr_align_result_character_text(r, i, j)) ?? "",
+                            Seconds(NativeMethods.crispasr_align_result_character_t0(r, i, j)),
+                            Seconds(NativeMethods.crispasr_align_result_character_t1(r, i, j)));
                     words[i] = new AlignedWord(
                         NativeMethods.PtrToUtf8(NativeMethods.crispasr_align_result_word_text(r, i)) ?? "",
-                        NativeMethods.crispasr_align_result_word_t0(r, i),
-                        NativeMethods.crispasr_align_result_word_t1(r, i));
+                        Seconds(NativeMethods.crispasr_align_result_word_t0(r, i)),
+                        Seconds(NativeMethods.crispasr_align_result_word_t1(r, i)), characters);
                 }
                 return words;
             }
@@ -541,8 +875,14 @@ namespace CrispASR
                 var raw = new float[n * 2];
                 Marshal.Copy(outSpans[0], raw, 0, n * 2);
                 var spans = new VadSpan[n];
+                // The native crispasr_vad_segments ABI returns CENTISECONDS
+                // (start_cs, end_cs — see crispasr.h), the raw whisper.cpp VAD
+                // unit. Every other time value in this binding (Segment/Word T0/T1)
+                // is seconds, and this method's own doc-comment promises seconds,
+                // so convert here. Reported as issue #291: without this the spans
+                // came back as ms/10 and silently disagreed with Session times.
                 for (int i = 0; i < n; i++)
-                    spans[i] = new VadSpan(raw[i * 2], raw[i * 2 + 1]);
+                    spans[i] = new VadSpan(raw[i * 2] / 100.0, raw[i * 2 + 1] / 100.0);
                 return spans;
             }
             finally
@@ -624,18 +964,24 @@ namespace CrispASR
     public readonly struct Word
     {
         public string Text { get; }
-        public long T0 { get; }
-        public long T1 { get; }
+        /// <summary>Word start, in SECONDS, or -1 when the backend produced no
+        /// word timing (moonshine, and any other token-only decoder). (Issue #291:
+        /// was raw centiseconds through v0.8.29 while the binding documented
+        /// seconds everywhere else.)</summary>
+        public double T0 { get; }
+        /// <summary>Word end, in SECONDS, or -1 when the backend produced no word timing.</summary>
+        public double T1 { get; }
         public float P { get; }
         public AltToken[] Alts { get; }
+        public bool HasTimestamps => T0 >= 0 && T1 >= T0;
 
-        public Word(string text, long t0, long t1, float p, AltToken[]? alts = null)
+        public Word(string text, double t0, double t1, float p, AltToken[]? alts = null)
         {
             Text = text; T0 = t0; T1 = t1; P = p;
             Alts = alts ?? Array.Empty<AltToken>();
         }
 
-        public override string ToString() => $"{T0}-{T1} {Text}";
+        public override string ToString() => FormattableString.Invariant($"{T0:F2}-{T1:F2} {Text}");
     }
 
     /// <summary>Alternative token candidate.</summary>
@@ -646,26 +992,53 @@ namespace CrispASR
 
         public AltToken(string text, float p) { Text = text; P = p; }
 
-        public override string ToString() => $"{Text}({P * 100:F1}%)";
+        public override string ToString() => FormattableString.Invariant($"{Text}({P * 100:F1}%)");
+    }
+
+    /// <summary>Owned native token bytes, seconds (-1 when unavailable) and probability.</summary>
+    public readonly struct SessionToken
+    {
+        public byte[] RawText { get; }
+        public string Text => Encoding.UTF8.GetString(RawText);
+        public double T0 { get; }
+        public double T1 { get; }
+        public float P { get; }
+        public bool HasTimestamps => T0 >= 0 && T1 >= T0;
+        public SessionToken(byte[] rawText, double t0, double t1, float p = -1)
+        { RawText = (byte[])rawText.Clone(); T0 = t0; T1 = t1; P = p; }
     }
 
     /// <summary>One segment from a transcription result.</summary>
     public readonly struct Segment
     {
         public string Text { get; }
-        public long T0 { get; }
-        public long T1 { get; }
+        /// <summary>Segment start, in SECONDS, or -1 when the backend produced no
+        /// timing. (Issue #291: was raw centiseconds through v0.8.29 while the
+        /// binding documented seconds everywhere else.)</summary>
+        public double T0 { get; }
+        /// <summary>Segment end, in SECONDS, or -1 when the backend produced no timing.</summary>
+        public double T1 { get; }
         public Word[] Words { get; }
         /// <summary>Whisper's per-segment no-speech probability (the &lt;|nospeech|&gt;
         /// posterior) in [0, 1]. Whisper-only; other backends leave -1.0 ("no data").</summary>
         public float NoSpeechProb { get; }
+        /// <summary>Native per-segment speaker label from a backend that diarizes on
+        /// its own, in the "(Speaker N) " form the CLI prefixes into text/srt/vtt
+        /// output, or "" when the backend produced none. Populated today by vibevoice.
+        /// The ordinals are CHUNK-LOCAL: "Speaker 1" from one transcribe call is not
+        /// necessarily the same voice as "Speaker 1" from the next.</summary>
+        public string Speaker { get; }
+        public SessionToken[] Tokens { get; }
+        public bool HasTimestamps => T0 >= 0 && T1 >= T0;
 
-        public Segment(string text, long t0, long t1, Word[] words, float noSpeechProb = -1.0f)
+        public Segment(string text, double t0, double t1, Word[] words, float noSpeechProb = -1.0f,
+                       string speaker = "", SessionToken[]? tokens = null)
         {
-            Text = text; T0 = t0; T1 = t1; Words = words; NoSpeechProb = noSpeechProb;
+            Text = text; T0 = t0; T1 = t1; Words = words; NoSpeechProb = noSpeechProb; Speaker = speaker ?? "";
+            Tokens = tokens ?? Array.Empty<SessionToken>();
         }
 
-        public override string ToString() => $"[{T0}-{T1}] {Text}";
+        public override string ToString() => FormattableString.Invariant($"[{T0:F2}-{T1:F2}] {Text}");
     }
 
     /// <summary>
@@ -694,14 +1067,27 @@ namespace CrispASR
         }
     }
 
+    /// <summary>A measured original codepoint; times are seconds.</summary>
+    public readonly struct AlignedCharacter
+    {
+        public string Text { get; }
+        public double T0 { get; }
+        public double T1 { get; }
+        public AlignedCharacter(string text, double t0, double t1) { Text = text; T0 = t0; T1 = t1; }
+    }
+
     /// <summary>One aligned word from forced alignment.</summary>
     public readonly struct AlignedWord
     {
         public string Text { get; }
-        public long T0 { get; }
-        public long T1 { get; }
+        /// <summary>Word start, in SECONDS (issue #291 — was raw centiseconds).</summary>
+        public double T0 { get; }
+        /// <summary>Word end, in SECONDS.</summary>
+        public double T1 { get; }
 
-        public AlignedWord(string text, long t0, long t1) { Text = text; T0 = t0; T1 = t1; }
+        public AlignedCharacter[] Characters { get; }
+        public AlignedWord(string text, double t0, double t1, AlignedCharacter[]? characters = null)
+        { Text = text; T0 = t0; T1 = t1; Characters = characters ?? Array.Empty<AlignedCharacter>(); }
     }
 
     /// <summary>One speech span from VAD (seconds).</summary>
@@ -723,7 +1109,7 @@ namespace CrispASR
 
         public bool Ok => !string.IsNullOrEmpty(Code) && Probability >= 0f;
 
-        public override string ToString() => $"LanguageDetection({Code}, {Probability * 100:F1}%)";
+        public override string ToString() => FormattableString.Invariant($"LanguageDetection({Code}, {Probability * 100:F1}%)");
     }
 
     /// <summary>Result of <see cref="Session.KokoroResolveForLang"/>.</summary>
@@ -752,12 +1138,17 @@ namespace CrispASR
     {
         private IntPtr _handle;
 
-        internal StreamDecoder(IntPtr handle) => _handle = handle;
+        private readonly Action _checkOwner;
+        private readonly Action<StreamDecoder> _onClosed;
+        internal StreamDecoder(Session owner, IntPtr handle) : this(owner.CheckStreamOwner, owner.StreamClosed, handle) { }
+        internal StreamDecoder(Action checkOwner, Action<StreamDecoder> onClosed, IntPtr handle) { _checkOwner = checkOwner; _onClosed = onClosed; _handle = handle; }
+        public void SetLiveDecode(bool enabled) => NativeMethods.crispasr_stream_set_live_decode(Handle, enabled ? 1 : 0);
 
         private IntPtr Handle
         {
             get
             {
+                _checkOwner();
                 if (_handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(StreamDecoder));
                 return _handle;
             }
@@ -797,7 +1188,9 @@ namespace CrispASR
         {
             if (_handle != IntPtr.Zero)
             {
+                _checkOwner();
                 NativeMethods.crispasr_stream_close(_handle);
+                _onClosed(this);
                 _handle = IntPtr.Zero;
             }
         }
@@ -839,9 +1232,12 @@ namespace CrispASR
         /// <summary>Compute a 192-dim speaker embedding from 16 kHz mono PCM.</summary>
         public float[] Embed(float[] pcm16k)
         {
+            ArgumentNullException.ThrowIfNull(pcm16k);
+            if (_handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(TitaNet));
+            if (pcm16k.Length == 0) throw new ArgumentException("Nonempty PCM required");
             var emb = new float[EmbeddingDim];
             int rc = NativeMethods.crispasr_titanet_embed(_handle, pcm16k, pcm16k.Length, emb);
-            if (rc != 0) throw new InvalidOperationException($"titanet_embed failed (rc={rc})");
+            if (rc != EmbeddingDim) throw new InvalidOperationException($"titanet_embed failed (rc={rc})");
             return emb;
         }
 
@@ -866,36 +1262,66 @@ namespace CrispASR
     // Speaker database
     // ====================================================================
 
-    /// <summary>On-disk speaker embedding database.</summary>
+    /// <summary>
+    /// On-disk speaker embedding database (closed-roster, consent-gated —
+    /// issue #266). Matching is a claimed-participant confirmation, never
+    /// an open 1:N search.
+    /// </summary>
     public sealed class SpeakerDb : IDisposable
     {
         private IntPtr _handle;
 
         private SpeakerDb(IntPtr handle) => _handle = handle;
 
-        public static SpeakerDb Load(string dirPath)
+        /// <summary>
+        /// Open a db narrowed to the claimed roster. <paramref name="expectedNames"/>
+        /// is the comma-separated list of enrolled participants asserted present
+        /// (e.g. "Alice,Bob"). <paramref name="consentAttested"/> affirms a lawful
+        /// basis + explicit consent from every enrolled person (GDPR Art. 9);
+        /// the call refuses without both.
+        /// </summary>
+        public static SpeakerDb Open(string dirPath, string expectedNames, bool consentAttested)
         {
-            var p = NativeMethods.crispasr_speaker_db_load(dirPath);
-            if (p == IntPtr.Zero) throw new InvalidOperationException($"Failed to load speaker db from {dirPath}");
+            if (!consentAttested)
+                throw new InvalidOperationException("SpeakerDb requires an explicit consent attestation (GDPR Art. 9)");
+            ArgumentNullException.ThrowIfNull(dirPath);
+            ArgumentException.ThrowIfNullOrWhiteSpace(expectedNames);
+            var p = NativeMethods.crispasr_speaker_db_open(dirPath, expectedNames, 1);
+            if (p == IntPtr.Zero) throw new InvalidOperationException($"Failed to open speaker db from {dirPath}");
             return new SpeakerDb(p);
         }
 
-        public int Count => NativeMethods.crispasr_speaker_db_count(_handle);
+        private IntPtr Handle => _handle != IntPtr.Zero ? _handle : throw new ObjectDisposedException(nameof(SpeakerDb));
+        public int Count => NativeMethods.crispasr_speaker_db_count(Handle);
 
-        /// <summary>Match an embedding against the database. Returns (name, score) or (null, 0) if below threshold.</summary>
+        /// <summary>Match an embedding against the database. Returns (name, score), preserving a negative native score for no match.</summary>
         public (string? Name, float Score) Match(float[] embedding, float threshold = 0.5f)
         {
+            var handle = Handle;
+            ArgumentNullException.ThrowIfNull(embedding);
+            if (embedding.Length == 0) throw new ArgumentException("Embedding must not be empty", nameof(embedding));
+            if (!float.IsFinite(threshold)) throw new ArgumentOutOfRangeException(nameof(threshold));
             var outName = new byte[256];
             float score = NativeMethods.crispasr_speaker_db_match(
-                _handle, embedding, embedding.Length, threshold, outName, outName.Length);
-            if (score < threshold) return (null, score);
+                handle, embedding, embedding.Length, threshold, outName, outName.Length);
+            if (score < 0 || score < threshold) return (null, score);
             return (NativeMethods.NullTerminated(outName), score);
         }
 
-        /// <summary>Enroll a new speaker embedding.</summary>
-        public static void Enroll(string dirPath, string name, float[] embedding)
+        /// <summary>
+        /// Enroll a new speaker embedding. <paramref name="consentAttested"/> records
+        /// the enrolled person's explicit consent (GDPR Art. 9) in the profile;
+        /// enrollment refuses without it.
+        /// </summary>
+        public static void Enroll(string dirPath, string name, float[] embedding, bool consentAttested)
         {
-            int rc = NativeMethods.crispasr_speaker_db_enroll(dirPath, name, embedding, embedding.Length);
+            if (!consentAttested)
+                throw new InvalidOperationException("Enrollment requires an explicit consent attestation (GDPR Art. 9)");
+            ArgumentNullException.ThrowIfNull(dirPath);
+            ArgumentNullException.ThrowIfNull(name);
+            ArgumentNullException.ThrowIfNull(embedding);
+            if (embedding.Length == 0) throw new ArgumentException("Embedding must not be empty", nameof(embedding));
+            int rc = NativeMethods.crispasr_speaker_db_enroll2(dirPath, name, embedding, embedding.Length, 1);
             if (rc != 0) throw new InvalidOperationException($"speaker_db_enroll failed (rc={rc})");
         }
 

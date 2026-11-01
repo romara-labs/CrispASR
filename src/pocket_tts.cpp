@@ -31,6 +31,8 @@
 #include "core/gguf_loader.h"
 #include "core/sentencepiece.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
+#include "../examples/json.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -52,6 +54,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ── SentencePiece tokenizer ───────────────────────────────────────
 // The GGUF stores tokenizer.ggml.tokens + tokenizer.ggml.scores arrays
@@ -68,7 +71,7 @@ namespace {
 static bool pocket_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("POCKET_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_POCKET_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -343,6 +346,12 @@ struct pocket_tts_context {
     bool has_voice_state = false;
     std::vector<float> voice_conditioning; // (n_voice_frames, d_model)
     int n_voice_frames = 0;
+    // Official Kyutai embeddings_v3 files contain the already-prefilled
+    // FlowLM transformer K/V state, not audio.  Stored compactly as
+    // [layer][frame][head][head_dim] and expanded into backbone_kv per run.
+    bool has_prepared_voice_state = false;
+    std::vector<float> prepared_voice_k;
+    std::vector<float> prepared_voice_v;
 
     // RNG
     std::mt19937 rng;
@@ -1369,7 +1378,7 @@ static void backbone_forward_step(pocket_tts_context* pctx, const float* x_in, f
 // Dispatch: ggml or manual backbone forward step.
 // --no-gpu (use_gpu=false) forces legacy manual path; env var POCKET_MANUAL_BACKBONE=1 also works.
 static void backbone_step(pocket_tts_context* pctx, const float* x_in, float* out) {
-    if (!pctx->params.use_gpu || getenv("POCKET_MANUAL_BACKBONE")) {
+    if (!pctx->params.use_gpu || crispasr_env::get("CRISPASR_POCKET_MANUAL_BACKBONE")) {
         backbone_forward_step(pctx, x_in, out);
     } else {
         backbone_forward_step_ggml(pctx, x_in, out);
@@ -1440,7 +1449,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
     vec_add(y.data(), t_combined.data(), c_emb.data(), FD);
 
     // Dump y for diff
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         float yn = 0, tcn = 0, cn = 0;
         for (int i = 0; i < FD; i++) {
             yn += y[i] * y[i];
@@ -1480,7 +1489,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
         for (int i = 0; i < FD; i++)
             x[i] += gate[i] * h_out[i];
 
-        if (getenv("POCKET_DUMP_DIR")) {
+        if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
             float xn = 0, gn = 0, hn = 0;
             for (int i = 0; i < FD; i++) {
                 xn += x[i] * x[i];
@@ -1505,7 +1514,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
     layer_norm(normed.data(), x.data(), FD, nullptr, nullptr, 1e-6f);
 
     // Dump pre-modulation x norm and post-modulation for debugging
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         float x_norm = 0, normed_norm = 0;
         for (int i = 0; i < FD; i++) {
             x_norm += x[i] * x[i];
@@ -1894,8 +1903,8 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
     }
 
     // Dump post-upsample (same as manual path for comparison)
-    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (pctx->verbosity >= 2 || crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         if (dd) {
             // Convert to channels-first for dump compatibility with manual path
             std::vector<float> dump_cf(OD * T_xfmr);
@@ -1971,7 +1980,7 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
 
     // Dump hook: mark post-transformer output
     ggml_tensor* post_xfmr = x;
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         ggml_set_name(post_xfmr, "post_xfmr");
         ggml_set_output(post_xfmr);
     }
@@ -2034,13 +2043,13 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
     }
 
     // Dump post-transformer if requested
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         ggml_tensor* pxfmr = ggml_graph_get_tensor(gf, "post_xfmr");
         if (pxfmr) {
             int n_elem = (int)ggml_nelements(pxfmr);
             std::vector<float> xfmr_data(n_elem);
             ggml_backend_tensor_get(pxfmr, xfmr_data.data(), 0, n_elem * sizeof(float));
-            const char* dd = getenv("POCKET_DUMP_DIR");
+            const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
             std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
             FILE* f = fopen(p.c_str(), "wb");
             if (f) {
@@ -2494,8 +2503,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int T_xfmr = T_up_causal;
 
     // Dump post-upsample
-    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (pctx->verbosity >= 2 || crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         if (dd) {
             std::string p = std::string(dd) + "/cpp_mimi_upsample.f32";
             FILE* f = fopen(p.c_str(), "wb");
@@ -2538,8 +2547,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     }
 
     // Dump post-transformer
-    if (getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
         FILE* f = fopen(p.c_str(), "wb");
         if (f) {
@@ -2878,7 +2887,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         // POCKET_MIMI_DUMP=<path>: dump the (deterministic) conditioning
         // latents for scalar-vs-batched A/B — the sampler is stochastic, so
         // WAV comparison cannot validate the encoder.
-        if (const char* dp = std::getenv("POCKET_MIMI_DUMP")) {
+        if (const char* dp = crispasr_env::get("CRISPASR_POCKET_MIMI_DUMP")) {
             if (FILE* f = fopen(dp, "wb")) {
                 fwrite(*latent_out, sizeof(float), (size_t)T_down * LD, f);
                 fclose(f);
@@ -2974,13 +2983,13 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     core_gguf::free_metadata(meta);
 
     // ── Init backends ──
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "pocket_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -3093,7 +3102,7 @@ void pocket_tts_free(struct pocket_tts_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -3121,8 +3130,8 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     //   cpp_latents.f32      — (n_frames, latent_dim) AR latent sequence
     //   cpp_pcm.f32          — final PCM
     // POCKET_FORCE_LATENTS=f : teacher-force AR latents from file f
-    const char* pocket_dump_dir = getenv("POCKET_DUMP_DIR");
-    const char* pocket_force_lat = getenv("POCKET_FORCE_LATENTS");
+    const char* pocket_dump_dir = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
+    const char* pocket_force_lat = crispasr_env::get("CRISPASR_POCKET_FORCE_LATENTS");
     auto dump_path = [&](const char* name) -> std::string {
         return std::string(pocket_dump_dir ? pocket_dump_dir : ".") + "/" + name;
     };
@@ -3165,7 +3174,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         max_frames = std::min(max_frames, 500); // ~40s max
     }
     // Allow env override for testing
-    if (const char* mf_env = getenv("POCKET_MAX_FRAMES")) {
+    if (const char* mf_env = crispasr_env::get("CRISPASR_POCKET_MAX_FRAMES")) {
         max_frames = std::atoi(mf_env);
         if (max_frames <= 0)
             max_frames = 25;
@@ -3194,7 +3203,19 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     kv_cache_reset(ctx->backbone_kv);
 
     // 2b. Voice conditioning prefill (if set via set_voice)
-    if (ctx->has_voice_state && n_voice > 0) {
+    if (ctx->has_prepared_voice_state && n_voice > 0) {
+        const size_t frame_stride = (size_t)hp.num_heads * hp.head_dim();
+        const size_t compact_layer_stride = (size_t)n_voice * frame_stride;
+        for (int l = 0; l < (int)hp.num_layers; ++l) {
+            memcpy(kv_k_ptr(ctx->backbone_kv, l, 0), ctx->prepared_voice_k.data() + (size_t)l * compact_layer_stride,
+                   compact_layer_stride * sizeof(float));
+            memcpy(kv_v_ptr(ctx->backbone_kv, l, 0), ctx->prepared_voice_v.data() + (size_t)l * compact_layer_stride,
+                   compact_layer_stride * sizeof(float));
+        }
+        ctx->backbone_kv.offset = n_voice;
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "pocket_tts: prepared voice state loaded: %d frames\n", n_voice);
+    } else if (ctx->has_voice_state && n_voice > 0) {
         for (int f = 0; f < n_voice; f++) {
             const float* vc = &ctx->voice_conditioning[f * D];
             std::vector<float> backbone_out(D);
@@ -3322,7 +3343,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             // Allow forcing step-0 noise from file for diff testing
             bool noise_forced = false;
             if (frame == 0) {
-                const char* nf = getenv("POCKET_FORCE_NOISE");
+                const char* nf = crispasr_env::get("CRISPASR_POCKET_FORCE_NOISE");
                 if (nf) {
                     FILE* fn = fopen(nf, "rb");
                     if (fn) {
@@ -3400,7 +3421,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     {
         pocket_tts_bench_stage _bs("mimi_decode");
         // use_gpu=false forces the manual CPU Mimi path; env POCKET_MANUAL_MIMI=1 also.
-        bool force_cpu_mimi = !ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI");
+        bool force_cpu_mimi = !ctx->params.use_gpu || crispasr_env::get("CRISPASR_POCKET_MANUAL_MIMI");
 
         // Vulkan workgroup-limit guard (issue #256). The Mimi decoder transformer
         // dispatches ~T_xfmr^2 workgroups over the causal attention (T_xfmr scales
@@ -3413,7 +3434,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             const char* be_name = ggml_backend_name(ctx->backend);
             if (be_name && strstr(be_name, "Vulkan")) {
                 int max_frames = 120;
-                if (const char* env = getenv("POCKET_VULKAN_MIMI_MAX_FRAMES"))
+                if (const char* env = crispasr_env::get("CRISPASR_POCKET_VULKAN_MIMI_MAX_FRAMES"))
                     max_frames = atoi(env);
                 if (max_frames > 0 && n_gen_frames > max_frames) {
                     force_cpu_mimi = true;
@@ -3582,6 +3603,9 @@ int pocket_tts_set_voice(struct pocket_tts_context* ctx, const float* ref_pcm_24
 
     ctx->n_voice_frames = n_ref_frames;
     ctx->has_voice_state = true;
+    ctx->has_prepared_voice_state = false;
+    ctx->prepared_voice_k.clear();
+    ctx->prepared_voice_v.clear();
 
     if (ctx->verbosity >= 1)
         fprintf(stderr, "pocket_tts: voice conditioning set (%d frames)\n", n_ref_frames);
@@ -3589,11 +3613,125 @@ int pocket_tts_set_voice(struct pocket_tts_context* ctx, const float* ref_pcm_24
     return 0;
 }
 
+int pocket_tts_load_voice_embedding(struct pocket_tts_context* ctx, const char* path) {
+    if (!ctx || !path || !*path)
+        return -1;
+    try {
+        FILE* f = fopen(path, "rb");
+        if (!f)
+            throw std::runtime_error("cannot open file");
+        uint64_t header_len = 0;
+        if (fread(&header_len, sizeof(header_len), 1, f) != 1 || header_len == 0 || header_len > 16 * 1024 * 1024) {
+            fclose(f);
+            throw std::runtime_error("invalid safetensors header length");
+        }
+        std::string header((size_t)header_len, '\0');
+        if (fread(header.data(), 1, header.size(), f) != header.size()) {
+            fclose(f);
+            throw std::runtime_error("truncated safetensors header");
+        }
+        if (fseek(f, 0, SEEK_END) != 0) {
+            fclose(f);
+            throw std::runtime_error("cannot determine file size");
+        }
+        const long file_size_long = ftell(f);
+        if (file_size_long < 0) {
+            fclose(f);
+            throw std::runtime_error("cannot determine file size");
+        }
+        const uint64_t file_size = (uint64_t)file_size_long;
+        const uint64_t data_base = 8 + header_len;
+        const auto root = nlohmann::json::parse(header);
+        const int layers = (int)ctx->model.flow_lm_hp.num_layers;
+        const int heads = (int)ctx->model.flow_lm_hp.num_heads;
+        const int head_dim = (int)ctx->model.flow_lm_hp.head_dim();
+        int frames = -1;
+        std::vector<float> keys, values;
+
+        auto read_tensor = [&](const nlohmann::json& info, void* dst, size_t bytes) {
+            if (!info.contains("data_offsets") || info["data_offsets"].size() != 2)
+                throw std::runtime_error("tensor has invalid data_offsets");
+            uint64_t begin = info["data_offsets"][0].get<uint64_t>();
+            uint64_t end = info["data_offsets"][1].get<uint64_t>();
+            if (end < begin || end - begin != bytes || data_base > file_size || begin > file_size - data_base ||
+                bytes > file_size - data_base - begin)
+                throw std::runtime_error("tensor data range is invalid");
+            if (fseek(f, (long)(data_base + begin), SEEK_SET) != 0 || fread(dst, 1, bytes, f) != bytes)
+                throw std::runtime_error("failed to read tensor data");
+        };
+
+        for (int l = 0; l < layers; ++l) {
+            const std::string prefix = "transformer.layers." + std::to_string(l) + ".self_attn/";
+            const std::string cache_name = prefix + "cache";
+            const std::string offset_name = prefix + "offset";
+            const std::string current_end_name = prefix + "current_end";
+            if (!root.contains(cache_name))
+                throw std::runtime_error("missing " + cache_name);
+            const auto& info = root.at(cache_name);
+            if (info.value("dtype", "") != "F32" || !info.contains("shape"))
+                throw std::runtime_error(cache_name + " must be F32 with a shape");
+            std::vector<int64_t> shape = info.at("shape").get<std::vector<int64_t>>();
+            int64_t tensor_frames = 0;
+            if (shape.size() == 5 && shape[0] == 2 && shape[1] == 1)
+                tensor_frames = shape[2];
+            else if (shape.size() == 4 && shape[0] == 2)
+                tensor_frames = shape[1];
+            else
+                throw std::runtime_error(cache_name + " must have shape [2,1,T,H,D] or [2,T,H,D]");
+            if (tensor_frames <= 0 || tensor_frames > 100000 || shape[shape.size() - 2] != heads ||
+                shape.back() != head_dim)
+                throw std::runtime_error(cache_name + " does not match this model");
+            if (frames < 0)
+                frames = (int)tensor_frames;
+            if (frames != tensor_frames)
+                throw std::runtime_error("voice cache layer frame counts disagree");
+            int64_t offset = -1;
+            if (root.contains(offset_name)) {
+                const auto& oi = root.at(offset_name);
+                if (oi.value("dtype", "") != "I64")
+                    throw std::runtime_error(offset_name + " must be I64");
+                read_tensor(oi, &offset, sizeof(offset));
+            } else if (root.contains(current_end_name)) {
+                const auto shape2 = root.at(current_end_name).at("shape").get<std::vector<int64_t>>();
+                if (shape2.empty())
+                    throw std::runtime_error(current_end_name + " has no extent");
+                offset = shape2[0];
+            } else {
+                throw std::runtime_error("missing " + offset_name);
+            }
+            if (offset != frames)
+                throw std::runtime_error("voice cache offset does not match its frame count");
+            const size_t single = (size_t)frames * heads * head_dim;
+            std::vector<float> both(single * 2);
+            read_tensor(info, both.data(), both.size() * sizeof(float));
+            keys.insert(keys.end(), both.begin(), both.begin() + (ptrdiff_t)single);
+            values.insert(values.end(), both.begin() + (ptrdiff_t)single, both.end());
+        }
+        fclose(f);
+        ctx->prepared_voice_k = std::move(keys);
+        ctx->prepared_voice_v = std::move(values);
+        ctx->n_voice_frames = frames;
+        ctx->voice_conditioning.clear();
+        ctx->has_voice_state = true;
+        ctx->has_prepared_voice_state = true;
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "pocket_tts: loaded prepared voice embedding '%s' (%d layers, %d frames)\n", path, layers,
+                    frames);
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "pocket_tts: failed to load voice embedding '%s': %s\n", path, e.what());
+        return -1;
+    }
+}
+
 void pocket_tts_clear_voice(struct pocket_tts_context* ctx) {
     if (!ctx)
         return;
     ctx->has_voice_state = false;
+    ctx->has_prepared_voice_state = false;
     ctx->voice_conditioning.clear();
+    ctx->prepared_voice_k.clear();
+    ctx->prepared_voice_v.clear();
     ctx->n_voice_frames = 0;
 }
 

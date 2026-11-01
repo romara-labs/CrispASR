@@ -1,8 +1,32 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+
+/// Helper: copy a NUL-terminated C string's raw bytes losslessly before freeing its result.
+Uint8List _copyCStringBytes(Pointer<Utf8> ptr) {
+  if (ptr == nullptr) return Uint8List(0);
+  final u8 = ptr.cast<Uint8>();
+  var len = 0;
+  while (u8[len] != 0) {
+    len++;
+  }
+  final out = Uint8List(len);
+  for (var i = 0; i < len; i++) {
+    out[i] = u8[i];
+  }
+  return out;
+}
+
+String _decodeCString(Pointer<Utf8> ptr, {bool allowMalformed = false}) {
+  final bytes = _copyCStringBytes(ptr);
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: allowMalformed);
+}
+
+bool _hasTs(int t0, int t1) => t0 >= 0 && t1 >= 0 && t1 >= t0;
 
 /// A transcription segment with timing.
 class Segment {
@@ -29,8 +53,8 @@ class Segment {
 /// [TranscribeOptions.wordTimestamps] is true.
 class Word {
   final String text;
-  final double start; // seconds
-  final double end; // seconds
+  final double start; // seconds; -1 when timestamp unavailable
+  final double end; // seconds; -1 when timestamp unavailable
   final double p; // token probability [0, 1]
   /// Top-N runner-up candidates for this token. Populated only when
   /// the caller asked for alt-token capture (`altN` > 0 on the
@@ -46,6 +70,11 @@ class Word {
     required this.p,
     this.alts = const [],
   });
+
+  /// Whether this word has valid timestamps (`start`/`end` >= 0).
+  /// Missing timestamps are preserved as -1, not -0.01, so callers can
+  /// distinguish "no timing" from a genuine early timestamp.
+  bool get hasTimestamps => start >= 0 && end >= 0;
 
   @override
   String toString() =>
@@ -68,6 +97,50 @@ class AltToken {
 
   @override
   String toString() => '$text(${(p * 100).toStringAsFixed(1)}%)';
+}
+
+/// Native token metadata from the shared session (issue #549).
+///
+/// Backends that expose a token stream (whisper, some LLM decoders) populate
+/// this; others return an empty list. Times are seconds, or -1 when unavailable
+/// (never interpolate). Token text may contain a UTF-8 byte fragment:
+/// concatenate [rawBytes] before decoding to reconstruct the transcript losslessly.
+/// Returned pointers live until result free, so the wrapper copies before freeing.
+class SessionToken {
+  /// Display text decoded with replacement; valid text survives, malformed
+  /// decoded bytes are replaced with U+FFFD. Join [rawBytes] before decoding
+  /// when reconstructing losslessly (e.g. for CJK where a character may span
+  /// multiple tokens).
+  final String text;
+
+  /// Raw UTF-8 bytes for this token, copied before result free. Lossless even
+  /// when [text] needed replacement characters. Empty for backends without token
+  /// output and on older libraries.
+  final Uint8List rawBytes;
+
+  /// Start time in seconds, or -1 when unavailable (never interpolate).
+  final double start;
+
+  /// End time in seconds, or -1 when unavailable.
+  final double end;
+
+  /// Token confidence in [0, 1], or -1 when unavailable.
+  final double p;
+
+  const SessionToken({
+    required this.text,
+    required this.rawBytes,
+    required this.start,
+    required this.end,
+    required this.p,
+  });
+
+  /// Whether this token has valid timestamps.
+  bool get hasTimestamps => start >= 0 && end >= 0;
+
+  @override
+  String toString() =>
+      '${start.toStringAsFixed(2)}-${end.toStringAsFixed(2)} $text';
 }
 
 /// Result of [CrispASR.detectLanguage].
@@ -141,9 +214,9 @@ DecodedAudio decodeAudioFile(String path, {String? libPath}) {
     final copy = Float32List(n);
     final srcView = ptr.asTypedList(n);
     copy.setAll(0, srcView);
-    free(ptr);
     return DecodedAudio(samples: copy, sampleRate: sr > 0 ? sr : 16000);
   } finally {
+    if (pcmOut.value != nullptr) free(pcmOut.value);
     calloc.free(pathPtr);
     calloc.free(pcmOut);
     calloc.free(nOut);
@@ -217,6 +290,48 @@ class DiarizeSegment {
   DiarizeSegment({required this.t0, required this.t1, this.speaker = -1});
 }
 
+/// One audio-derived speaker turn returned by FoxNose.
+///
+/// Times are seconds on the same absolute timeline as [DiarizeSegment].
+class DiarizeTurn {
+  final double t0;
+  final double t1;
+  final int speaker;
+  const DiarizeTurn(
+      {required this.t0, required this.t1, required this.speaker});
+}
+
+// FFI uses the target C ABI's pointer width/alignment, including 32-bit builds.
+final class _DiarizeSpanAbi extends Struct {
+  @Int64()
+  external int t0;
+  @Int64()
+  external int t1;
+  @Int32()
+  external int speaker;
+  @Int32()
+  external int padding;
+}
+
+final class _DiarizeOptionsAbi extends Struct {
+  @Int32()
+  external int method;
+  @Int32()
+  external int threads;
+  @Int64()
+  external int sliceOffset;
+  external Pointer<Utf8> model;
+  external Pointer<Utf8> embedder;
+  @Int32()
+  external int minSpeakers;
+  @Int32()
+  external int maxSpeakers;
+  @Int32()
+  external int numSpeakers;
+  @Int32()
+  external int padding;
+}
+
 enum DiarizeMethod {
   /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
   energy,
@@ -231,6 +346,16 @@ enum DiarizeMethod {
   /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net.
   /// Requires [pyannoteModelPath].
   pyannote,
+
+  /// Mono-friendly, ML-based (#324): WeSpeaker embeddings + spectral
+  /// clustering (the FoxNose recipe). Requires [foxnoseEmbedderPath].
+  foxNose,
+
+  /// Mono-friendly, ML-based (#466): NVIDIA Nemotron-3-Diarization, a
+  /// streaming Sortformer v3 that derives speaker turns from the audio.
+  /// Requires [sortformerModelPath]. Index 5 = the C ABI's method number,
+  /// which is what this enum's order encodes — append only.
+  sortformer,
 }
 
 /// Assign a speaker index to each of [segs], based on the selected
@@ -240,14 +365,28 @@ enum DiarizeMethod {
 /// of a stereo pair. When `isStereo` is true, `right` must point at the
 /// right channel. All PCM is 16 kHz float32.
 ///
-/// Returns `true` on success. The only failure case is
-/// [DiarizeMethod.pyannote] when the GGUF model can't be loaded — all
-/// other methods always succeed (they may leave individual segments
-/// with `speaker = -1` when they had no information to decide).
+/// Returns `true` on success. The only failure cases are the
+/// model-backed methods ([DiarizeMethod.pyannote], [DiarizeMethod.foxNose],
+/// [DiarizeMethod.sortformer]) when their GGUF model can't be loaded — all other methods always
+/// succeed (they may leave individual segments with `speaker = -1` when
+/// they had no information to decide).
 ///
 /// `sliceT0` is the absolute start time (seconds) of the PCM buffer
 /// within the original audio, so absolute segment times in [DiarizeSegment]
 /// can be mapped back to sample indices.
+///
+/// [foxnoseEmbedderPath] (required for [DiarizeMethod.foxNose]) is the
+/// WeSpeaker embedder GGUF; [minSpeakers] / [maxSpeakers] bound the
+/// automatic speaker-count estimation (0 keeps the library defaults 1 / 8)
+/// and [numSpeakers] > 0 pins the count and skips estimation.
+///
+/// [sortformerModelPath] (required for [DiarizeMethod.sortformer]) is the
+/// Nemotron-3-Diarization GGUF. The C ABI reads it from the same struct
+/// field as the pyannote model. The FFI struct follows the target pointer width.
+///
+/// When [outTurns] is supplied, the function calls the CrispASR 0.8.30+
+/// turn-returning ABI and replaces that list with the audio-derived turns
+/// of FoxNose or Sortformer. Other methods leave it empty.
 bool diarizeSegments({
   required List<DiarizeSegment> segs,
   required Float32List left,
@@ -257,70 +396,138 @@ bool diarizeSegments({
   String? pyannoteModelPath,
   int nThreads = 4,
   double sliceT0 = 0.0,
+  String? foxnoseEmbedderPath,
+  String? sortformerModelPath,
+  int minSpeakers = 0,
+  int maxSpeakers = 0,
+  int numSpeakers = 0,
+  List<DiarizeTurn>? outTurns,
   DynamicLibrary? lib,
 }) {
+  outTurns?.clear();
   if (segs.isEmpty || left.isEmpty) return true;
+  if (isStereo && (right == null || right.length != left.length)) {
+    throw ArgumentError('Stereo channels must have equal lengths');
+  }
+  if (!sliceT0.isFinite ||
+      nThreads < 1 ||
+      minSpeakers < 0 ||
+      maxSpeakers < 0 ||
+      numSpeakers < 0) {
+    throw ArgumentError(
+        'Invalid diarization offset, threads or speaker counts');
+  }
+  for (final seg in segs) {
+    if (!seg.t0.isFinite || !seg.t1.isFinite || seg.t1 < seg.t0) {
+      throw ArgumentError('Segment times must be finite and ordered');
+    }
+  }
   lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
-
-  final n = left.length;
-  final leftPtr = calloc<Float>(n);
-  for (var i = 0; i < n; i++) {
-    leftPtr[i] = left[i];
-  }
-
-  Pointer<Float> rightPtr = leftPtr;
-  if (isStereo && right != null) {
-    rightPtr = calloc<Float>(right.length);
-    for (var i = 0; i < right.length; i++) {
-      rightPtr[i] = right[i];
-    }
-  }
-
-  // ABI struct layout must match `crispasr_diarize_seg_abi`:
-  // int64 t0_cs, int64 t1_cs, int32 speaker, int32 _pad. 24 bytes each.
-  final segsPtr = calloc<Uint8>(24 * segs.length);
-  for (var i = 0; i < segs.length; i++) {
-    final base = segsPtr + i * 24;
-    base.cast<Int64>().value = (segs[i].t0 * 100).round();
-    (base + 8).cast<Int64>().value = (segs[i].t1 * 100).round();
-    (base + 16).cast<Int32>().value = segs[i].speaker;
-    (base + 20).cast<Int32>().value = 0;
-  }
-
-  // ABI opts: int32 method, int32 n_threads, int64 slice_t0_cs, const char*.
-  // 4+4+8+8 = 24 bytes on 64-bit. We write each field explicitly.
-  final optsPtr = calloc<Uint8>(24);
-  optsPtr.cast<Int32>().value = method.index;
-  (optsPtr + 4).cast<Int32>().value = nThreads;
-  (optsPtr + 8).cast<Int64>().value = (sliceT0 * 100).round();
-  final pathPtr = (method == DiarizeMethod.pyannote &&
-          pyannoteModelPath != null &&
-          pyannoteModelPath.isNotEmpty)
-      ? pyannoteModelPath.toNativeUtf8()
-      : nullptr;
-  (optsPtr + 16).cast<IntPtr>().value = pathPtr.address;
-
-  final fn = lib.lookupFunction<
-      Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
-          Pointer<Uint8>, Int32, Pointer<Uint8>),
-      int Function(Pointer<Float>, Pointer<Float>, int, int, Pointer<Uint8>,
-          int, Pointer<Uint8>)>('crispasr_diarize_segments_abi');
-  final rc =
-      fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length, optsPtr);
-
-  if (rc == 0) {
+  final arena = Arena();
+  try {
+    final n = left.length;
+    final leftPtr = arena<Float>(n)..asTypedList(n).setAll(0, left);
+    final rightPtr = isStereo
+        ? (arena<Float>(n)..asTypedList(n).setAll(0, right!))
+        : leftPtr;
+    final segments = arena<_DiarizeSpanAbi>(segs.length);
     for (var i = 0; i < segs.length; i++) {
-      segs[i].speaker = (segsPtr + i * 24 + 16).cast<Int32>().value;
+      segments[i].t0 = (segs[i].t0 * 100).round();
+      segments[i].t1 = (segs[i].t1 * 100).round();
+      segments[i].speaker = segs[i].speaker;
     }
+    final opts = arena<_DiarizeOptionsAbi>();
+    opts.ref.method = method.index;
+    opts.ref.threads = nThreads;
+    opts.ref.sliceOffset = (sliceT0 * 100).round();
+    final modelPath = switch (method) {
+      DiarizeMethod.pyannote => pyannoteModelPath,
+      DiarizeMethod.sortformer => sortformerModelPath,
+      _ => null,
+    };
+    opts.ref.model = modelPath == null || modelPath.isEmpty
+        ? nullptr
+        : modelPath.toNativeUtf8(allocator: arena);
+    opts.ref.embedder = method == DiarizeMethod.foxNose &&
+            foxnoseEmbedderPath != null &&
+            foxnoseEmbedderPath.isNotEmpty
+        ? foxnoseEmbedderPath.toNativeUtf8(allocator: arena)
+        : nullptr;
+    opts.ref.minSpeakers = minSpeakers;
+    opts.ref.maxSpeakers = maxSpeakers;
+    opts.ref.numSpeakers = numSpeakers;
+    var rc = 0;
+    if (outTurns == null) {
+      final fn = lib.lookupFunction<
+          Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
+              Pointer<_DiarizeSpanAbi>, Int32, Pointer<_DiarizeOptionsAbi>),
+          int Function(
+              Pointer<Float>,
+              Pointer<Float>,
+              int,
+              int,
+              Pointer<_DiarizeSpanAbi>,
+              int,
+              Pointer<_DiarizeOptionsAbi>)>('crispasr_diarize_segments_abi');
+      rc = fn(
+          leftPtr, rightPtr, n, isStereo ? 1 : 0, segments, segs.length, opts);
+    } else {
+      final fn = lib.lookupFunction<
+          Int32 Function(
+              Pointer<Float>,
+              Pointer<Float>,
+              Int32,
+              Int32,
+              Pointer<_DiarizeSpanAbi>,
+              Int32,
+              Pointer<_DiarizeOptionsAbi>,
+              Pointer<_DiarizeSpanAbi>,
+              Int32,
+              Pointer<Int32>),
+          int Function(
+              Pointer<Float>,
+              Pointer<Float>,
+              int,
+              int,
+              Pointer<_DiarizeSpanAbi>,
+              int,
+              Pointer<_DiarizeOptionsAbi>,
+              Pointer<_DiarizeSpanAbi>,
+              int,
+              Pointer<Int32>)>('crispasr_diarize_segments_turns_abi');
+      var cap = ((n + 7999) ~/ 8000) + segs.length + 16;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        final turns = arena<_DiarizeSpanAbi>(cap);
+        final count = arena<Int32>();
+        rc = fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segments, segs.length,
+            opts, turns, cap, count);
+        if (rc == 2 && attempt == 0 && count.value > cap) {
+          cap = count.value;
+          continue;
+        }
+        if (rc == 0) {
+          if (count.value < 0 || count.value > cap) {
+            throw StateError('Invalid native diarization turn count');
+          }
+          for (var i = 0; i < count.value; i++) {
+            outTurns.add(DiarizeTurn(
+                t0: turns[i].t0 / 100.0,
+                t1: turns[i].t1 / 100.0,
+                speaker: turns[i].speaker));
+          }
+        }
+        break;
+      }
+    }
+    if (rc == 0) {
+      for (var i = 0; i < segs.length; i++) {
+        segs[i].speaker = segments[i].speaker;
+      }
+    }
+    return rc == 0;
+  } finally {
+    arena.releaseAll();
   }
-
-  calloc.free(leftPtr);
-  if (rightPtr != leftPtr) calloc.free(rightPtr);
-  calloc.free(segsPtr);
-  calloc.free(optsPtr);
-  if (pathPtr != nullptr) calloc.free(pathPtr);
-
-  return rc == 0;
 }
 
 /// A registry entry returned by [registryLookup] / [registryLookupByFilename].
@@ -335,9 +542,40 @@ class RegistryEntry {
   });
 }
 
+/// Role of one artifact in a canonical model download bundle.
+enum RegistryArtifactKind { primary, companion, extra }
+
+/// One file in a backend's canonical default download bundle.
+class RegistryArtifact {
+  final RegistryArtifactKind kind;
+  final String filename;
+  final String url;
+  final String approxSize;
+  const RegistryArtifact({
+    required this.kind,
+    required this.filename,
+    required this.url,
+    required this.approxSize,
+  });
+}
+
+/// The exact artifact bundle downloaded by `-m auto`.
+class RegistryBundle {
+  final String backend;
+  final String license;
+  final bool requiresAcceptance;
+  final List<RegistryArtifact> artifacts;
+  const RegistryBundle({
+    required this.backend,
+    required this.license,
+    required this.requiresAcceptance,
+    required this.artifacts,
+  });
+}
+
 /// Look up the canonical GGUF for a backend (whisper, parakeet, canary,
-/// voxtral, voxtral4b, granite, qwen3, cohere, nemotron, wav2vec2). Returns null
-/// on miss.
+/// voxtral, voxtral4b, granite, qwen3, cohere, nemotron, gigaam, wav2vec2).
+/// Returns null on miss.
 RegistryEntry? registryLookup(String backend, {DynamicLibrary? lib}) =>
     _registryCall('crispasr_registry_lookup_abi', backend, lib);
 
@@ -347,6 +585,79 @@ RegistryEntry? registryLookup(String backend, {DynamicLibrary? lib}) =>
 RegistryEntry? registryLookupByFilename(String filename,
         {DynamicLibrary? lib}) =>
     _registryCall('crispasr_registry_lookup_by_filename_abi', filename, lib);
+
+/// Return the backend's exact canonical `-m auto` artifact bundle.
+/// No preferred quant is applied. Returns null for an unknown backend.
+RegistryBundle? registryDefaultBundle(String backend, {DynamicLibrary? lib}) {
+  if (backend.isEmpty) return null;
+  lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+  const infoSymbol = 'crispasr_registry_default_bundle_info_abi';
+  const artifactSymbol = 'crispasr_registry_default_bundle_artifact_abi';
+  if (!lib.providesSymbol(infoSymbol) || !lib.providesSymbol(artifactSymbol)) {
+    return null;
+  }
+
+  final backendPtr = backend.toNativeUtf8();
+  final canonicalBuf = calloc<Uint8>(256);
+  final licenseBuf = calloc<Uint8>(1024);
+  final requiresAcceptancePtr = calloc<Int32>();
+  final info = lib.lookupFunction<
+      Int32 Function(Pointer<Utf8>, Pointer<Uint8>, Int32, Pointer<Uint8>,
+          Int32, Pointer<Int32>),
+      int Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Uint8>, int,
+          Pointer<Int32>)>(infoSymbol);
+  try {
+    final count = info(
+        backendPtr, canonicalBuf, 256, licenseBuf, 1024, requiresAcceptancePtr);
+    if (count == 0) return null;
+    if (count < 0) {
+      throw StateError('Default registry bundle lookup failed (rc=$count).');
+    }
+
+    final artifactFn = lib.lookupFunction<
+        Int32 Function(Pointer<Utf8>, Int32, Pointer<Int32>, Pointer<Uint8>,
+            Int32, Pointer<Uint8>, Int32, Pointer<Uint8>, Int32),
+        int Function(Pointer<Utf8>, int, Pointer<Int32>, Pointer<Uint8>, int,
+            Pointer<Uint8>, int, Pointer<Uint8>, int)>(artifactSymbol);
+    final artifacts = <RegistryArtifact>[];
+    for (var index = 0; index < count; index++) {
+      final kindPtr = calloc<Int32>();
+      final filenameBuf = calloc<Uint8>(256);
+      final urlBuf = calloc<Uint8>(2048);
+      final sizeBuf = calloc<Uint8>(64);
+      try {
+        final rc = artifactFn(backendPtr, index, kindPtr, filenameBuf, 256,
+            urlBuf, 2048, sizeBuf, 64);
+        if (rc != 0 || kindPtr.value < 0 || kindPtr.value > 2) {
+          throw StateError('Default registry bundle artifact $index failed '
+              '(rc=$rc, kind=${kindPtr.value}).');
+        }
+        artifacts.add(RegistryArtifact(
+          kind: RegistryArtifactKind.values[kindPtr.value],
+          filename: filenameBuf.cast<Utf8>().toDartString(),
+          url: urlBuf.cast<Utf8>().toDartString(),
+          approxSize: sizeBuf.cast<Utf8>().toDartString(),
+        ));
+      } finally {
+        calloc.free(kindPtr);
+        calloc.free(filenameBuf);
+        calloc.free(urlBuf);
+        calloc.free(sizeBuf);
+      }
+    }
+    return RegistryBundle(
+      backend: canonicalBuf.cast<Utf8>().toDartString(),
+      license: licenseBuf.cast<Utf8>().toDartString(),
+      requiresAcceptance: requiresAcceptancePtr.value != 0,
+      artifacts: List.unmodifiable(artifacts),
+    );
+  } finally {
+    calloc.free(backendPtr);
+    calloc.free(canonicalBuf);
+    calloc.free(licenseBuf);
+    calloc.free(requiresAcceptancePtr);
+  }
+}
 
 /// Every backend name in the registry, in declaration order. Each name
 /// can be passed back to [registryLookup] for full details.
@@ -549,21 +860,36 @@ String? cacheDir({String? override, DynamicLibrary? lib}) {
   return dir;
 }
 
-/// One word + centisecond timings returned by [alignWords].
+/// Measured original codepoint; start/end are seconds.
+class AlignedCharacter {
+  final String text;
+  final double start;
+  final double end;
+  const AlignedCharacter(
+      {required this.text, required this.start, required this.end});
+}
+
+/// One word and optional measured character spans returned by [alignWords].
 class AlignedWord {
+  final List<AlignedCharacter> characters;
   final String text;
   final double start; // seconds
   final double end;
   const AlignedWord(
-      {required this.text, required this.start, required this.end});
+      {required this.text,
+      required this.start,
+      required this.end,
+      this.characters = const []});
 }
 
 /// CTC / forced-alignment word timings for a transcript + audio pair.
 ///
 /// `alignerModel` picks the backend by filename convention: any path
 /// containing "forced-aligner" / "qwen3-fa" / "qwen3-forced" routes to
-/// the Qwen3-ForcedAligner path; everything else goes through
-/// canary-ctc-aligner.
+/// the Qwen3-ForcedAligner path. Wav2vec2/HuBERT/data2vec models use
+/// their own CTC vocabulary; remaining models use canary-ctc. Supported
+/// original codepoints have measured character spans. Romanized words
+/// and other aligner families return an empty character list.
 ///
 /// `tOffset` (seconds) is added to every word's start/end so the
 /// returned timings are absolute against the original audio.
@@ -614,12 +940,35 @@ List<AlignedWord> alignWords({
   final freeFn = lib.lookupFunction<Void Function(Pointer<Void>),
       void Function(Pointer<Void>)>('crispasr_align_result_free');
 
+  final ncFn = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+      int Function(Pointer<Void>, int)>('crispasr_align_result_n_characters');
+  final cpFn = lib.lookupFunction<
+      Pointer<Utf8> Function(Pointer<Void>, Int32, Int32),
+      Pointer<Utf8> Function(
+          Pointer<Void>, int, int)>('crispasr_align_result_character_text');
+  final c0Fn = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32, Int32),
+      int Function(
+          Pointer<Void>, int, int)>('crispasr_align_result_character_t0');
+  final c1Fn = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32, Int32),
+      int Function(
+          Pointer<Void>, int, int)>('crispasr_align_result_character_t1');
   final n = nFn(res);
   final out = <AlignedWord>[];
   for (var i = 0; i < n; i++) {
     final tp = textFn(res, i);
     final t = tp == nullptr ? '' : tp.toDartString();
+    final characters = <AlignedCharacter>[];
+    for (var j = 0; j < ncFn(res, i); j++) {
+      final cp = cpFn(res, i, j);
+      characters.add(AlignedCharacter(
+          text: cp == nullptr ? '' : cp.toDartString(),
+          start: c0Fn(res, i, j) / 100.0,
+          end: c1Fn(res, i, j) / 100.0));
+    }
     out.add(AlignedWord(
+      characters: characters,
       text: t,
       start: t0Fn(res, i) / 100.0,
       end: t1Fn(res, i) / 100.0,
@@ -765,6 +1114,136 @@ Float32List enhanceAudioRnnoise(
   }
 }
 
+/// Lightweight wrappers for missing utility entry points (header census).
+///
+/// These are intentionally minimal - they probe symbol presence and fall back
+/// gracefully so an older library never throws at import time. The heavy
+/// native work stays in the existing validated surfaces.
+
+/// Version string reported by the loaded libcrispasr (CRISPASR_SHARED build).
+/// Returns empty string when the symbol is absent (pre-0.7.0 builds).
+String cApiVersion({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_c_api_version')) return '';
+  final fn =
+      lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+          'crispasr_c_api_version');
+  final p = fn();
+  return p == nullptr ? '' : p.toDartString();
+}
+
+/// Dart helpers version (deprecated alias for [cApiVersion]); kept for parity.
+String dartHelpersVersion({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_dart_helpers_version')) {
+    return cApiVersion(libPath: libPath);
+  }
+  final fn =
+      lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+          'crispasr_dart_helpers_version');
+  final p = fn();
+  return p == nullptr ? '' : p.toDartString();
+}
+
+/// Set the preferred GPU backend name ("cuda", "vulkan", "metal").
+/// Call before any session open. Null or "" = auto.
+void setGpuBackend(String? name, {String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_set_gpu_backend')) return;
+  final fn = lib.lookupFunction<Void Function(Pointer<Utf8>),
+      void Function(Pointer<Utf8>)>('crispasr_set_gpu_backend');
+  final p = name == null ? nullptr : name.toNativeUtf8().cast<Utf8>();
+  try {
+    fn(p);
+  } finally {
+    if (p != nullptr) calloc.free(p);
+  }
+}
+
+/// Detect every backend that can open this GGUF, newline-separated, primary
+/// first. Returns null on failure, or a list of backend names.
+List<String>? detectBackendsFromGguf(String path, {String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_detect_backends_from_gguf')) {
+    final single = detectBackendFromGguf(path, libPath: libPath);
+    return single == null ? null : [single];
+  }
+  final fn = lib.lookupFunction<
+      Int32 Function(Pointer<Utf8>, Pointer<Utf8>, Int32),
+      int Function(Pointer<Utf8>, Pointer<Utf8>,
+          int)>('crispasr_detect_backends_from_gguf');
+  final pathPtr = path.toNativeUtf8();
+  const cap = 1024;
+  final outBuf = calloc<Uint8>(cap);
+  try {
+    final n = fn(pathPtr, outBuf.cast<Utf8>(), cap);
+    if (n <= 0) return null;
+    final s = outBuf.cast<Utf8>().toDartString();
+    if (s.isEmpty) return const [];
+    return s.split('\n').where((e) => e.isNotEmpty).toList();
+  } finally {
+    calloc.free(pathPtr);
+    calloc.free(outBuf);
+  }
+}
+
+/// Query what verbs a backend can perform (e.g. "tts,voice-cloning,auto-download").
+/// Returns null when the backend is unknown or the symbol is absent.
+String? backendCaps(String backend, {String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_backend_caps_abi')) return null;
+  final fn = lib.lookupFunction<
+      Int32 Function(Pointer<Utf8>, Pointer<Utf8>, Int32),
+      int Function(
+          Pointer<Utf8>, Pointer<Utf8>, int)>('crispasr_backend_caps_abi');
+  final bPtr = backend.toNativeUtf8();
+  const cap = 512;
+  final out = calloc<Uint8>(cap);
+  try {
+    final n = fn(bPtr, out.cast<Utf8>(), cap);
+    if (n < 0) return null;
+    return out.cast<Utf8>().toDartString();
+  } finally {
+    calloc.free(bPtr);
+    calloc.free(out);
+  }
+}
+
+/// List all backend capabilities as "name\tcaps" lines. Returns null when absent.
+String? backendCapsList({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_backend_caps_list_abi')) return null;
+  final fn = lib.lookupFunction<Int32 Function(Pointer<Uint8>, Int32),
+      int Function(Pointer<Uint8>, int)>('crispasr_backend_caps_list_abi');
+  // Two-call protocol: negative required byte count = size needed
+  var cap = 4096;
+  var buf = calloc<Uint8>(cap);
+  try {
+    var n = fn(buf, cap);
+    if (n < 0) {
+      calloc.free(buf);
+      cap = (-n) + 64;
+      buf = calloc<Uint8>(cap);
+      n = fn(buf, cap);
+      if (n < 0) return null;
+    }
+    if (n <= 0) return '';
+    return buf.cast<Utf8>().toDartString();
+  } finally {
+    calloc.free(buf);
+  }
+}
+
+/// Release the process-wide forced-aligner cache. Safe to repeat; waits for an
+/// active alignment to finish. The next alignment reloads its model.
+void freeAlignerCache({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_free_aligner_cache')) return;
+  final fn = lib.lookupFunction<Void Function(), void Function()>(
+      'crispasr_free_aligner_cache');
+  fn();
+}
+
 /// Tunables for [CrispasrSession.transcribeVad]. Field names and defaults
 /// mirror crispasr's `whisper_vad_params` plus the max-chunk fallback
 /// the shared library uses to bound encoder cost on long audio.
@@ -814,13 +1293,31 @@ class SessionSegment {
   /// in [0, 1]. Whisper-only; other backends (and older dylibs without the
   /// accessor) leave the -1.0 "no data" sentinel.
   final double noSpeechProb;
+
+  /// Native per-segment speaker label from a backend that diarizes on its own,
+  /// in the `"(Speaker N) "` form the CLI prefixes into text/srt/vtt output, or
+  /// the empty string when the backend produced none (and on older dylibs
+  /// without the accessor). Populated today by `vibevoice`, whose model answers
+  /// with a Start/End/Speaker/Content array. The ordinals are CHUNK-LOCAL:
+  /// `Speaker 1` in one transcribe call is not necessarily the same voice as
+  /// `Speaker 1` in the next.
+  final String speaker;
+
+  /// Native token stream for this segment (issue #549). Empty for backends/routes
+  /// without token output and on older libraries without the accessor. Token text
+  /// may contain UTF-8 fragments - use [SessionToken.rawBytes] for lossless
+  /// reconstruction.
+  final List<SessionToken> tokens;
   const SessionSegment({
     required this.text,
     required this.start,
     required this.end,
     this.words = const [],
     this.noSpeechProb = -1.0,
+    this.speaker = '',
+    this.tokens = const [],
   });
+  bool get hasTimestamps => start >= 0 && end >= start;
   @override
   String toString() =>
       '[${start.toStringAsFixed(1)}-${end.toStringAsFixed(1)}s] $text';
@@ -849,6 +1346,56 @@ class CtcLogits {
     required this.nVocab,
     required this.nFrames,
     required this.data,
+  });
+}
+
+/// One chord span from [CrispasrSession.chords].
+///
+/// Times are seconds from the start of the audio. [label] is the vocabulary
+/// index; resolve via [name] for the human-readable chord (e.g. "C", "Am",
+/// "G:7", or "N" for no-chord). Confidence in [0, 1].
+class ChordSpan {
+  final double start;
+  final double end;
+  final int label;
+  final double confidence;
+  final String name;
+  const ChordSpan({
+    required this.start,
+    required this.end,
+    required this.label,
+    required this.confidence,
+    required this.name,
+  });
+}
+
+/// Guitar tablature emission scores from [CrispasrSession.tab].
+///
+/// [emissions] is a flat frame-major grid of log-probabilities shaped
+/// `[nFrames, nStrings, nClasses]`. Index as
+/// `emissions[(frame * nStrings + string) * nClasses + cls]`.
+/// The constrained Viterbi/DP that turns those into a playable fingering is
+/// yours - argmaxing this grid ignores every playability constraint.
+class TabResult {
+  final int nFrames;
+  final int nStrings;
+  final int nClasses;
+  final Float32List emissions;
+
+  /// Class index meaning "string not played" - read it, never assume it.
+  final int silentClass;
+  final double framePeriod;
+
+  /// Open-string MIDI pitch per string (0 = lowest), or -1 if unknown.
+  final List<int> openMidi;
+  const TabResult({
+    required this.nFrames,
+    required this.nStrings,
+    required this.nClasses,
+    required this.emissions,
+    required this.silentClass,
+    required this.framePeriod,
+    required this.openMidi,
   });
 }
 
@@ -1130,6 +1677,14 @@ typedef _VadSlicesNative = Int32 Function(Pointer<Utf8>, Pointer<Float>, Int32,
 typedef _VadSlices = int Function(Pointer<Utf8>, Pointer<Float>, int, int,
     double, int, int, int, double, int, Pointer<Pointer<Float>>);
 
+// Session callback native signatures
+typedef _ProgressCbNative = Void Function(Int32, Int32, Pointer<Void>);
+typedef _SegmentCbNative = Void Function(
+    Pointer<Utf8>, Int64, Int64, Int32, Pointer<Void>);
+typedef _TokenCbNative = Void Function(Pointer<Utf8>, Int32, Pointer<Void>);
+typedef _PcmStreamCbNative = Void Function(
+    Pointer<Float>, Int32, Int32, Pointer<Void>);
+
 /// On-device speech recognition model.
 ///
 /// ```dart
@@ -1144,6 +1699,7 @@ class CrispASR {
   late final DynamicLibrary _lib;
   late final Pointer<Void> _ctx;
   bool _disposed = false;
+  final Set<StreamingSession> _streams = {};
 
   // 0.1.0 FFI handles
   late final _WhisperInit _initByRef;
@@ -1225,7 +1781,14 @@ class CrispASR {
   bool get supportsExtended => _detectLang != null;
   bool get supportsStreaming => _streamOpen != null;
 
-  CrispASR(String modelPath, {String? libPath}) {
+  CrispASR(String modelPath,
+      {String? libPath, bool dtw = false, int dtwPreset = 1, int dtwTop = 2}) {
+    if (dtw &&
+        !((dtwPreset == 1 && dtwTop > 0) ||
+            (dtwPreset >= 3 && dtwPreset <= 14))) {
+      throw ArgumentError(
+          'DTW requires positive top-head count or a model preset (3..14)');
+    }
     _lib = DynamicLibrary.open(libPath ?? _findLib());
 
     _free = _lib.lookupFunction<_VoidPtrC, _VoidPtr>('whisper_free');
@@ -1252,37 +1815,42 @@ class CrispASR {
     // `whisper_full_params` reaching `whisper_full`, e.g. VAD enabled
     // with a garbage `vad_model_path`, producing
     //   `whisper_vad_init_from_file_with_params: failed to open VAD model '…'`
-    // even though the caller passed `vad: false`. Fall back to the
-    // by-value entry points when running against an older libwhisper so
-    // existing macOS / ARM64 builds keep loading.
+    // even though the caller passed `vad: false`. Older libraries without
+    // pointer adapters are rejected before model initialization.
     final hasInitByRef =
         _lib.providesSymbol('whisper_init_from_file_with_params_by_ref');
     final hasFullByRef = _lib.providesSymbol('whisper_full_by_ref');
-    if (hasInitByRef) {
-      _initByRef = _lib.lookupFunction<_WhisperInitNative, _WhisperInit>(
-          'whisper_init_from_file_with_params_by_ref');
-    } else {
-      _initByRef = _lib.lookupFunction<_WhisperInitNative, _WhisperInit>(
-          'whisper_init_from_file_with_params');
+    if (!hasInitByRef || !hasFullByRef) {
+      throw UnsupportedError(
+          'Legacy Whisper requires pointer-safe init/full exports; use a current library');
     }
-    if (hasFullByRef) {
-      _full = _lib.lookupFunction<_WhisperFullNative, _WhisperFull>(
-          'whisper_full_by_ref');
-    } else {
-      _full =
-          _lib.lookupFunction<_WhisperFullNative, _WhisperFull>('whisper_full');
-    }
-
+    _initByRef = _lib.lookupFunction<_WhisperInitNative, _WhisperInit>(
+        'whisper_init_from_file_with_params_by_ref');
+    _full = _lib.lookupFunction<_WhisperFullNative, _WhisperFull>(
+        'whisper_full_by_ref');
+    final freeContextParams = _lib.lookupFunction<Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)>('whisper_free_context_params');
     final ctxDefault =
         _lib.lookupFunction<_DefaultCtxParamsNative, _DefaultCtxParams>(
             'whisper_context_default_params_by_ref')();
-    final pathPtr = modelPath.toNativeUtf8();
-    _ctx = _initByRef(pathPtr, ctxDefault);
-    calloc.free(pathPtr);
-
-    if (_ctx == nullptr) {
-      throw Exception('Failed to load model: $modelPath');
+    if (ctxDefault == nullptr) {
+      throw StateError('Whisper context parameter allocation failed');
     }
+    final pathPtr = modelPath.toNativeUtf8();
+    try {
+      if (dtw) {
+        final configure = _lib.lookupFunction<
+            Void Function(Pointer<Void>, Bool, Int32, Int32),
+            void Function(
+                Pointer<Void>, bool, int, int)>('crispasr_ctx_params_set_dtw');
+        configure(ctxDefault, true, dtwPreset, dtwTop);
+      }
+      _ctx = _initByRef(pathPtr, ctxDefault);
+    } finally {
+      calloc.free(pathPtr);
+      freeContextParams(ctxDefault);
+    }
+    if (_ctx == nullptr) throw Exception('Failed to load model: $modelPath');
 
     _tryBindExtended();
   }
@@ -1525,8 +2093,12 @@ class CrispASR {
     Float32List pcm, {
     int strategy = 0,
     TranscribeOptions? options,
+    int nProcessors = 1,
   }) {
     _checkDisposed();
+    if (nProcessors < 1) {
+      throw ArgumentError.value(nProcessors, "nProcessors", "must be positive");
+    }
 
     final opts = options ?? TranscribeOptions(strategy: strategy);
 
@@ -1537,6 +2109,10 @@ class CrispASR {
     }
 
     final params = _defaultParams(opts.strategy);
+    if (params == nullptr) {
+      calloc.free(samples);
+      throw StateError("Whisper decode parameter allocation failed");
+    }
     Pointer<Utf8>? langPtr;
     Pointer<Utf8>? promptPtr;
     Pointer<Utf8>? vadPathPtr;
@@ -1586,7 +2162,17 @@ class CrispASR {
       // the setter — silently skip so callers stay forward-compatible.
       if (opts.altN > 0) _paramsSetAltN?.call(params, opts.altN);
 
-      final ret = _full(_ctx, params, samples, pcm.length);
+      final int ret;
+      if (nProcessors == 1) {
+        ret = _full(_ctx, params, samples, pcm.length);
+      } else {
+        final parallel = _lib.lookupFunction<
+            Int32 Function(
+                Pointer<Void>, Pointer<Void>, Pointer<Float>, Int32, Int32),
+            int Function(Pointer<Void>, Pointer<Void>, Pointer<Float>, int,
+                int)>('crispasr_transcribe_parallel_by_ref');
+        ret = parallel(_ctx, params, samples, pcm.length, nProcessors);
+      }
       if (ret != 0) throw Exception('Transcription failed (error $ret)');
 
       return _collectSegments(wantWords: opts.wordTimestamps);
@@ -1599,14 +2185,35 @@ class CrispASR {
     }
   }
 
+  /// Native DTW timestamp in seconds, or -1 when unavailable.
+  double tokenDtwTime(int segment, int token) {
+    _checkDisposed();
+    if (segment < 0 || segment >= _nSegments(_ctx)) {
+      throw RangeError('Segment index out of range');
+    }
+    final nTokens = _fullNTokens;
+    if (nTokens == null) {
+      throw UnsupportedError('Native token counts unavailable');
+    }
+    if (token < 0 || token >= nTokens(_ctx, segment)) {
+      throw RangeError('Token index out of range');
+    }
+    if (!_lib.providesSymbol('crispasr_token_dtw_t')) return -1;
+    final fn = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32, Int32),
+        int Function(Pointer<Void>, int, int)>('crispasr_token_dtw_t');
+    final time = fn(_ctx, segment, token);
+    return time < 0 ? -1 : time / 100.0;
+  }
+
   List<Segment> _collectSegments({required bool wantWords}) {
     final n = _nSegments(_ctx);
     final segments = <Segment>[];
     for (var i = 0; i < n; i++) {
       final textPtr = _getText(_ctx, i);
       final text = textPtr == nullptr ? '' : textPtr.toDartString();
-      final t0 = _getT0(_ctx, i) / 100.0;
-      final t1 = _getT1(_ctx, i) / 100.0;
+      final rawT0 = _getT0(_ctx, i), rawT1 = _getT1(_ctx, i);
+      final t0 = _hasTs(rawT0, rawT1) ? rawT0 / 100.0 : -1.0;
+      final t1 = _hasTs(rawT0, rawT1) ? rawT1 / 100.0 : -1.0;
       final nsp = _getNSP(_ctx, i);
 
       final words = <Word>[];
@@ -1619,7 +2226,8 @@ class CrispASR {
         final nTokens = _fullNTokens!(_ctx, i);
         for (var k = 0; k < nTokens; k++) {
           final tp = _tokenText!(_ctx, i, k);
-          final tok = tp == nullptr ? '' : tp.toDartString();
+          final tok =
+              tp == nullptr ? '' : _decodeCString(tp, allowMalformed: true);
           if (tok.isEmpty) continue;
           // Skip the special-token brackets whisper emits inline.
           if (tok.startsWith('[_') || tok.startsWith('<|')) continue;
@@ -1648,8 +2256,12 @@ class CrispASR {
           }
           words.add(Word(
             text: tok,
-            start: _tokenT0!(_ctx, i, k) / 100.0,
-            end: _tokenT1!(_ctx, i, k) / 100.0,
+            start: _tokenT0!(_ctx, i, k) < 0
+                ? -1.0
+                : _tokenT0!(_ctx, i, k) / 100.0,
+            end: _tokenT1!(_ctx, i, k) < 0
+                ? -1.0
+                : _tokenT1!(_ctx, i, k) / 100.0,
             p: _tokenP!(_ctx, i, k),
             alts: alts,
           ));
@@ -1875,18 +2487,25 @@ class CrispASR {
       throw Exception('crispasr_stream_open returned null');
     }
 
-    return StreamingSession._(
+    final stream = StreamingSession._(
       handle: handle,
+      ownerCheck: _checkDisposed,
+      onClosed: _streams.remove,
       feed: _streamFeed!,
       flush: _streamFlush,
       getText: _streamGetText!,
       close: _streamClose!,
       setLiveDecode: _streamSetLiveDecode,
     );
+    _streams.add(stream);
+    return stream;
   }
 
   void dispose() {
     if (!_disposed) {
+      for (final stream in _streams.toList()) {
+        stream.close();
+      }
       _free(_ctx);
       _disposed = true;
     }
@@ -1938,22 +2557,25 @@ class CrispASR {
 
 /// A live streaming decode session, created via [CrispASR.openStream].
 ///
-/// Feed PCM chunks as they arrive; every chunk whose accumulation crosses
-/// the configured `stepMs` triggers a decode over the rolling window and
-/// returns a [StreamingUpdate]. Chunks that don't trigger a decode return
-/// `null` — the caller is still buffering.
+/// Feed new PCM chunks as they arrive. Persistent streams retain backend
+/// state; window-based streams decode at the configured `stepMs` threshold.
+/// Updates contain cumulative utterance text; null means no new output.
 ///
 /// Close the session explicitly with [close] to free the native state —
 /// there is no Dart finalizer hooking the native library.
 class StreamingSession {
   StreamingSession._({
     required Pointer<Void> handle,
+    required void Function() ownerCheck,
+    required void Function(StreamingSession) onClosed,
     required _StreamFeed feed,
     required _StreamFlush? flush,
     required _StreamGetText getText,
     required _StreamClose close,
     _StreamSetLiveDecode? setLiveDecode,
   })  : _handle = handle,
+        _ownerCheck = ownerCheck,
+        _onClosed = onClosed,
         _feedFn = feed,
         _flushFn = flush,
         _getTextFn = getText,
@@ -1961,6 +2583,8 @@ class StreamingSession {
         _setLiveDecodeFn = setLiveDecode;
 
   final Pointer<Void> _handle;
+  final void Function() _ownerCheck;
+  final void Function(StreamingSession) _onClosed;
   final _StreamFeed _feedFn;
   final _StreamFlush? _flushFn;
   final _StreamGetText _getTextFn;
@@ -1976,6 +2600,7 @@ class StreamingSession {
   /// when this chunk's arrival triggered a new decode, otherwise `null`.
   StreamingUpdate? feed(Float32List pcm) {
     if (_closed) throw StateError('StreamingSession is closed');
+    _ownerCheck();
     if (pcm.isEmpty) return null;
 
     final buf = calloc<Float>(pcm.length);
@@ -1985,8 +2610,7 @@ class StreamingSession {
     try {
       final r = _feedFn(_handle, buf, pcm.length);
       if (r < 0) throw Exception('crispasr_stream_feed error $r');
-      if (r == 0) return null; // still buffering
-      return _readOutput();
+      return _readOutput(); // also polls asynchronous decoders
     } finally {
       calloc.free(buf);
     }
@@ -1999,23 +2623,35 @@ class StreamingSession {
   /// resulting update, or `null` if nothing was buffered.
   StreamingUpdate? flush() {
     if (_closed) throw StateError('StreamingSession is closed');
+    _ownerCheck();
     if (_flushFn == null) return _readOutput();
     final r = _flushFn!(_handle);
-    if (r <= 0) return null;
+    if (r < 0) throw Exception('crispasr_stream_flush error $r');
     return _readOutput();
   }
 
   StreamingUpdate? _readOutput() {
-    final outCap = 4096;
-    final outBuf = calloc<Uint8>(outCap);
-    final out = outBuf.cast<Utf8>();
+    var outCap = 4096;
+    var outBuf = calloc<Uint8>(outCap);
+    var out = outBuf.cast<Utf8>();
     final t0Ptr = calloc<Double>();
     final t1Ptr = calloc<Double>();
     final cntPtr = calloc<Int64>();
 
     try {
-      final n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
-      if (n <= 0) return null;
+      var n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
+      if (n < 0) throw Exception('crispasr_stream_get_text error $n');
+      // Common streams return the full byte length, even when truncated.
+      // Retry before decoding UTF-8: truncation may split a codepoint.
+      while (n >= outCap) {
+        outCap = n + 1;
+        calloc.free(outBuf);
+        outBuf = calloc<Uint8>(outCap);
+        out = outBuf.cast<Utf8>();
+        n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
+        if (n < 0) throw Exception('crispasr_stream_get_text error $n');
+      }
+      if (n == 0) return null;
       final counter = cntPtr.value;
       if (counter == _lastCounter) return null; // same decode we already saw
       _lastCounter = counter;
@@ -2038,9 +2674,11 @@ class StreamingSession {
   /// step threshold. Useful for ultra-low-latency UIs at higher CPU cost.
   void setLiveDecode(bool enabled) {
     if (_closed) throw StateError('StreamingSession is closed');
+    _ownerCheck();
     if (_setLiveDecodeFn == null) {
       throw UnsupportedError(
-          'crispasr_stream_set_live_decode not available in this libcrispasr build');
+        'crispasr_stream_set_live_decode not available in this libcrispasr build',
+      );
     }
     _setLiveDecodeFn!(_handle, enabled ? 1 : 0);
   }
@@ -2048,8 +2686,10 @@ class StreamingSession {
   /// Release the native session. Safe to call more than once.
   void close() {
     if (_closed) return;
-    _closed = true;
+    _ownerCheck();
     _closeFn(_handle);
+    _closed = true;
+    _onClosed(this);
   }
 }
 
@@ -2066,17 +2706,107 @@ class StreamingSession {
 // =====================================================================
 
 /// Unified session over any CrispASR-supported GGUF model.
+/// One frame of a pitch (F0) track, as returned by [CrispasrSession.pitch].
+///
+/// - `timeMs` — frame centre, in milliseconds from the start of the input.
+/// - `f0Hz` — estimated fundamental frequency, in Hz.
+/// - `voicedProb` — model activation at the decoded bin, in `[0, 1]`. Low
+///   values mean the frame is probably unvoiced; gate on this rather than
+///   trusting `f0Hz` on every frame.
+///
+/// Deliberately a record rather than a class: the shape is chosen to match
+/// the `PitchFrame` contract used by downstream music-transcription apps,
+/// so the value crosses the seam without a marshalling step.
+///
+/// On the C side this is `crepe_frame` — three **32-bit** floats. [pitch]
+/// reads them through a [Float32List] view. Dart's `double` is 64-bit, so
+/// declaring these as FFI `Double` fields over the same buffer would be a
+/// silent 32/64-bit mismatch that reads garbage.
+typedef PitchFrame = ({double timeMs, double f0Hz, double voicedProb});
+
+/// One detected beat, as returned by [CrispasrSession.beats].
+///
+/// [timeS] is seconds from the start of the audio. [isDownbeat] marks a beat
+/// that also starts a bar.
+///
+/// **Every downbeat is also a beat.** The model's postprocessor snaps each
+/// downbeat onto its nearest detected beat, so downbeats are a strict subset
+/// of this list — filter on [isDownbeat] to get the bar grid, and never merge
+/// two separate lists to reconstruct the full grid.
+///
+/// On the C side this is a flat pair of **32-bit** floats; [beats] widens them
+/// to Dart doubles on read and turns the second into a bool.
+typedef Beat = ({double timeS, bool isDownbeat});
+
+/// One transcribed note, as returned by [CrispasrSession.pianoNotes].
+///
+/// - `midi` — MIDI note number, 21–108 (A0–C8).
+/// - `onMs` / `offMs` — onset and offset, in milliseconds from the start of
+///   the input.
+/// - `velocity` — MIDI velocity, 0–127.
+///
+/// Shaped to drop into the `NoteEvent` contract used by downstream music
+/// notation apps. Note that `velocity` is **not** a confidence: it is the
+/// model's loudness estimate. If a consumer's contract wants a confidence
+/// field, decide the mapping explicitly rather than reusing this value.
+typedef PianoNote = ({int midi, double onMs, double offMs, int velocity});
+
+/// One transcribed note with the instrument that played it, as returned by
+/// [CrispasrSession.pianoNotesWithPrograms].
+///
+/// - `program` — General MIDI program 0-127; **128** for percussion (GM
+///   channel 10, which carries no meaningful program); **-1** when the model
+///   does not identify an instrument.
+///
+/// Only MT3 fills this in. piano-transcription and basic-pitch report -1
+/// throughout — deliberately -1 and not 0, because 0 is "Acoustic Grand
+/// Piano" and would be indistinguishable from a real answer.
+typedef PianoNoteWithProgram = ({
+  int midi,
+  double onMs,
+  double offMs,
+  int velocity,
+  int program,
+});
+
+/// One separated source stem, as returned by [CrispasrSession.separate].
+///
+/// - `name` — the model's own label for the stem (`drums`, `bass`, `other`,
+///   `vocals` for htdemucs). Match on this rather than on index; stem order
+///   is the model's, not a contract.
+/// - `pcm` — **interleaved stereo** float32, `L,R,L,R,…`, at
+///   [CrispasrSession.separateSampleRate] (44100 Hz for htdemucs). Length is
+///   `2 * framesPerChannel`, the same length as the input passed to
+///   [CrispasrSession.separate].
+///
+/// The PCM is Dart-owned: [CrispasrSession.separate] copies it out of the
+/// session-owned native buffer, which is invalidated by the next separate
+/// call or by closing the session.
+typedef Stem = ({String name, Float32List pcm});
+
+/// Unified model session. Phonon-2 auto-detects as Parakeet from GGUF metadata,
+/// including renamed files; its trained language is English.
+/// Index-Echo opens the tower GGUF with a matching decoder beside it. Set the
+/// target language to en/ja/es for bilingual transcript/translation segments.
+/// A sibling Silero v6.2 model enables the released speech-window recipe.
 class CrispasrSession {
   CrispasrSession._(
     this._lib,
-    this._handle,
+    this._nativeHandle,
     this._backend,
   );
 
   final DynamicLibrary _lib;
-  Pointer<Void> _handle;
+  Pointer<Void> _nativeHandle;
+  Pointer<Void> get _handle {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    _ensureNotInCallback();
+    return _nativeHandle;
+  }
+
   final String _backend;
   bool _closed = false;
+  final Set<StreamingSession> _streams = {};
 
   /// Open a model file. Backend is auto-detected from the GGUF
   /// `general.architecture` metadata key.
@@ -2303,11 +3033,12 @@ class CrispasrSession {
   /// Pass [language] as an ISO 639-1 code ("en", "de", "ja", …) to steer
   /// backends that accept a source-language hint (whisper / canary /
   /// cohere / voxtral / voxtral4b). Backends that auto-detect
-  /// (parakeet / qwen3) or that don't expose a language input
+  /// (parakeet) or that don't expose a language input
   /// (granite / wav2vec2 / fastconformer-ctc) ignore the hint silently.
   /// `null` or empty preserves each backend's historical default.
   List<SessionSegment> transcribe(Float32List pcm, {String? language}) {
     if (_closed) throw StateError('CrispasrSession is closed');
+    _ensureNotInCallback();
     if (pcm.isEmpty) return const [];
 
     final samples = calloc<Float>(pcm.length);
@@ -2343,7 +3074,7 @@ class CrispasrSession {
     }
 
     try {
-      return _readSegments(res);
+      return _readSegments(_lib, res);
     } finally {
       setReturnLogits(false);
       final freeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
@@ -2351,6 +3082,7 @@ class CrispasrSession {
         'crispasr_session_result_free',
       );
       freeFn(res);
+      _rethrowCallbackError();
     }
   }
 
@@ -2371,6 +3103,7 @@ class CrispasrSession {
     String? language,
   }) {
     if (_closed) throw StateError('CrispasrSession is closed');
+    _ensureNotInCallback();
     if (pcm.isEmpty) return (const <SessionSegment>[], null);
     if (!_lib.providesSymbol('crispasr_session_result_logits')) {
       return (transcribe(pcm, language: language), null); // old dylib
@@ -2411,7 +3144,7 @@ class CrispasrSession {
 
     try {
       // Read both segments and logits before the result handle is freed.
-      final segs = _readSegments(res);
+      final segs = _readSegments(_lib, res);
       final logits = _readLogits(res);
       return (segs, logits);
     } finally {
@@ -2420,6 +3153,7 @@ class CrispasrSession {
         'crispasr_session_result_free',
       );
       freeFn(res);
+      _rethrowCallbackError();
     }
   }
 
@@ -2470,13 +3204,14 @@ class CrispasrSession {
     }
 
     try {
-      return _readSegments(res);
+      return _readSegments(_lib, res);
     } finally {
       final freeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
           void Function(Pointer<Void>)>(
         'crispasr_session_result_free',
       );
       freeFn(res);
+      _rethrowCallbackError();
     }
   }
 
@@ -2504,6 +3239,7 @@ class CrispasrSession {
     String? language,
   }) {
     if (_closed) throw StateError('CrispasrSession is closed');
+    _ensureNotInCallback();
     if (pcm.isEmpty) return const [];
 
     final samples = calloc<Float>(pcm.length);
@@ -2555,47 +3291,58 @@ class CrispasrSession {
     }
 
     try {
-      return _readSegments(res);
+      return _readSegments(_lib, res);
     } finally {
       final freeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
           void Function(Pointer<Void>)>('crispasr_session_result_free');
       freeFn(res);
+      _rethrowCallbackError();
     }
   }
 
-  List<SessionSegment> _readSegments(Pointer<Void> res) {
-    final nSegs = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+  static List<SessionSegment> _readSegments(
+      DynamicLibrary lib, Pointer<Void> res) {
+    final nSegs = lib.lookupFunction<Int32 Function(Pointer<Void>),
         int Function(Pointer<Void>)>('crispasr_session_result_n_segments')(res);
-    final segText = _lib.lookupFunction<
+    final segText = lib.lookupFunction<
         Pointer<Utf8> Function(Pointer<Void>, Int32),
         Pointer<Utf8> Function(Pointer<Void>, int)>(
       'crispasr_session_result_segment_text',
     );
-    final segT0 = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
+    final segT0 = lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t0');
-    final segT1 = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
+    final segT1 = lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t1');
     // Per-segment no_speech_prob (Whisper). Probe like word_p — older dylibs
     // lack the symbol; fall back to the -1.0 "no data" sentinel.
     final segNSPFn =
-        _lib.providesSymbol('crispasr_session_result_segment_no_speech_prob')
-            ? _lib.lookupFunction<
+        lib.providesSymbol('crispasr_session_result_segment_no_speech_prob')
+            ? lib.lookupFunction<
                 Float Function(Pointer<Void>, Int32),
                 double Function(Pointer<Void>,
                     int)>('crispasr_session_result_segment_no_speech_prob')
             : null;
-    final nWords = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+    // #300: native per-segment speaker label; probe like the others so a
+    // newer package keeps working against an older dylib.
+    final segSpkFn = lib
+            .providesSymbol('crispasr_session_result_segment_speaker')
+        ? lib.lookupFunction<
+            Pointer<Utf8> Function(Pointer<Void>, Int32),
+            Pointer<Utf8> Function(
+                Pointer<Void>, int)>('crispasr_session_result_segment_speaker')
+        : null;
+    final nWords = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_session_result_n_words');
-    final wordText = _lib.lookupFunction<
+    final wordText = lib.lookupFunction<
         Pointer<Utf8> Function(Pointer<Void>, Int32, Int32),
         Pointer<Utf8> Function(Pointer<Void>, int, int)>(
       'crispasr_session_result_word_text',
     );
-    final wordT0 = _lib.lookupFunction<
+    final wordT0 = lib.lookupFunction<
         Int64 Function(Pointer<Void>, Int32, Int32),
         int Function(
             Pointer<Void>, int, int)>('crispasr_session_result_word_t0');
-    final wordT1 = _lib.lookupFunction<
+    final wordT1 = lib.lookupFunction<
         Int64 Function(Pointer<Void>, Int32, Int32),
         int Function(
             Pointer<Void>, int, int)>('crispasr_session_result_word_t1');
@@ -2604,8 +3351,8 @@ class CrispasrSession {
     // libwhisper builds don't have the symbol — probe and fall back to
     // 1.0 (the documented "uniform confidence" default) so this
     // binding stays loadable against pre-2026-05 dylibs.
-    final wordPFn = _lib.providesSymbol('crispasr_session_result_word_p')
-        ? _lib.lookupFunction<
+    final wordPFn = lib.providesSymbol('crispasr_session_result_word_p')
+        ? lib.lookupFunction<
             Float Function(Pointer<Void>, Int32, Int32),
             double Function(
                 Pointer<Void>, int, int)>('crispasr_session_result_word_p')
@@ -2613,39 +3360,96 @@ class CrispasrSession {
     // 0.5.13: per-word top-N alternative candidates. All three symbols
     // landed together so a single guard covers presence; pre-0.5.13
     // dylibs report no alts and the UI hides the affordance.
-    final wordNAltsFn = _lib
+    final wordNAltsFn = lib
             .providesSymbol('crispasr_session_result_word_n_alts')
-        ? _lib.lookupFunction<
+        ? lib.lookupFunction<
             Int32 Function(Pointer<Void>, Int32, Int32),
             int Function(
                 Pointer<Void>, int, int)>('crispasr_session_result_word_n_alts')
         : null;
     final wordAltTextFn =
-        _lib.providesSymbol('crispasr_session_result_word_alt_text')
-            ? _lib.lookupFunction<
+        lib.providesSymbol('crispasr_session_result_word_alt_text')
+            ? lib.lookupFunction<
                 Pointer<Utf8> Function(Pointer<Void>, Int32, Int32, Int32),
                 Pointer<Utf8> Function(Pointer<Void>, int, int,
                     int)>('crispasr_session_result_word_alt_text')
             : null;
-    final wordAltPFn = _lib.providesSymbol('crispasr_session_result_word_alt_p')
-        ? _lib.lookupFunction<
+    final wordAltPFn = lib.providesSymbol('crispasr_session_result_word_alt_p')
+        ? lib.lookupFunction<
             Float Function(Pointer<Void>, Int32, Int32, Int32),
             double Function(Pointer<Void>, int, int,
                 int)>('crispasr_session_result_word_alt_p')
         : null;
 
+    // Shared-session tokens (issue #549): probe all five symbols together so an
+    // older dylib without token support falls back to empty lists.
+    final hasTokens = lib.providesSymbol('crispasr_session_result_n_tokens') &&
+        lib.providesSymbol('crispasr_session_result_token_text') &&
+        lib.providesSymbol('crispasr_session_result_token_t0') &&
+        lib.providesSymbol('crispasr_session_result_token_t1') &&
+        lib.providesSymbol('crispasr_session_result_token_p');
+    final nTokensFn = hasTokens
+        ? lib.lookupFunction<
+            Int32 Function(Pointer<Void>, Int32),
+            int Function(
+                Pointer<Void>, int)>('crispasr_session_result_n_tokens')
+        : null;
+    final tokenTextFn = hasTokens
+        ? lib.lookupFunction<
+            Pointer<Utf8> Function(Pointer<Void>, Int32, Int32),
+            Pointer<Utf8> Function(Pointer<Void>, int, int)>(
+            'crispasr_session_result_token_text',
+          )
+        : null;
+    final tokenT0Fn = hasTokens
+        ? lib.lookupFunction<Int64 Function(Pointer<Void>, Int32, Int32),
+            int Function(Pointer<Void>, int, int)>(
+            'crispasr_session_result_token_t0',
+          )
+        : null;
+    final tokenT1Fn = hasTokens
+        ? lib.lookupFunction<Int64 Function(Pointer<Void>, Int32, Int32),
+            int Function(Pointer<Void>, int, int)>(
+            'crispasr_session_result_token_t1',
+          )
+        : null;
+    final tokenPFn = hasTokens
+        ? lib.lookupFunction<Float Function(Pointer<Void>, Int32, Int32),
+            double Function(Pointer<Void>, int, int)>(
+            'crispasr_session_result_token_p',
+          )
+        : null;
+
     final out = <SessionSegment>[];
     for (var i = 0; i < nSegs; i++) {
       final tp = segText(res, i);
-      final text = tp == nullptr ? '' : tp.toDartString();
-      final t0 = segT0(res, i) / 100.0;
-      final t1 = segT1(res, i) / 100.0;
+      // Byte-level BPE models (Qwen3-ASR) can stop inside a multibyte
+      // character when generation is capped, and a word is a run of token
+      // pieces, so segment, word and alt text are not always valid UTF-8.
+      // Strict decoding threw FormatException and lost the whole result;
+      // the bad bytes become U+FFFD, as for whisper token text.
+      final text =
+          tp == nullptr ? '' : _decodeCString(tp, allowMalformed: true);
+      final t0raw = segT0(res, i);
+      final t1raw = segT1(res, i);
+      // Segments always have timestamps, but preserve -1 sentinel if ever missing
+      final t0 = t0raw < 0 ? -1.0 : t0raw / 100.0;
+      final t1 = t1raw < 0 ? -1.0 : t1raw / 100.0;
       final nsp = segNSPFn == null ? -1.0 : segNSPFn(res, i);
+      final spkP = segSpkFn == null ? nullptr : segSpkFn(res, i);
+      final spk = spkP == nullptr ? '' : _decodeCString(spkP);
       final wc = nWords(res, i);
       final words = <Word>[];
       for (var k = 0; k < wc; k++) {
         final wp = wordText(res, i, k);
-        final wt = wp == nullptr ? '' : wp.toDartString();
+        final wt =
+            wp == nullptr ? '' : _decodeCString(wp, allowMalformed: true);
+        // Preserve -1 absent timing instead of -0.01: native returns -1 cs for
+        // missing token/word timing; dividing would give -0.01 sec. Return -1.0 sec sentinel.
+        final wt0raw = wordT0(res, i, k);
+        final wt1raw = wordT1(res, i, k);
+        final wt0 = _hasTs(wt0raw, wt1raw) ? wt0raw / 100.0 : -1.0;
+        final wt1 = _hasTs(wt0raw, wt1raw) ? wt1raw / 100.0 : -1.0;
         // -1.0 from the C side means "no per-word probability for this
         // backend" — clamp to 1.0 so the UI renders neutrally rather
         // than treating it as zero confidence.
@@ -2660,7 +3464,9 @@ class CrispasrSession {
             final list = <AltToken>[];
             for (var a = 0; a < nA; a++) {
               final tp2 = wordAltTextFn(res, i, k, a);
-              final atext = tp2 == nullptr ? '' : tp2.toDartString();
+              final atext = tp2 == nullptr
+                  ? ''
+                  : _decodeCString(tp2, allowMalformed: true);
               if (atext.isEmpty) continue;
               list.add(AltToken(text: atext, p: wordAltPFn(res, i, k, a)));
             }
@@ -2669,18 +3475,46 @@ class CrispasrSession {
         }
         words.add(Word(
           text: wt,
-          start: wordT0(res, i, k) / 100.0,
-          end: wordT1(res, i, k) / 100.0,
+          start: wt0,
+          end: wt1,
           p: p,
           alts: alts,
         ));
+      }
+      // Tokens: copy raw bytes losslessly before result free, with empty
+      // fallback on older libraries. Preserve -1 sentinel and expose via
+      // SessionToken.hasTimestamps without breaking old constructors.
+      final tokens = <SessionToken>[];
+      if (hasTokens &&
+          nTokensFn != null &&
+          tokenTextFn != null &&
+          tokenT0Fn != null &&
+          tokenT1Fn != null &&
+          tokenPFn != null) {
+        final tc = nTokensFn(res, i);
+        for (var k = 0; k < tc; k++) {
+          final tptr = tokenTextFn(res, i, k);
+          final raw = _copyCStringBytes(tptr);
+          final ttext =
+              raw.isEmpty ? '' : utf8.decode(raw, allowMalformed: true);
+          final tt0raw = tokenT0Fn(res, i, k);
+          final tt1raw = tokenT1Fn(res, i, k);
+          final tt0 = _hasTs(tt0raw, tt1raw) ? tt0raw / 100.0 : -1.0;
+          final tt1 = _hasTs(tt0raw, tt1raw) ? tt1raw / 100.0 : -1.0;
+          var tp = tokenPFn(res, i, k);
+          if (tp < -0.5) tp = -1.0; // preserve sentinel
+          tokens.add(SessionToken(
+              text: ttext, rawBytes: raw, start: tt0, end: tt1, p: tp));
+        }
       }
       out.add(SessionSegment(
           text: text.trim(),
           start: t0,
           end: t1,
           words: words,
-          noSpeechProb: nsp));
+          noSpeechProb: nsp,
+          speaker: spk,
+          tokens: tokens));
     }
     return out;
   }
@@ -2740,7 +3574,7 @@ class CrispasrSession {
   }
 
   // ---------------------------------------------------------------------------
-  // TTS synthesis (vibevoice, qwen3-tts, moss-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, and others)
+  // TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, fireredtts3, and others)
   // ---------------------------------------------------------------------------
 
   /// Load a separate codec GGUF (qwen3-tts, moss-tts, moss-tts-local; no-op for other backends).
@@ -2823,6 +3657,36 @@ class CrispasrSession {
     try {
       final rc = fn(_handle, p);
       if (rc != 0) throw Exception('setTargetLanguage failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Language a voice-cloning REFERENCE clip is spoken in (issue #329).
+  ///
+  /// Cross-lingual TTS backends (cosyvoice3) compare it to the requested output
+  /// language — [setTargetLanguage], falling back to [setSourceLanguage] — and
+  /// drop the reference transcript when they differ, so the clone speaks the
+  /// target language instead of carrying the reference's accent.
+  ///
+  /// Optional: the backend otherwise infers it from the voice bank or the
+  /// reference transcript, and that inference declines rather than guesses on a
+  /// short transcript. When it declines the requested target language has no
+  /// effect — set this to make it explicit. Empty string clears.
+  void setTtsReferenceLanguage(String lang) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_reference_language')) {
+      throw UnsupportedError(
+          'session-state API not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>,
+            Pointer<Utf8>)>('crispasr_session_set_tts_reference_language');
+    final p = lang.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setTtsReferenceLanguage failed (rc=$rc)');
     } finally {
       calloc.free(p);
     }
@@ -3060,6 +3924,102 @@ class CrispasrSession {
   /// Convenience: clear any previously-set grammar so the next
   /// transcribe call decodes unconstrained again.
   void clearGrammar() => setGrammar('');
+
+  /// Strict grammar decoding (whisper only): no end-of-text until the
+  /// grammar can be complete. Without it a constrained decode may stop
+  /// mid-phrase ("knight to f" for "knight to f3"). Off by default; sticky.
+  void setGrammarStrict(bool strict) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_grammar_strict')) {
+      throw UnsupportedError(
+          'crispasr_session_set_grammar_strict not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_set_grammar_strict');
+    final rc = fn(_handle, strict ? 1 : 0);
+    if (rc != 0) throw Exception('setGrammarStrict failed (rc=$rc)');
+  }
+
+  /// log P(text | audio) for each of [texts] (whisper only), with the number
+  /// of tokens it covers (text tokens plus end-of-text). The decoder is
+  /// teacher-forced over each candidate; the audio is encoded and the prompt
+  /// decoded once. To choose among a known set of phrases — the legal moves of
+  /// a chess position, say — compare `logprob / tokens`: a plain sum favours
+  /// shorter texts. [pcm] is 16 kHz mono. A text that does not fit the decoder
+  /// context scores negative infinity.
+  ///
+  /// [prompt] is optional previous text that primes Whisper's vocabulary —
+  /// a few example phrases in the expected style.
+  List<({double logprob, int tokens})> scoreTexts(
+      Float32List pcm, List<String> texts,
+      {String? language, String? prompt}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (texts.isEmpty) return const [];
+    if (!_lib.providesSymbol('crispasr_session_score_texts')) {
+      throw UnsupportedError(
+          'crispasr_session_score_texts not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(
+            Pointer<Void>,
+            Pointer<Float>,
+            Int32,
+            Pointer<Utf8>,
+            Pointer<Utf8>,
+            Pointer<Pointer<Utf8>>,
+            Int32,
+            Pointer<Float>,
+            Pointer<Int32>),
+        int Function(
+            Pointer<Void>,
+            Pointer<Float>,
+            int,
+            Pointer<Utf8>,
+            Pointer<Utf8>,
+            Pointer<Pointer<Utf8>>,
+            int,
+            Pointer<Float>,
+            Pointer<Int32>)>('crispasr_session_score_texts');
+    final pcmPtr = calloc<Float>(pcm.length);
+    pcmPtr.asTypedList(pcm.length).setAll(0, pcm);
+    final langPtr = (language == null || language.isEmpty)
+        ? Pointer<Utf8>.fromAddress(0)
+        : language.toNativeUtf8();
+    final promptPtr = (prompt == null || prompt.isEmpty)
+        ? Pointer<Utf8>.fromAddress(0)
+        : prompt.toNativeUtf8();
+    final textPtrs = calloc<Pointer<Utf8>>(texts.length);
+    for (var i = 0; i < texts.length; i++) {
+      textPtrs[i] = texts[i].toNativeUtf8();
+    }
+    final out = calloc<Float>(texts.length);
+    final counts = calloc<Int32>(texts.length);
+    try {
+      final rc = fn(_handle, pcmPtr, pcm.length, langPtr, promptPtr, textPtrs,
+          texts.length, out, counts);
+      if (rc == -10) {
+        throw UnsupportedError(
+            'scoreTexts needs the whisper backend (this session is $_backend)');
+      }
+      if (rc != 0) throw Exception('scoreTexts failed (rc=$rc)');
+      return [
+        for (var i = 0; i < texts.length; i++)
+          (logprob: out[i], tokens: counts[i])
+      ];
+    } finally {
+      calloc.free(pcmPtr);
+      if (langPtr != Pointer<Utf8>.fromAddress(0)) calloc.free(langPtr);
+      if (promptPtr != Pointer<Utf8>.fromAddress(0)) calloc.free(promptPtr);
+      for (var i = 0; i < texts.length; i++) {
+        calloc.free(textPtrs[i]);
+      }
+      calloc.free(textPtrs);
+      calloc.free(out);
+      calloc.free(counts);
+    }
+  }
 
   /// Whisper text-suppression + prompt-carry extras (whisper-only;
   /// other backends silently ignore). Effective on CrispASR
@@ -3368,6 +4328,20 @@ class CrispasrSession {
     }
   }
 
+  /// Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2).
+  void setMinSpeechTokens(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_min_speech_tokens')) return;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_set_min_speech_tokens');
+    final rc = fn(_handle, n);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setMinSpeechTokens failed (rc=$rc)');
+    }
+  }
+
   /// Per-phoneme length-scale / speaking-rate scalar for TTS
   /// backends with a duration model. Honoured by kokoro today
   /// (PLAN #88); other backends silently no-op. 1.0 = upstream
@@ -3532,6 +4506,7 @@ class CrispasrSession {
   ///
   /// For qwen3-tts a WAV reference requires [refText] (the transcription of
   /// the reference audio). For vibevoice only GGUF voice packs are supported.
+  /// For MioTTS pass a preset embedding GGUF; save PCM at [outputSampleRate].
   /// For orpheus voice selection is BY NAME — use [setSpeakerName] instead.
   void setVoice(String path, {String? refText}) {
     if (_closed) throw StateError('CrispasrSession is closed');
@@ -3684,6 +4659,37 @@ class CrispasrSession {
     }
   }
 
+  /// Synthesize [phonemes] verbatim instead of phonemizing the text — the seam
+  /// between text processing and the acoustic model. Use it to reproduce another
+  /// implementation's pronunciation exactly, or to tell a G2P bug from a model
+  /// bug (#316). An empty string clears it.
+  ///
+  /// Honoured by `kokoro` and `piper`; other backends soft no-op (rc = -2).
+  void setTtsPhonemes(String phonemes) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_phonemes')) {
+      throw UnsupportedError(
+          'setTtsPhonemes API not available in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(
+            Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_tts_phonemes');
+    final p = phonemes.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw StateError(
+            'backend $_backend has no phonemes-in entry point; setTtsPhonemes applies to kokoro and piper');
+      }
+      if (rc != 0) {
+        throw Exception('setTtsPhonemes failed (rc=$rc) for backend $_backend');
+      }
+    } finally {
+      calloc.free(p);
+    }
+  }
+
   /// Whether the loaded model is a qwen3-tts CustomVoice variant
   /// (use [setSpeakerName] for it).
   bool isCustomVoice() {
@@ -3772,6 +4778,121 @@ class CrispasrSession {
     }
   }
 
+  /// Attest acceptance of AI-content marking/disclosure responsibility (EU AI
+  /// Act Art. 50). REQUIRED before [synthesizeRaw] will return unmarked audio;
+  /// the default [synthesize] is watermarked and needs no attestation.
+  /// [attestation] is a human-readable affirmation recorded for audit.
+  /// Declare whose voice a PRESET voice is: `real_person`, `synthetic` or
+  /// `unknown`.
+  ///
+  /// Cloning is not the only way to produce a deep fake: a preset voice
+  /// shipped inside a model can be an identifiable individual (a named donor,
+  /// a corpus speaker), and EU AI Act Art. 3(60) attaches to the audio
+  /// resembling that person rather than to which pipeline made it. Setting
+  /// `real_person` makes the Art. 50(4) reminder fire for a non-cloned voice.
+  ///
+  /// It does NOT require a consent attestation — whether the donor agreed to
+  /// the model being trained is a licensing matter settled upstream that you
+  /// cannot attest to.
+  ///
+  /// Throws [ArgumentError] on an unrecognised value rather than silently
+  /// treating it as `unknown`.
+  void setSpeakerIdentity(String identity) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_speaker_identity')) {
+      throw UnsupportedError(
+          'speaker-identity API not available in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>(
+      'crispasr_session_set_speaker_identity',
+    );
+    final p = identity.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw ArgumentError(
+            "unrecognised speaker_identity '$identity'; expected "
+            "'real_person', 'synthetic' or 'unknown'");
+      }
+      if (rc != 0) throw StateError('setSpeakerIdentity failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  void acceptMarkingResponsibility([String attestation = '']) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib
+        .providesSymbol('crispasr_session_accept_marking_responsibility')) {
+      throw UnsupportedError(
+          'marking-attestation API not available in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>(
+      'crispasr_session_accept_marking_responsibility',
+    );
+    final aPtr = attestation.toNativeUtf8();
+    try {
+      fn(_handle, aPtr);
+    } finally {
+      calloc.free(aPtr);
+    }
+  }
+
+  /// UNMARKED synthesis (no watermark), for callers that must post-process
+  /// before embedding the mark themselves. Hard-refused (throws) unless
+  /// [acceptMarkingResponsibility] was called first. Prefer [synthesize] for
+  /// the default watermarked output.
+  Float32List synthesizeRaw(String text) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_synthesize_raw')) {
+      throw UnsupportedError(
+          'TTS raw synthesize API not available in this libcrispasr build');
+    }
+    final synFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Utf8>, Pointer<Int32>)>(
+      'crispasr_session_synthesize_raw',
+    );
+    final freeFn = _lib.lookupFunction<Void Function(Pointer<Float>),
+        void Function(Pointer<Float>)>('crispasr_pcm_free');
+    final textPtr = text.toNativeUtf8();
+    final nPtr = calloc<Int32>();
+    try {
+      final pcmPtr = synFn(_handle, textPtr, nPtr);
+      final n = nPtr.value;
+      if (pcmPtr == nullptr || n <= 0) {
+        String reason = '';
+        if (_lib.providesSymbol('crispasr_session_last_synth_error')) {
+          final errFn = _lib.lookupFunction<
+              Pointer<Utf8> Function(Pointer<Void>),
+              Pointer<Utf8> Function(Pointer<Void>)>(
+            'crispasr_session_last_synth_error',
+          );
+          final errPtr = errFn(_handle);
+          if (errPtr != nullptr) {
+            final msg = errPtr.toDartString();
+            if (msg.isNotEmpty) reason = msg;
+          }
+        }
+        throw Exception(reason.isNotEmpty
+            ? reason
+            : 'synthesizeRaw returned no audio (attestation required? '
+                'call acceptMarkingResponsibility first)');
+      }
+      try {
+        final view = pcmPtr.asTypedList(n);
+        return Float32List.fromList(view);
+      } finally {
+        freeFn(pcmPtr);
+      }
+    } finally {
+      calloc.free(textPtr);
+      calloc.free(nPtr);
+    }
+  }
+
   /// Speech-to-Speech: audio in → audio out via a single model pass.
   ///
   /// Supported on backends with S2S capability (lfm2-audio, mini-omni2).
@@ -3846,6 +4967,494 @@ class CrispasrSession {
     }
   }
 
+  /// Estimate a monophonic pitch (F0) track from mono float32 PCM.
+  ///
+  /// Requires a pitch-capable backend (`crepe`). [pcm16k] must be mono
+  /// float32 at the model's native rate — 16000 Hz for CREPE; query
+  /// [pitchSampleRate] to confirm rather than hard-coding it. [hopMs] is
+  /// the analysis hop in milliseconds; a value `<= 0` uses the model
+  /// default (10 ms).
+  ///
+  /// Returns one [PitchFrame] per hop, in time order. The frames are
+  /// copied into Dart-owned memory before returning, so the result stays
+  /// valid after the next [pitch] call or [close].
+  ///
+  /// Note that CREPE is monophonic — it estimates a single F0 per frame.
+  /// For polyphonic material, separate the source first (see the
+  /// `--separate` CLI route) and run [pitch] per stem.
+  ///
+  /// Open the session with an explicit `backend: 'crepe'`:
+  ///
+  /// ```dart
+  /// final s = CrispasrSession.open(path, backend: 'crepe');
+  /// final track = s.pitch(pcm);
+  /// ```
+  ///
+  /// Passing `backend: 'crepe'` explicitly is the safest form and always
+  /// works. Plain [CrispasrSession.open] also works from CrispASR 0.8.15
+  /// onward, where the C ABI's GGUF architecture auto-detection gained a
+  /// `crepe` case; against an older dylib it returns null for a CREPE
+  /// model even though the backend is compiled in.
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates the pitch
+  /// API, [StateError] when the session is closed, and [Exception] when
+  /// the backend has no pitch arm (the C side returns -1).
+  List<PitchFrame> pitch(Float32List pcm16k, {double hopMs = 10.0}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_pitch')) {
+      throw UnsupportedError(
+          'Pitch API not available in this libcrispasr build');
+    }
+    if (pcm16k.isEmpty) return const <PitchFrame>[];
+    // `hop_ms` is a C `float`; the native signature must say Float while
+    // the Dart signature says double — the FFI trampoline narrows it.
+    final pitchFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Float),
+        int Function(Pointer<Void>, Pointer<Float>, int, double)>(
+      'crispasr_session_pitch',
+    );
+    final framesFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>)>(
+      'crispasr_session_pitch_frames',
+    );
+    final inPtr = calloc<Float>(pcm16k.length);
+    final nPtr = calloc<Int32>();
+    try {
+      // Bulk view-then-copy, not an element-by-element loop — same
+      // reasoning as [synthesize].
+      inPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
+      final n = pitchFn(_handle, inPtr, pcm16k.length, hopMs);
+      if (n <= 0) {
+        throw Exception('pitch failed for backend $_backend — the model '
+            'is probably not pitch-capable (expected `crepe`)');
+      }
+      final framesPtr = framesFn(_handle, nPtr);
+      final nFrames = nPtr.value;
+      if (framesPtr == nullptr || nFrames <= 0) {
+        throw Exception('pitch returned no frames');
+      }
+      // The C side hands back a flat, session-owned view of
+      // `crepe_frame[]`: three 32-bit floats per frame, frame-major, as
+      // {time_ms, f0_hz, voiced_prob}. `asTypedList` on a Pointer<Float>
+      // yields a Float32List whose elements widen to Dart `double` on
+      // read, which is the only correct way across the 32/64 boundary.
+      final flat = framesPtr.asTypedList(nFrames * 3);
+      return List<PitchFrame>.generate(
+        nFrames,
+        (i) => (
+          timeMs: flat[i * 3],
+          f0Hz: flat[i * 3 + 1],
+          voicedProb: flat[i * 3 + 2],
+        ),
+        growable: false,
+      );
+    } finally {
+      calloc.free(inPtr);
+      calloc.free(nPtr);
+    }
+  }
+
+  /// Native input sample rate the loaded pitch model expects, in Hz
+  /// (16000 for CREPE).
+  ///
+  /// Returns 0 when the session's backend has no pitch arm, or when the
+  /// loaded dylib predates the pitch API — so this doubles as a
+  /// capability probe that never throws.
+  int get pitchSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_pitch_sample_rate')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_pitch_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Track beats and downbeats in mono float32 PCM.
+  ///
+  /// Requires a beat-capable backend (`beat-this`). [pcm22k] must be mono
+  /// float32 at the model's native rate — 22050 Hz for Beat This!; query
+  /// [beatsSampleRate] to confirm rather than hard-coding it. The native
+  /// side REJECTS a rate mismatch rather than resampling, because silently
+  /// resampling would move every beat time.
+  ///
+  /// Returns one [Beat] per detected beat, in time order, copied into
+  /// Dart-owned memory so the result stays valid after the next [beats]
+  /// call or [close]. Long inputs are chunked internally, so there is no
+  /// length limit and no seam handling for the caller to get right.
+  ///
+  /// Postprocessing is peak-picking only — there is deliberately **no DBN**.
+  /// madmom's Dynamic Bayesian Network is patent-encumbered and licensed
+  /// non-commercially; Beat This! is MIT for both code and weights and
+  /// reaches state-of-the-art without one, which is why this arm can ship in
+  /// a commercial app where most beat trackers cannot.
+  ///
+  /// Open the session with an explicit `backend: 'beat-this'`:
+  ///
+  /// ```dart
+  /// final s = CrispasrSession.open(path, backend: 'beat-this');
+  /// final grid = s.beats(pcm);
+  /// final bars = grid.where((b) => b.isDownbeat);
+  /// print('${s.beatsTempoBpm.toStringAsFixed(1)} BPM');
+  /// ```
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates the beat API,
+  /// [StateError] when the session is closed, and [Exception] when the
+  /// backend has no beat arm or the sample rate does not match (the C side
+  /// returns -1 for both).
+  List<Beat> beats(Float32List pcm22k) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_beats')) {
+      throw UnsupportedError(
+          'Beat API not available in this libcrispasr build');
+    }
+    if (pcm22k.isEmpty) return const <Beat>[];
+    final rate = beatsSampleRate;
+    final beatsFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Int32),
+        int Function(Pointer<Void>, Pointer<Float>, int, int)>(
+      'crispasr_session_beats',
+    );
+    final eventsFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>)>(
+      'crispasr_session_beats_events',
+    );
+    final inPtr = calloc<Float>(pcm22k.length);
+    final nPtr = calloc<Int32>();
+    try {
+      // Bulk view-then-copy, not an element-by-element loop — same
+      // reasoning as [synthesize].
+      inPtr.asTypedList(pcm22k.length).setAll(0, pcm22k);
+      final n = beatsFn(_handle, inPtr, pcm22k.length, rate > 0 ? rate : 22050);
+      if (n < 0) {
+        throw Exception('beats failed for backend $_backend — the model is '
+            'probably not beat-capable (expected `beat-this`), or the PCM is '
+            'not at ${rate > 0 ? rate : 22050} Hz');
+      }
+      if (n == 0) return const <Beat>[];
+      final evPtr = eventsFn(_handle, nPtr);
+      final nEv = nPtr.value;
+      if (evPtr == nullptr || nEv <= 0) return const <Beat>[];
+      // Flat, session-owned view: two 32-bit floats per beat, beat-major, as
+      // {time_s, is_downbeat}. It is a float pair rather than a struct
+      // because a mixed int/float struct misreads through a flat float view.
+      final flat = evPtr.asTypedList(nEv * 2);
+      return List<Beat>.generate(
+        nEv,
+        (i) => (timeS: flat[i * 2], isDownbeat: flat[i * 2 + 1] != 0.0),
+        growable: false,
+      );
+    } finally {
+      calloc.free(inPtr);
+      calloc.free(nPtr);
+    }
+  }
+
+  /// Native input sample rate the loaded beat model expects, in Hz
+  /// (22050 for Beat This!).
+  ///
+  /// Returns 0 when the session's backend has no beat arm, or when the
+  /// loaded dylib predates the beat API — so this doubles as a capability
+  /// probe that never throws.
+  int get beatsSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_beats_sample_rate')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_beats_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Median inter-beat tempo estimate in BPM from the last [beats] call, or
+  /// 0 with fewer than two beats.
+  ///
+  /// Median rather than mean: a single missed or doubled beat skews a mean
+  /// badly, and beat sequences routinely have both.
+  double get beatsTempoBpm {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_beats_tempo_bpm')) return 0.0;
+    final fn = _lib.lookupFunction<Float Function(Pointer<Void>),
+        double Function(Pointer<Void>)>('crispasr_session_beats_tempo_bpm');
+    return fn(_handle);
+  }
+
+  /// Split audio into source stems (e.g. drums / bass / other / vocals).
+  ///
+  /// Requires a separation-capable backend (`htdemucs`).
+  ///
+  /// [pcmStereo] is **interleaved stereo** float32 — `L,R,L,R,…` — at the
+  /// model's native rate (44100 Hz for htdemucs; query
+  /// [separateSampleRate] rather than hard-coding it). Its length must
+  /// therefore be `2 * framesPerChannel`; an odd length is rejected.
+  ///
+  /// Each returned [Stem] carries interleaved stereo PCM of the same
+  /// length as the input. Stems are copied into Dart-owned memory before
+  /// returning, so they stay valid after the next [separate] or [close]
+  /// — the C side hands back session-owned buffers that do not.
+  ///
+  /// To feed a stem to [pitch] (the "transcribe the melody of a song"
+  /// path), downmix to mono at the pitch model's rate first — [pitch]
+  /// wants mono at 16 kHz, not stereo at 44.1 kHz:
+  ///
+  /// ```dart
+  /// final stems = sep.separate(songStereo);
+  /// final vocals = stems.firstWhere((s) => s.name == 'vocals').pcm;
+  /// final mono = Float32List(vocals.length ~/ 2);
+  /// for (var i = 0; i < mono.length; i++) {
+  ///   mono[i] = (vocals[i * 2] + vocals[i * 2 + 1]) / 2;
+  /// }
+  /// // then resample mono 44100 -> 16000 and call pitch() on it
+  /// ```
+  ///
+  /// Separation is heavy and offline-grade; run it off the UI isolate.
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates the
+  /// separation API, [StateError] when the session is closed,
+  /// [ArgumentError] on a non-interleaved (odd-length) buffer, and
+  /// [Exception] when the backend has no separation arm (C returns -1).
+  List<Stem> separate(Float32List pcmStereo) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_separate')) {
+      throw UnsupportedError(
+          'Separation API not available in this libcrispasr build');
+    }
+    if (pcmStereo.isEmpty) return const <Stem>[];
+    if (pcmStereo.length.isOdd) {
+      throw ArgumentError.value(pcmStereo.length, 'pcmStereo.length',
+          'must be even — interleaved stereo is 2 samples per frame');
+    }
+    // The C side counts samples PER CHANNEL, not total interleaved floats.
+    // Passing the interleaved length here would ask htdemucs to read twice
+    // the buffer.
+    final framesPerChannel = pcmStereo.length ~/ 2;
+
+    final sepFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32),
+        int Function(Pointer<Void>, Pointer<Float>, int)>(
+      'crispasr_session_separate',
+    );
+    final nameFn = _lib.lookupFunction<
+        Pointer<Utf8> Function(Pointer<Void>, Int32),
+        Pointer<Utf8> Function(Pointer<Void>, int)>(
+      'crispasr_session_separate_stem_name',
+    );
+    final stemFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Int32, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, int, Pointer<Int32>)>(
+      'crispasr_session_separate_stem',
+    );
+
+    final inPtr = calloc<Float>(pcmStereo.length);
+    final nPtr = calloc<Int32>();
+    try {
+      inPtr.asTypedList(pcmStereo.length).setAll(0, pcmStereo);
+      final nStems = sepFn(_handle, inPtr, framesPerChannel);
+      if (nStems <= 0) {
+        throw Exception('separate failed for backend $_backend — the model '
+            'is probably not separation-capable (expected `htdemucs`)');
+      }
+      final out = <Stem>[];
+      for (var i = 0; i < nStems; i++) {
+        final ptr = stemFn(_handle, i, nPtr);
+        final perChannel = nPtr.value;
+        if (ptr == nullptr || perChannel <= 0) continue;
+        final namePtr = nameFn(_handle, i);
+        final name = namePtr == nullptr ? 'stem$i' : namePtr.toDartString();
+        // Session-owned view -> copy, since it dies on the next separate().
+        // Length is interleaved (2x per-channel), matching the input.
+        final view = ptr.asTypedList(perChannel * 2);
+        out.add((name: name, pcm: Float32List.fromList(view)));
+      }
+      return out;
+    } finally {
+      calloc.free(inPtr);
+      calloc.free(nPtr);
+    }
+  }
+
+  /// Transcribe polyphonic piano audio into note events.
+  ///
+  /// Requires a piano-capable backend (`piano-transcription`). [pcm16k] must
+  /// be mono float32 at the model's native rate — 16000 Hz; query
+  /// [pianoSampleRate] rather than hard-coding it.
+  ///
+  /// Returns notes in the model's order (not guaranteed sorted), copied into
+  /// Dart-owned memory, so they stay valid after the next call or [close].
+  ///
+  /// This is the structured seam. The `--backend piano-transcription`
+  /// transcribe path also works, but it renders each note into segment text
+  /// like `"C4 v=80"`, and parsing that back is lossy — prefer this.
+  ///
+  /// ```dart
+  /// final s = CrispasrSession.open(path, backend: 'piano-transcription');
+  /// final notes = s.pianoNotes(pcm16k);
+  /// ```
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates the piano API,
+  /// [StateError] when the session is closed, and [Exception] when the
+  /// backend has no piano arm (the C side returns -1). An empty result is
+  /// returned as an empty list, not an error — "ran, found no notes" is a
+  /// legitimate outcome on silence.
+  List<PianoNote> pianoNotes(Float32List pcm16k) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_piano')) {
+      throw UnsupportedError(
+          'Piano transcription API not available in this libcrispasr build');
+    }
+    if (pcm16k.isEmpty) return const <PianoNote>[];
+    final pianoFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32),
+        int Function(Pointer<Void>, Pointer<Float>, int)>(
+      'crispasr_session_piano',
+    );
+    final notesFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>)>(
+      'crispasr_session_piano_notes',
+    );
+    final inPtr = calloc<Float>(pcm16k.length);
+    final nPtr = calloc<Int32>();
+    try {
+      inPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
+      final n = pianoFn(_handle, inPtr, pcm16k.length);
+      if (n < 0) {
+        throw Exception('piano transcription failed for backend $_backend — '
+            'the model is probably not piano-capable '
+            '(expected `piano-transcription`)');
+      }
+      if (n == 0) return const <PianoNote>[];
+      final ptr = notesFn(_handle, nPtr);
+      final nNotes = nPtr.value;
+      if (ptr == nullptr || nNotes <= 0) return const <PianoNote>[];
+      // Flat, session-owned: 4 floats per note, note-major, as
+      // {onset_ms, offset_ms, midi, velocity}. All four lanes are float even
+      // though midi/velocity are logically ints — a mixed struct read through
+      // a float view would misread the int lanes, so the C side flattens.
+      final flat = ptr.asTypedList(nNotes * 4);
+      return List<PianoNote>.generate(
+        nNotes,
+        (i) => (
+          onMs: flat[i * 4],
+          offMs: flat[i * 4 + 1],
+          midi: flat[i * 4 + 2].round(),
+          velocity: flat[i * 4 + 3].round(),
+        ),
+        growable: false,
+      );
+    } finally {
+      calloc.free(inPtr);
+      calloc.free(nPtr);
+    }
+  }
+
+  /// [pianoNotes], plus the General MIDI program of each note.
+  ///
+  /// MT3's reason for existing is that it is multi-instrument, and the flat
+  /// note record this ABI hands out has nowhere to put that — so the programs
+  /// travel in a parallel array and this is the call that reads both.
+  ///
+  /// Returns -1 for every program against a dylib that predates
+  /// `crispasr_session_piano_note_programs`, or against a model that does not
+  /// identify instruments, so a caller can use this unconditionally and read
+  /// the sentinel rather than probing for the symbol.
+  List<PianoNoteWithProgram> pianoNotesWithPrograms(Float32List pcm16k) {
+    final notes = pianoNotes(pcm16k);
+    if (notes.isEmpty) return const <PianoNoteWithProgram>[];
+
+    var programs = List<int>.filled(notes.length, -1);
+    if (_lib.providesSymbol('crispasr_session_piano_note_programs')) {
+      final fn = _lib.lookupFunction<
+          Pointer<Int32> Function(Pointer<Void>, Pointer<Int32>),
+          Pointer<Int32> Function(Pointer<Void>, Pointer<Int32>)>(
+        'crispasr_session_piano_note_programs',
+      );
+      final nPtr = calloc<Int32>();
+      try {
+        final ptr = fn(_handle, nPtr);
+        final n = nPtr.value;
+        if (ptr != nullptr && n >= notes.length) {
+          programs = List<int>.of(ptr.asTypedList(notes.length));
+        }
+      } finally {
+        calloc.free(nPtr);
+      }
+    }
+
+    return List<PianoNoteWithProgram>.generate(
+      notes.length,
+      (i) => (
+        onMs: notes[i].onMs,
+        offMs: notes[i].offMs,
+        midi: notes[i].midi,
+        velocity: notes[i].velocity,
+        program: programs[i],
+      ),
+      growable: false,
+    );
+  }
+
+  /// Native input sample rate the loaded piano model expects, in Hz (16000).
+  ///
+  /// Returns 0 when the session's backend has no piano arm, or when the
+  /// loaded dylib predates the piano API — so this doubles as a capability
+  /// probe that never throws.
+  int get pianoSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_piano_sample_rate')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_piano_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Native sample rate the loaded separation model expects, in Hz
+  /// (44100 for htdemucs).
+  ///
+  /// Returns 0 when the session's backend has no separation arm, or when
+  /// the loaded dylib predates the separation API — so this doubles as a
+  /// capability probe that never throws.
+  int get separateSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_separate_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_separate_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Sample rate (Hz) this backend expects for input PCM.
+  ///
+  /// [speechToSpeech] and the other PCM entry points want audio at the
+  /// backend's native rate, and it varies by backend — so telling callers to
+  /// resample without giving them a way to ask the rate is not actionable
+  /// (issue #321).
+  ///
+  /// Returns 0 on a dylib that predates the symbol, matching
+  /// [separateSampleRate]: a capability probe that never throws.
+  int get inputSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_input_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_input_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Sample rate (Hz) of PCM this backend returns — what [speechToSpeech]
+  /// and [synthesize] hand back. 24 kHz for conversational S2S, 48 kHz for
+  /// Sidon and VoxCPM2 AudioVAE.
+  ///
+  /// Returns 0 on a dylib that predates the symbol.
+  int get outputSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_output_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_output_sample_rate');
+    return fn(_handle);
+  }
+
   /// Set hotwords for contextual biasing.
   ///
   /// [hotwords] is a comma-separated list of words/phrases. For CTC/TDT
@@ -3874,6 +5483,51 @@ class CrispasrSession {
     } finally {
       calloc.free(p);
     }
+  }
+
+  /// Apply a named bundle of the four decoder fallback thresholds:
+  /// `"conservative"`, `"balanced"` (the shipped defaults, a no-op) or
+  /// `"aggressive"`. `"strict"`/`"default"`/`"loose"` are aliases. Mirrors the
+  /// CLI's `--sensitivity`.
+  ///
+  /// The four thresholds interact — a decode is only retried when the logprob
+  /// *and* no-speech bars are both crossed — so they move as a set. A later
+  /// [setFallbackThresholds] overrides this.
+  ///
+  /// Throws [ArgumentError] for an unrecognised preset: a typo must not be
+  /// silently treated as `"balanced"`. Gracefully degrades on older dylibs
+  /// that don't have the symbol.
+  void setSensitivity(String preset) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_sensitivity')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(
+            Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_sensitivity');
+    final p = preset.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw ArgumentError('unknown sensitivity preset "$preset" '
+            '(expected: conservative, balanced, aggressive)');
+      }
+      if (rc != 0) throw Exception('setSensitivity failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// 0: unavailable, 1: rolling windows, 2: persistent model caches,
+  /// 3: text-prefix streaming (accumulated audio is re-encoded).
+  /// Older libraries report 0 rather than claiming unsupported streaming.
+  int get streamingKind {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_stream_kind')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_stream_kind');
+    return fn(_handle);
   }
 
   /// Open a streaming decode session against this session's backend.
@@ -3906,7 +5560,7 @@ class CrispasrSession {
             Pointer<Void>, Int32, Int32, Int32, Int32, Pointer<Utf8>, Int32),
         Pointer<Void> Function(Pointer<Void>, int, int, int, int, Pointer<Utf8>,
             int)>('crispasr_session_stream_open');
-    final langPtr = (language == null || language.isEmpty || language == 'auto')
+    final langPtr = (language == null || language.isEmpty)
         ? nullptr
         : language.toNativeUtf8();
     final handle = fn(_handle, nThreads, stepMs, lengthMs, keepMs,
@@ -3938,25 +5592,783 @@ class CrispasrSession {
             'crispasr_stream_set_live_decode')
         : null;
 
-    return StreamingSession._(
+    final stream = StreamingSession._(
       handle: handle,
+      ownerCheck: () => _handle,
+      onClosed: _streams.remove,
       feed: feedFn,
       flush: flushFn,
       getText: getTextFn,
       close: closeFn,
       setLiveDecode: setLiveDecodeFn,
     );
+    _streams.add(stream);
+    return stream;
   }
 
+  // -- Additional session bindings for header census completeness --
+
+  /// Native input sample rate the loaded model expects (Hz) - alias for legacy.
+  int get inputChannels {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_input_channels')) return 1;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_input_channels');
+    final v = fn(_handle);
+    return v <= 0 ? 1 : v;
+  }
+
+  /// Native output channel count (1 = mono, 0 when no audio output).
+  int get outputChannels {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_output_channels')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_output_channels');
+    return fn(_handle);
+  }
+
+  /// Tell the session what sample rate the next PCM input is at. Skips resampling
+  /// when already at native rate. Defaults to 16000.
+  void setPcmSampleRate(int rate) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_pcm_sample_rate')) return;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_set_pcm_sample_rate');
+    final rc = fn(_handle, rate);
+    if (rc != 0) throw Exception('setPcmSampleRate failed (rc=$rc)');
+  }
+
+  /// Set the Parakeet local-attention window (encoder frames, ~80ms each).
+  /// Bounds long-audio encoder memory to O(T·window) instead of O(T2).
+  /// Negative values = full attention; INT_MIN,INT_MIN = clear.
+  void setParakeetAttContext(int left, int right) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_parakeet_att_context')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32, Int32),
+        int Function(Pointer<Void>, int,
+            int)>('crispasr_session_set_parakeet_att_context');
+    final rc = fn(_handle, left, right);
+    if (rc != 0) throw Exception('setParakeetAttContext failed (rc=$rc)');
+  }
+
+  /// Whisper encoder audio context size (0 = all/1500, >0 = explicit frames).
+  void setAudioCtx(int audioCtx) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_audio_ctx')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_audio_ctx');
+    final rc = fn(_handle, audioCtx);
+    if (rc != 0) throw Exception('setAudioCtx failed (rc=$rc)');
+  }
+
+  /// Hikari streaming strided window refresh interval (0 = exact, K > 0 = strided).
+  void setHikariRefreshStride(int stride) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_hikari_refresh_stride')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_set_hikari_refresh_stride');
+    final rc = fn(_handle, stride);
+    if (rc != 0) throw Exception('setHikariRefreshStride failed (rc=$rc)');
+  }
+
+  /// Pad N ms of silence at the beginning of TTS output.
+  void setTtsPadSilenceMs(int ms) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_pad_silence_ms')) return;
+    final fn = _lib.lookupFunction<
+        Void Function(Pointer<Void>, Int32),
+        void Function(
+            Pointer<Void>, int)>('crispasr_session_set_tts_pad_silence_ms');
+    fn(_handle, ms);
+  }
+
+  /// Distinct TTS CFG scale setter (separate from generic cfg_weight).
+  /// Used by cosyvoice, indextts etc. Returns silently on backends that don't support it.
+  void setTtsCfgScale(double scale) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_cfg_scale')) return;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Float),
+        int Function(
+            Pointer<Void>, double)>('crispasr_session_set_tts_cfg_scale');
+    final rc = fn(_handle, scale);
+    if (rc != 0 && rc != -2) throw Exception('setTtsCfgScale failed (rc=$rc)');
+  }
+
+  /// Install mono reference PCM for voice cloning (no temp file).
+  /// [pcm] is mono float32 at [sampleRate]; [refText] is the transcript of
+  /// the reference audio when required by the backend (e.g. qwen3-tts WAV cloning).
+  void setVoiceSamples(Float32List pcm, int sampleRate, {String? refText}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (pcm.isEmpty) throw ArgumentError('pcm must not be empty');
+    if (sampleRate <= 0) throw ArgumentError('sampleRate must be positive');
+    if (!_lib.providesSymbol('crispasr_session_set_voice_samples')) {
+      throw UnsupportedError(
+          'setVoiceSamples not in this libcrispasr - needs CrispASR 0.7.0+');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(
+            Pointer<Void>, Pointer<Float>, Int32, Int32, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Float>, int, int, Pointer<Utf8>)>(
+      'crispasr_session_set_voice_samples',
+    );
+    final pcmPtr = calloc<Float>(pcm.length);
+    pcmPtr.asTypedList(pcm.length).setAll(0, pcm);
+    final refPtr = refText == null ? nullptr : refText.toNativeUtf8();
+    try {
+      final rc =
+          fn(_handle, pcmPtr, pcm.length, sampleRate, refPtr.cast<Utf8>());
+      if (rc != 0) {
+        throw Exception(
+            'setVoiceSamples failed (rc=$rc) for backend $_backend');
+      }
+    } finally {
+      calloc.free(pcmPtr);
+      if (refPtr != nullptr) calloc.free(refPtr);
+    }
+  }
+
+  /// Configure TADA encoder + aligner GGUFs for on-the-fly voice cloning.
+  /// Either path may be null to clear and fall back to auto-resolution.
+  /// No-op (returns -1) for non-TADA sessions.
+  void tadaSetMakerefModels({String? encoderGguf, String? alignerGguf}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_tada_set_makeref_models')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>)>(
+      'crispasr_session_tada_set_makeref_models',
+    );
+    final encPtr = encoderGguf == null ? nullptr : encoderGguf.toNativeUtf8();
+    final aliPtr = alignerGguf == null ? nullptr : alignerGguf.toNativeUtf8();
+    try {
+      final rc = fn(_handle, encPtr.cast<Utf8>(), aliPtr.cast<Utf8>());
+      if (rc != 0) throw Exception('tadaSetMakerefModels failed (rc=$rc)');
+    } finally {
+      if (encPtr != nullptr) calloc.free(encPtr);
+      if (aliPtr != nullptr) calloc.free(aliPtr);
+    }
+  }
+
+  /// Human-readable error from the last failed synthesize call. Empty when success.
+  String get lastSynthError {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_last_synth_error')) return '';
+    final fn = _lib.lookupFunction<
+        Pointer<Utf8> Function(Pointer<Void>),
+        Pointer<Utf8> Function(
+            Pointer<Void>)>('crispasr_session_last_synth_error');
+    final p = fn(_handle);
+    return p == nullptr ? '' : p.toDartString();
+  }
+
+  /// Canonical AI disclosure string for voice clones (EU AI Act Art. 50(4)).
+  /// Static; never null. Use for a visible label.
+  static String disclaimerText({String? libPath}) {
+    final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+    if (!lib.providesSymbol('crispasr_session_disclaimer_text')) {
+      return 'AI generated';
+    }
+    final fn =
+        lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+            'crispasr_session_disclaimer_text');
+    final p = fn();
+    return p == nullptr ? '' : p.toDartString();
+  }
+
+  /// Disclosure PCM synthesized in this session's NEUTRAL voice, for you to
+  /// prepend to cloned output. Must be called BEFORE setVoice installs a
+  /// cloning voice - returns empty afterwards. Caller owns buffer via copy.
+  Float32List getDisclaimerPcm() {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_get_disclaimer_pcm')) {
+      throw UnsupportedError(
+          'getDisclaimerPcm not in this libcrispasr - needs CrispASR 0.7.0+');
+    }
+    final fn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>)>(
+      'crispasr_session_get_disclaimer_pcm',
+    );
+    final freeFn = _lib.lookupFunction<Void Function(Pointer<Float>),
+        void Function(Pointer<Float>)>('crispasr_pcm_free');
+    final nPtr = calloc<Int32>();
+    try {
+      final p = fn(_handle, nPtr);
+      final n = nPtr.value;
+      if (p == nullptr || n <= 0) {
+        throw Exception(lastSynthError.isNotEmpty
+            ? lastSynthError
+            : 'getDisclaimerPcm returned no audio (already have a clone voice?)');
+      }
+      final view = p.asTypedList(n);
+      final copy = Float32List.fromList(view);
+      freeFn(p);
+      return copy;
+    } finally {
+      calloc.free(nPtr);
+    }
+  }
+
+  // -- Music / task backends: chords, tab, convert --
+
+  /// Chord recognition: mono PCM at any sample rate (resampled internally to 22050 Hz)
+  /// -> chord timeline. Returns empty list for "ran, found nothing".
+  /// The shipped BTC weights are CC-BY-NC-SA - not licensed for commercial use.
+  List<ChordSpan> chords(Float32List pcm, {int sampleRate = 22050}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (pcm.isEmpty) return const [];
+    if (!_lib.providesSymbol('crispasr_session_chords')) {
+      throw UnsupportedError('chords API not in this libcrispasr');
+    }
+    if (sampleRate <= 0) throw ArgumentError('sampleRate must be positive');
+    final runFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Int32),
+        int Function(Pointer<Void>, Pointer<Float>, int,
+            int)>('crispasr_session_chords');
+    final spansFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>),
+        Pointer<Float> Function(
+            Pointer<Void>, Pointer<Int32>)>('crispasr_session_chords_spans');
+    final nameFn = _lib.lookupFunction<
+        Pointer<Utf8> Function(Pointer<Void>, Int32),
+        Pointer<Utf8> Function(
+            Pointer<Void>, int)>('crispasr_session_chords_span_name');
+    final pcmPtr = calloc<Float>(pcm.length);
+    pcmPtr.asTypedList(pcm.length).setAll(0, pcm);
+    try {
+      final rc = runFn(_handle, pcmPtr, pcm.length, sampleRate);
+      if (rc < 0) {
+        throw Exception(
+            'chords failed (rc=$rc) - backend $_backend has no chord arm?');
+      }
+      if (rc == 0) return const [];
+      final nPtr = calloc<Int32>();
+      try {
+        final flatPtr = spansFn(_handle, nPtr);
+        final n = nPtr.value;
+        if (flatPtr == nullptr || n <= 0) return const [];
+        final flat = flatPtr.asTypedList(n * 4);
+        final out = <ChordSpan>[];
+        for (var i = 0; i < n; i++) {
+          final sMs = flat[i * 4];
+          final eMs = flat[i * 4 + 1];
+          final label = flat[i * 4 + 2].round();
+          final conf = flat[i * 4 + 3];
+          final namePtr = nameFn(_handle, i);
+          final name = namePtr == nullptr ? '' : namePtr.toDartString();
+          out.add(ChordSpan(
+              start: sMs / 1000.0,
+              end: eMs / 1000.0,
+              label: label,
+              confidence: conf,
+              name: name));
+        }
+        return out;
+      } finally {
+        calloc.free(nPtr);
+      }
+    } finally {
+      calloc.free(pcmPtr);
+    }
+  }
+
+  /// Vocabulary size for the loaded chord model: 25 (maj/min+N) or 170 (full).
+  int get chordsVocabSize {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_chords_vocab_size')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_chords_vocab_size');
+    return fn(_handle);
+  }
+
+  /// Guitar tablature emission scores, not a decided fingering.
+  /// Returns per-frame log-probabilities; caller supplies Viterbi/DP for playability.
+  TabResult tab(Float32List pcm, {int sampleRate = 22050}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (pcm.isEmpty) throw ArgumentError('pcm must not be empty');
+    if (!_lib.providesSymbol('crispasr_session_tab')) {
+      throw UnsupportedError('tab API not in this libcrispasr');
+    }
+    if (sampleRate <= 0) throw ArgumentError('sampleRate must be positive');
+    final runFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Int32),
+        int Function(
+            Pointer<Void>, Pointer<Float>, int, int)>('crispasr_session_tab');
+    final emFn = _lib.lookupFunction<
+        Pointer<Float> Function(
+            Pointer<Void>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>),
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>, Pointer<Int32>,
+            Pointer<Int32>)>('crispasr_session_tab_emissions');
+    final silentFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_tab_silent_class');
+    final periodFn = _lib.lookupFunction<Float Function(Pointer<Void>),
+        double Function(Pointer<Void>)>('crispasr_session_tab_frame_period');
+    final midiFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_tab_string_open_midi');
+    final pcmPtr = calloc<Float>(pcm.length);
+    pcmPtr.asTypedList(pcm.length).setAll(0, pcm);
+    try {
+      final rc = runFn(_handle, pcmPtr, pcm.length, sampleRate);
+      if (rc < 0) {
+        throw Exception(
+            'tab failed (rc=$rc) - backend $_backend has no tab arm?');
+      }
+      if (rc == 0) {
+        return TabResult(
+            nFrames: 0,
+            nStrings: 0,
+            nClasses: 0,
+            emissions: Float32List(0),
+            silentClass: 0,
+            framePeriod: 0,
+            openMidi: []);
+      }
+      final nPtr = calloc<Int32>();
+      final sPtr = calloc<Int32>();
+      final cPtr = calloc<Int32>();
+      try {
+        final flatPtr = emFn(_handle, nPtr, sPtr, cPtr);
+        final n = nPtr.value, nStr = sPtr.value, nCls = cPtr.value;
+        if (flatPtr == nullptr || n <= 0 || nStr <= 0 || nCls <= 0) {
+          return TabResult(
+              nFrames: 0,
+              nStrings: 0,
+              nClasses: 0,
+              emissions: Float32List(0),
+              silentClass: 0,
+              framePeriod: 0,
+              openMidi: []);
+        }
+        final flat = flatPtr.asTypedList(n * nStr * nCls);
+        final emissions = Float32List.fromList(flat);
+        final silent = silentFn(_handle);
+        final period = periodFn(_handle);
+        final open = <int>[];
+        for (var i = 0; i < nStr; i++) {
+          open.add(midiFn(_handle, i));
+        }
+        return TabResult(
+            nFrames: n,
+            nStrings: nStr,
+            nClasses: nCls,
+            emissions: emissions,
+            silentClass: silent,
+            framePeriod: period,
+            openMidi: open);
+      } finally {
+        calloc.free(nPtr);
+        calloc.free(sPtr);
+        calloc.free(cPtr);
+      }
+    } finally {
+      calloc.free(pcmPtr);
+    }
+  }
+
+  // -- ContentVec voice conversion --
+
+  int get convertContentDim {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_convert_content_dim')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_convert_content_dim');
+    return fn(_handle);
+  }
+
+  int get convertNSpeakers {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_convert_n_speakers')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_convert_n_speakers');
+    return fn(_handle);
+  }
+
+  int get convertSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_convert_sample_rate')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_convert_sample_rate');
+    return fn(_handle);
+  }
+
+  int get convertInterChannels {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_convert_inter_channels')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_convert_inter_channels');
+    return fn(_handle);
+  }
+
+  int get convertUpsampleProduct {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_convert_upsample_product')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>),
+        int Function(
+            Pointer<Void>)>('crispasr_session_convert_upsample_product');
+    return fn(_handle);
+  }
+
+  /// Voice conversion from ContentVec features + F0 to audio.
+  /// [content] is frame-major flattened [nFrames * contentDim].
+  /// [f0Hz] is per-frame F0 in Hz, 0.0 = unvoiced.
+  /// Stochastic by design; pass explicit [noiseZp]/[noiseSine] to replay.
+  /// Returns mono PCM at [convertSampleRate] (32k/40k/48k).
+  Float32List convert(Float32List content, Float32List f0Hz, int speakerId,
+      {Float32List? noiseZp, Float32List? noiseSine}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_convert')) {
+      throw UnsupportedError('convert API not in this libcrispasr');
+    }
+    final nFrames = f0Hz.length;
+    if (nFrames == 0) throw ArgumentError('f0Hz must not be empty');
+    final dim = convertContentDim;
+    final nSpk = convertNSpeakers;
+    if (dim <= 0 || nSpk <= 0) {
+      throw StateError(
+          'convert dimensions not available - is this a convert-capable backend?');
+    }
+    if (content.length != nFrames * dim) {
+      throw ArgumentError(
+          'content must have shape (nFrames=$nFrames, dim=$dim) = ${nFrames * dim} floats, got ${content.length}');
+    }
+    if (speakerId < 0 || speakerId >= nSpk) {
+      throw RangeError('speakerId $speakerId out of range [0, $nSpk)');
+    }
+    final ic = convertInterChannels;
+    final up = convertUpsampleProduct;
+    if (noiseZp != null && noiseZp.length != ic * nFrames) {
+      throw ArgumentError(
+          'noiseZp must have shape (interChannels=$ic, nFrames=$nFrames) = ${ic * nFrames}, got ${noiseZp.length}');
+    }
+    if (noiseSine != null && noiseSine.length != nFrames * up) {
+      throw ArgumentError(
+          'noiseSine must have shape (nFrames=$nFrames, upsampleProduct=$up) = ${nFrames * up}, got ${noiseSine.length}');
+    }
+    final convertFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Pointer<Float>,
+            Int32, Pointer<Float>, Pointer<Float>),
+        int Function(Pointer<Void>, Pointer<Float>, int, Pointer<Float>, int,
+            Pointer<Float>, Pointer<Float>)>('crispasr_session_convert');
+    final audioFn = _lib.lookupFunction<
+        Pointer<Float> Function(Pointer<Void>, Pointer<Int32>),
+        Pointer<Float> Function(
+            Pointer<Void>, Pointer<Int32>)>('crispasr_session_convert_audio');
+    final cPtr = calloc<Float>(content.length);
+    cPtr.asTypedList(content.length).setAll(0, content);
+    final f0Ptr = calloc<Float>(f0Hz.length);
+    f0Ptr.asTypedList(f0Hz.length).setAll(0, f0Hz);
+    final zpPtr = noiseZp == null ? nullptr : calloc<Float>(noiseZp.length);
+    if (zpPtr != nullptr && noiseZp != null) {
+      zpPtr.asTypedList(noiseZp.length).setAll(0, noiseZp);
+    }
+    final sinePtr =
+        noiseSine == null ? nullptr : calloc<Float>(noiseSine.length);
+    if (sinePtr != nullptr && noiseSine != null) {
+      sinePtr.asTypedList(noiseSine.length).setAll(0, noiseSine);
+    }
+    try {
+      final rc = convertFn(_handle, cPtr, nFrames, f0Ptr, speakerId,
+          zpPtr.cast<Float>(), sinePtr.cast<Float>());
+      if (rc <= 0) throw Exception('convert failed (rc=$rc)');
+      final nPtr = calloc<Int32>();
+      try {
+        final p = audioFn(_handle, nPtr);
+        final n = nPtr.value;
+        if (p == nullptr || n <= 0) {
+          throw Exception('convert returned no audio');
+        }
+        return Float32List.fromList(p.asTypedList(n));
+      } finally {
+        calloc.free(nPtr);
+      }
+    } finally {
+      calloc.free(cPtr);
+      calloc.free(f0Ptr);
+      if (zpPtr != nullptr) calloc.free(zpPtr);
+      if (sinePtr != nullptr) calloc.free(sinePtr);
+    }
+  }
+
+  // -- Sentence streaming synthesis (isolate-safe) --
+
+  bool _insideCallback = false;
+  Object? _callbackError;
+  StackTrace? _callbackStack;
+  // Hold NativeCallables to prevent GC
+  final Map<String, NativeCallable> _callbackHolders = {};
+
+  void _rethrowCallbackError() {
+    final e = _callbackError;
+    final s = _callbackStack;
+    _callbackError = null;
+    _callbackStack = null;
+    if (e != null) Error.throwWithStackTrace(e, s ?? StackTrace.current);
+  }
+
+  void _ensureNotInCallback() {
+    if (_insideCallback) {
+      throw StateError('do not re-enter CrispasrSession from its callback');
+    }
+  }
+
+  /// Streaming synthesis: fires [onChunk] once per sentence chunk with that
+  /// chunk's watermarked PCM (backend-native sample rate, same as [synthesize]).
+  /// The PCM is owned by the call and copied before [onChunk] returns.
+  /// [isFinal] is true on the last chunk. Synchronous - native callbacks are
+  /// invoked on the calling thread; never invoke callbacks into an incorrect
+  /// Dart thread. Sentence TTS is not token/vocoder streaming.
+  ///
+  /// This is isolate-safe via NativeCallable.isolateLocal: the callback runs
+  /// synchronously on the calling isolate, not via SendPort. A failed native
+  /// chunk (null/empty) surfaces via [lastSynthError].
+  void synthesizeStreaming(
+      String text, void Function(Float32List pcm, bool isFinal) onChunk) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_synthesize_streaming')) {
+      throw UnsupportedError(
+          'synthesizeStreaming not in this libcrispasr - needs CrispASR 0.7.0+');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>,
+            Pointer<NativeFunction<_PcmStreamCbNative>>, Pointer<Void>),
+        int Function(Pointer<Void>, Pointer<Utf8>,
+            Pointer<NativeFunction<_PcmStreamCbNative>>, Pointer<Void>)>(
+      'crispasr_session_synthesize_streaming',
+    );
+    final textPtr = text.toNativeUtf8();
+    // Use isolateLocal so the callback runs synchronously on this thread.
+    // listener would post async and the C pointer would dangle.
+    late NativeCallable<_PcmStreamCbNative> callable;
+    callable = NativeCallable<_PcmStreamCbNative>.isolateLocal(
+      (Pointer<Float> pcmPtr, int n, int isFinal, Pointer<Void> _) {
+        if (_callbackError != null) return;
+        if (pcmPtr == nullptr || n <= 0) {
+          _callbackError = Exception(lastSynthError.isNotEmpty
+              ? lastSynthError
+              : 'streaming synthesis returned empty chunk');
+          _callbackStack = StackTrace.current;
+          return;
+        }
+        if (_insideCallback) {
+          _callbackError =
+              StateError('do not re-enter the session from its callback');
+          _callbackStack = StackTrace.current;
+          return;
+        }
+        _insideCallback = true;
+        try {
+          final view = pcmPtr.asTypedList(n);
+          final copy = Float32List.fromList(view);
+          onChunk(copy, isFinal != 0);
+        } catch (e, st) {
+          _callbackError = e;
+          _callbackStack = st;
+        } finally {
+          _insideCallback = false;
+        }
+      },
+    );
+    _callbackHolders['streaming'] = callable;
+    try {
+      final rc = fn(_handle, textPtr, callable.nativeFunction, nullptr);
+      _rethrowCallbackError();
+      if (rc != 0) {
+        throw Exception(
+            'synthesizeStreaming failed (rc=$rc): ${lastSynthError}');
+      }
+    } finally {
+      callable.close();
+      _callbackHolders.remove('streaming');
+      calloc.free(textPtr);
+    }
+  }
+
+  // -- Progress / segment / token callbacks (isolate-safe) --
+
+  /// Register a per-window progress callback for chunked transcription.
+  /// [callback] receives (processedSamples, totalSamples) synchronously on the
+  /// transcribing thread. Pass null to clear. Keep it fast and non-blocking.
+  void setProgressCallback(void Function(int processed, int total)? callback) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_progress_callback')) return;
+    final fn = _lib.lookupFunction<
+        Void Function(Pointer<Void>, Pointer<NativeFunction<_ProgressCbNative>>,
+            Pointer<Void>),
+        void Function(Pointer<Void>, Pointer<NativeFunction<_ProgressCbNative>>,
+            Pointer<Void>)>(
+      'crispasr_session_set_progress_callback',
+    );
+    // Clear previous
+    if (callback == null) {
+      fn(_handle, nullptr, nullptr);
+      final prev = _callbackHolders.remove('progress');
+      prev?.close();
+      return;
+    }
+    late NativeCallable<_ProgressCbNative> callable;
+    callable = NativeCallable<_ProgressCbNative>.isolateLocal(
+      (int processed, int total, Pointer<Void> _) {
+        if (_callbackError != null) return;
+        if (_insideCallback) {
+          _callbackError =
+              StateError('do not re-enter the session from its callback');
+          _callbackStack = StackTrace.current;
+          return;
+        }
+        _insideCallback = true;
+        try {
+          callback(processed, total);
+        } catch (e, st) {
+          _callbackError = e;
+          _callbackStack = st;
+        } finally {
+          _insideCallback = false;
+        }
+      },
+    );
+    _callbackHolders['progress']?.close();
+    _callbackHolders['progress'] = callable;
+    fn(_handle, callable.nativeFunction, nullptr);
+  }
+
+  /// Register a per-segment streaming callback. Fired each time a new segment is
+  /// committed during transcription. Text and timing are passed directly - copy if needed.
+  void setSegmentCallback(
+      void Function(String text, double start, double end, int index)?
+          callback) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_segment_callback')) return;
+    final fn = _lib.lookupFunction<
+        Void Function(Pointer<Void>, Pointer<NativeFunction<_SegmentCbNative>>,
+            Pointer<Void>),
+        void Function(Pointer<Void>, Pointer<NativeFunction<_SegmentCbNative>>,
+            Pointer<Void>)>(
+      'crispasr_session_set_segment_callback',
+    );
+    if (callback == null) {
+      fn(_handle, nullptr, nullptr);
+      _callbackHolders.remove('segment')?.close();
+      return;
+    }
+    late NativeCallable<_SegmentCbNative> callable;
+    callable = NativeCallable<_SegmentCbNative>.isolateLocal(
+      (Pointer<Utf8> txt, int t0cs, int t1cs, int idx, Pointer<Void> _) {
+        if (_callbackError != null) return;
+        if (_insideCallback) {
+          _callbackError =
+              StateError('do not re-enter the session from its callback');
+          _callbackStack = StackTrace.current;
+          return;
+        }
+        _insideCallback = true;
+        try {
+          final text = txt == nullptr ? '' : txt.toDartString();
+          callback(text, t0cs / 100.0, t1cs / 100.0, idx);
+        } catch (e, st) {
+          _callbackError = e;
+          _callbackStack = st;
+        } finally {
+          _insideCallback = false;
+        }
+      },
+    );
+    _callbackHolders['segment']?.close();
+    _callbackHolders['segment'] = callable;
+    fn(_handle, callable.nativeFunction, nullptr);
+  }
+
+  /// Register a per-token streaming callback. Fired per decoded BPE piece. Lossless raw bytes.
+  void setTokenCallback(
+      void Function(Uint8List rawBytes, String text, int index)? callback) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_token_callback')) return;
+    final fn = _lib.lookupFunction<
+        Void Function(Pointer<Void>, Pointer<NativeFunction<_TokenCbNative>>,
+            Pointer<Void>),
+        void Function(Pointer<Void>, Pointer<NativeFunction<_TokenCbNative>>,
+            Pointer<Void>)>(
+      'crispasr_session_set_token_callback',
+    );
+    if (callback == null) {
+      fn(_handle, nullptr, nullptr);
+      _callbackHolders.remove('token')?.close();
+      return;
+    }
+    late NativeCallable<_TokenCbNative> callable;
+    callable = NativeCallable<_TokenCbNative>.isolateLocal(
+      (Pointer<Utf8> txt, int idx, Pointer<Void> _) {
+        if (_callbackError != null) return;
+        if (_insideCallback) {
+          _callbackError =
+              StateError('do not re-enter the session from its callback');
+          _callbackStack = StackTrace.current;
+          return;
+        }
+        _insideCallback = true;
+        try {
+          final raw = _copyCStringBytes(txt);
+          final text =
+              raw.isEmpty ? '' : utf8.decode(raw, allowMalformed: true);
+          callback(raw, text, idx);
+        } catch (e, st) {
+          _callbackError = e;
+          _callbackStack = st;
+        } finally {
+          _insideCallback = false;
+        }
+      },
+    );
+    _callbackHolders['token']?.close();
+    _callbackHolders['token'] = callable;
+    fn(_handle, callable.nativeFunction, nullptr);
+  }
+
+  /// Raise any exception saved from a synchronous callback after native returns.
+  void raiseCallbackError() => _rethrowCallbackError();
+
   void close() {
+    if (_insideCallback) {
+      throw StateError('do not close CrispasrSession from its callback');
+    }
     if (_closed) return;
+    for (final stream in _streams.toList()) {
+      stream.close();
+    }
     _closed = true;
+    // Clear callbacks and close their NativeCallables before freeing session
+    for (final h in _callbackHolders.values) {
+      try {
+        h.close();
+      } catch (_) {}
+    }
+    _callbackHolders.clear();
     final closeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
         void Function(Pointer<Void>)>(
       'crispasr_session_close',
     );
-    closeFn(_handle);
-    _handle = nullptr;
+    closeFn(_nativeHandle);
+    _nativeHandle = nullptr;
   }
 }
 
@@ -4173,39 +6585,53 @@ class CrispasrTitaNet {
 
   /// Extract 192-d speaker embedding from 16 kHz mono float32 PCM.
   Float32List embed(Float32List pcm16k) {
-    final embedFn = _lib.lookupFunction<
+    if (_handle == nullptr) throw StateError('TitaNet context is closed');
+    if (pcm16k.isEmpty) throw ArgumentError('Nonempty PCM required');
+    final fn = _lib.lookupFunction<
         Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Pointer<Float>),
         int Function(Pointer<Void>, Pointer<Float>, int,
             Pointer<Float>)>('crispasr_titanet_embed');
     final pcmPtr = malloc<Float>(pcm16k.length);
-    pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
-    final outPtr = malloc<Float>(192);
-    final dim = embedFn(_handle, pcmPtr, pcm16k.length, outPtr);
-    malloc.free(pcmPtr);
-    if (dim <= 0) {
-      malloc.free(outPtr);
-      throw Exception('TitaNet embedding failed');
+    try {
+      pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
+      final output = malloc<Float>(192);
+      try {
+        final dim = fn(_handle, pcmPtr, pcm16k.length, output);
+        if (dim != 192) {
+          throw StateError('TitaNet must return 192 floats (got $dim)');
+        }
+        return Float32List.fromList(output.asTypedList(192));
+      } finally {
+        malloc.free(output);
+      }
+    } finally {
+      malloc.free(pcmPtr);
     }
-    final result = Float32List.fromList(outPtr.asTypedList(dim));
-    malloc.free(outPtr);
-    return result;
   }
 
-  /// Cosine similarity between two embeddings.
+  /// Dot product for embeddings normalized to unit L2 length by TitaNet.
   static double cosineSim(DynamicLibrary lib, Float32List a, Float32List b) {
+    if (a.length != b.length) {
+      throw ArgumentError('Embedding dimensions must match');
+    }
+    if (a.isEmpty) return 0;
     final fn = lib.lookupFunction<
         Float Function(Pointer<Float>, Pointer<Float>, Int32),
         double Function(Pointer<Float>, Pointer<Float>,
             int)>('crispasr_titanet_cosine_sim');
-    final dim = a.length < b.length ? a.length : b.length;
-    final aPtr = malloc<Float>(dim);
-    aPtr.asTypedList(dim).setAll(0, a.sublist(0, dim));
-    final bPtr = malloc<Float>(dim);
-    bPtr.asTypedList(dim).setAll(0, b.sublist(0, dim));
-    final sim = fn(aPtr, bPtr, dim);
-    malloc.free(aPtr);
-    malloc.free(bPtr);
-    return sim;
+    final ap = malloc<Float>(a.length);
+    try {
+      ap.asTypedList(a.length).setAll(0, a);
+      final bp = malloc<Float>(b.length);
+      try {
+        bp.asTypedList(b.length).setAll(0, b);
+        return fn(ap, bp, a.length);
+      } finally {
+        malloc.free(bp);
+      }
+    } finally {
+      malloc.free(ap);
+    }
   }
 
   void close() {
@@ -4217,70 +6643,112 @@ class CrispasrTitaNet {
   }
 }
 
-/// File-based speaker profile database.
+/// File-based speaker profile database (closed-roster, consent-gated —
+/// issue #266). Matching is a claimed-participant confirmation, never an
+/// open 1:N search: [expectedNames] is the comma-separated list of
+/// enrolled participants you assert are present (e.g. "Alice,Bob"), and
+/// [consentAttested] affirms a lawful basis + explicit consent from every
+/// enrolled person (GDPR Art. 9). Construction throws without consent.
 class CrispasrSpeakerDB {
   late final DynamicLibrary _lib;
   Pointer<Void> _handle = nullptr;
   final String dirPath;
 
-  CrispasrSpeakerDB(DynamicLibrary lib, this.dirPath) : _lib = lib {
-    final loadFn = lib.lookupFunction<Pointer<Void> Function(Pointer<Utf8>),
-        Pointer<Void> Function(Pointer<Utf8>)>('crispasr_speaker_db_load');
-    final dp = dirPath.toNativeUtf8();
-    _handle = loadFn(dp);
-    malloc.free(dp);
+  CrispasrSpeakerDB(DynamicLibrary lib, this.dirPath,
+      {required String expectedNames, required bool consentAttested})
+      : _lib = lib {
+    if (!consentAttested) {
+      throw StateError('Speaker DB requires an explicit consent attestation');
+    }
+    if (expectedNames.trim().isEmpty) {
+      throw ArgumentError('Participant roster required');
+    }
+    final arena = Arena();
+    try {
+      final fn = _lib.lookupFunction<
+          Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>, Int32),
+          Pointer<Void> Function(
+              Pointer<Utf8>, Pointer<Utf8>, int)>('crispasr_speaker_db_open');
+      _handle = fn(dirPath.toNativeUtf8(allocator: arena),
+          expectedNames.toNativeUtf8(allocator: arena), 1);
+      if (_handle == nullptr) throw StateError('speaker_db_open failed');
+    } finally {
+      arena.releaseAll();
+    }
+  }
+  void _checkOpen() {
+    if (_handle == nullptr) throw StateError('Speaker DB is closed');
   }
 
   int get count {
-    final countFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
-        int Function(Pointer<Void>)>('crispasr_speaker_db_count');
-    return countFn(_handle);
+    _checkOpen();
+    return _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_speaker_db_count')(_handle);
   }
 
-  /// Match embedding against DB. Returns (name, score) or (null, score).
+  /// A negative native score always means no match.
   (String?, double) match(Float32List embedding, {double threshold = 0.7}) {
-    final matchFn = _lib.lookupFunction<
-        Float Function(
-            Pointer<Void>, Pointer<Float>, Int32, Float, Pointer<Utf8>, Int32),
-        double Function(Pointer<Void>, Pointer<Float>, int, double,
-            Pointer<Utf8>, int)>('crispasr_speaker_db_match');
-    final embPtr = malloc<Float>(embedding.length);
-    embPtr.asTypedList(embedding.length).setAll(0, embedding);
-    final nameBuf = malloc<Uint8>(256);
-    final score = matchFn(
-        _handle, embPtr, embedding.length, threshold, nameBuf.cast(), 256);
-    malloc.free(embPtr);
-    String? name;
-    if (score >= threshold) {
-      name = nameBuf.cast<Utf8>().toDartString();
+    _checkOpen();
+    if (embedding.isEmpty || !threshold.isFinite) {
+      throw ArgumentError('Nonempty embedding and finite threshold required');
     }
-    malloc.free(nameBuf);
-    return (name, score);
+    final arena = Arena();
+    try {
+      final pcm = arena<Float>(embedding.length)
+        ..asTypedList(embedding.length).setAll(0, embedding);
+      final name = arena<Uint8>(256).cast<Utf8>();
+      final fn = _lib.lookupFunction<
+          Float Function(Pointer<Void>, Pointer<Float>, Int32, Float,
+              Pointer<Utf8>, Int32),
+          double Function(Pointer<Void>, Pointer<Float>, int, double,
+              Pointer<Utf8>, int)>('crispasr_speaker_db_match');
+      final score = fn(_handle, pcm, embedding.length, threshold, name, 256);
+      return (
+        score >= 0 && score >= threshold ? name.toDartString() : null,
+        score
+      );
+    } finally {
+      arena.releaseAll();
+    }
   }
 
-  /// Enroll a speaker with the given name and embedding.
+  /// Writes a consent-attested profile. Older libraries need a reopen to refresh the roster.
   bool enroll(String name, Float32List embedding) {
-    final enrollFn = _lib.lookupFunction<
-        Int32 Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, Int32),
-        int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>,
-            int)>('crispasr_speaker_db_enroll');
-    final dp = dirPath.toNativeUtf8();
-    final np = name.toNativeUtf8();
-    final embPtr = malloc<Float>(embedding.length);
-    embPtr.asTypedList(embedding.length).setAll(0, embedding);
-    final rc = enrollFn(dp, np, embPtr, embedding.length);
-    malloc.free(dp);
-    malloc.free(np);
-    malloc.free(embPtr);
-    return rc == 0;
+    _checkOpen();
+    if (embedding.isEmpty) throw ArgumentError('Nonempty embedding required');
+    final arena = Arena();
+    try {
+      final pcm = arena<Float>(embedding.length)
+        ..asTypedList(embedding.length).setAll(0, embedding);
+      final np = name.toNativeUtf8(allocator: arena);
+      if (_lib.providesSymbol('crispasr_speaker_db_enroll_into')) {
+        final fn = _lib.lookupFunction<
+            Int32 Function(
+                Pointer<Void>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
+            int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Float>, int,
+                int)>('crispasr_speaker_db_enroll_into');
+        final rc = fn(_handle, np, pcm, embedding.length, 1);
+        return rc == 0 || rc == 3;
+      }
+      final fn = _lib.lookupFunction<
+          Int32 Function(
+              Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
+          int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, int,
+              int)>('crispasr_speaker_db_enroll2');
+      return fn(dirPath.toNativeUtf8(allocator: arena), np, pcm,
+              embedding.length, 1) ==
+          0;
+    } finally {
+      arena.releaseAll();
+    }
   }
 
   void close() {
-    if (_handle == nullptr) return;
-    final freeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
-        void Function(Pointer<Void>)>('crispasr_speaker_db_free');
-    freeFn(_handle);
-    _handle = nullptr;
+    if (_handle != nullptr) {
+      _lib.lookupFunction<Void Function(Pointer<Void>),
+          void Function(Pointer<Void>)>('crispasr_speaker_db_free')(_handle);
+      _handle = nullptr;
+    }
   }
 }
 
@@ -4291,6 +6759,31 @@ class CrispasrSpeakerDB {
 // --diarize-embedder path uses.
 // =====================================================================
 
+int _speakerInt32(int value, String name) {
+  if (value < -0x80000000 || value > 0x7fffffff) {
+    throw ArgumentError.value(value, name, 'Must fit a signed 32-bit integer');
+  }
+  return value;
+}
+
+String _speakerText(String value, String name) {
+  if (value.contains('\u0000')) {
+    throw ArgumentError.value(value, name, 'Must not contain NUL');
+  }
+  return value;
+}
+
+int _speakerCs(double value, String name) {
+  final scaled = value * 100;
+  if (!scaled.isFinite ||
+      scaled < -9223372036854775808.0 ||
+      scaled >= 9223372036854775808.0) {
+    throw ArgumentError.value(
+        value, name, 'Must be finite centiseconds within int64');
+  }
+  return scaled.round();
+}
+
 /// Pluggable speaker-embedding model. Dispatch:
 ///   - `auto` / `titanet`           -> TitaNet-Large (192-d)
 ///   - `indextts` / `indextts-bigvgan` / `ecapa`
@@ -4298,167 +6791,199 @@ class CrispasrSpeakerDB {
 ///   - any `.gguf` path             -> TitaNet (default; IndexTTS if the
 ///                                     path contains "indextts")
 class CrispasrSpeakerEmbedder {
-  late final DynamicLibrary _lib;
+  final DynamicLibrary _lib;
   Pointer<Void> _handle = nullptr;
 
   CrispasrSpeakerEmbedder(DynamicLibrary lib, String modelSpec,
       {int nThreads = 4, String cacheDir = ''})
       : _lib = lib {
+    _speakerText(modelSpec, 'modelSpec');
+    _speakerText(cacheDir, 'cacheDir');
+    _speakerInt32(nThreads, 'nThreads');
     final makeFn = lib.lookupFunction<
         Pointer<Void> Function(Pointer<Utf8>, Int32, Pointer<Utf8>),
         Pointer<Void> Function(Pointer<Utf8>, int,
             Pointer<Utf8>)>('crispasr_speaker_embedder_make_abi');
-    final specPtr = modelSpec.toNativeUtf8();
-    final cachePtr = cacheDir.toNativeUtf8();
-    _handle = makeFn(specPtr, nThreads, cachePtr);
-    malloc.free(specPtr);
-    malloc.free(cachePtr);
+    _handle = using((arena) => makeFn(modelSpec.toNativeUtf8(allocator: arena),
+        nThreads, cacheDir.toNativeUtf8(allocator: arena)));
     if (_handle == nullptr) {
       throw Exception('Failed to build speaker embedder: $modelSpec');
     }
   }
 
+  Pointer<Void> get _checked {
+    if (_handle == nullptr) {
+      throw StateError('Speaker embedder is closed');
+    }
+    return _handle;
+  }
+
   int get dim {
-    final dimFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
         int Function(Pointer<Void>)>('crispasr_speaker_embedder_dim_abi');
-    return dimFn(_handle);
+    return fn(_checked);
   }
 
   String get name {
-    final nameFn = _lib.lookupFunction<
+    final fn = _lib.lookupFunction<
         Pointer<Utf8> Function(Pointer<Void>),
         Pointer<Utf8> Function(
             Pointer<Void>)>('crispasr_speaker_embedder_name_abi');
-    final p = nameFn(_handle);
+    final p = fn(_checked);
     return p == nullptr ? '' : p.toDartString();
   }
 
-  /// Extract one embedding from mono 16 kHz float32 PCM. Returns null
-  /// when the underlying model rejected the input.
+  /// Extract an owned embedding from mono 16 kHz float32 PCM.
   Float32List? embed(Float32List pcm16k) {
-    final embedFn = _lib.lookupFunction<
+    final handle = _checked;
+    _speakerInt32(pcm16k.length, 'PCM length');
+    final d = dim;
+    if (d <= 0 || pcm16k.isEmpty) return null;
+    final fn = _lib.lookupFunction<
         Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Pointer<Float>),
         int Function(Pointer<Void>, Pointer<Float>, int,
             Pointer<Float>)>('crispasr_speaker_embedder_embed_abi');
-    final d = dim;
-    if (d <= 0) return null;
-    final pcmPtr = malloc<Float>(pcm16k.length);
-    pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
-    final outPtr = malloc<Float>(d);
-    final ok = embedFn(_handle, pcmPtr, pcm16k.length, outPtr);
-    malloc.free(pcmPtr);
-    if (ok == 0) {
-      malloc.free(outPtr);
-      return null;
-    }
-    final result = Float32List.fromList(outPtr.asTypedList(d));
-    malloc.free(outPtr);
-    return result;
+    return using((arena) {
+      final pcm = arena<Float>(pcm16k.length);
+      pcm.asTypedList(pcm16k.length).setAll(0, pcm16k);
+      final out = arena<Float>(d);
+      final rc = fn(handle, pcm, pcm16k.length, out);
+      return rc == 1 ? Float32List.fromList(out.asTypedList(d)) : null;
+    });
   }
 
   void close() {
     if (_handle == nullptr) return;
-    final freeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
+    final fn = _lib.lookupFunction<Void Function(Pointer<Void>),
         void Function(Pointer<Void>)>('crispasr_speaker_embedder_free_abi');
-    freeFn(_handle);
+    fn(_handle);
     _handle = nullptr;
   }
 }
 
-/// Agglomerative single-linkage cosine clustering on (ideally
-/// L2-normalized) speaker embeddings. `embeddings` is a flat row-major
-/// `n × dim` buffer; returns one cluster ID per input in `[0, k)`.
+/// Agglomerative cosine clustering. Returns owned labels; zero clusters means
+/// every input is unassigned (-1). Invalid shapes/results raise an exception.
 List<int> crispasrAgglomerativeCluster(
-  DynamicLibrary lib,
-  Float32List embeddings, {
-  required int n,
-  required int dim,
-  double mergeThreshold = 0.5,
-  int maxSpeakers = 32,
-}) {
-  if (n <= 0 || dim <= 0 || embeddings.length < n * dim) {
-    return List<int>.filled(n.clamp(0, 1 << 30), -1);
+    DynamicLibrary lib, Float32List embeddings,
+    {required int n,
+    required int dim,
+    double mergeThreshold = 0.5,
+    int maxSpeakers = 32}) {
+  _speakerInt32(n, 'n');
+  _speakerInt32(dim, 'dim');
+  _speakerInt32(maxSpeakers, 'maxSpeakers');
+  if (n < 0 ||
+      dim <= 0 ||
+      n > 0x7fffffff ~/ dim ||
+      embeddings.length ~/ dim < n ||
+      !mergeThreshold.isFinite ||
+      mergeThreshold.abs() > 3.4028234663852886e38) {
+    throw ArgumentError('Invalid clustering shape or threshold');
   }
+  if (n == 0) return [];
   final fn = lib.lookupFunction<
       Int32 Function(
           Pointer<Float>, Int32, Int32, Float, Int32, Pointer<Int32>),
       int Function(Pointer<Float>, int, int, double, int,
           Pointer<Int32>)>('crispasr_speaker_cluster_abi');
-  final embPtr = malloc<Float>(embeddings.length);
-  embPtr.asTypedList(embeddings.length).setAll(0, embeddings);
-  final outPtr = malloc<Int32>(n);
-  final rc = fn(embPtr, n, dim, mergeThreshold, maxSpeakers, outPtr);
-  final labels = List<int>.from(outPtr.asTypedList(n));
-  malloc.free(embPtr);
-  malloc.free(outPtr);
-  if (rc < 0) {
-    throw Exception('crispasr_speaker_cluster_abi: invalid arguments');
-  }
-  return labels;
+  return using((arena) {
+    final values = n * dim;
+    final input = arena<Float>(values);
+    input.asTypedList(values).setRange(0, values, embeddings);
+    final output = arena<Int32>(n);
+    final count = fn(input, n, dim, mergeThreshold, maxSpeakers, output);
+    if (count < 0 || count > n) {
+      throw Exception('Invalid native speaker cluster count: $count');
+    }
+    final labels = List<int>.from(output.asTypedList(n));
+    if (labels.any(
+        (label) => count == 0 ? label != -1 : label < 0 || label >= count)) {
+      throw Exception('Invalid native speaker cluster labels');
+    }
+    return labels;
+  });
 }
 
-/// Pre-computed pyannote-seg posteriors over a full audio buffer.
+/// Pre-computed pyannote-seg posteriors over a mono 16 kHz audio buffer.
 class CrispasrPyannoteCache {
-  late final DynamicLibrary _lib;
+  final DynamicLibrary _lib;
   Pointer<Void> _handle = nullptr;
 
   CrispasrPyannoteCache(
       DynamicLibrary lib, Float32List pcm16k, String modelPath,
       {int nThreads = 4})
       : _lib = lib {
-    final computeFn = lib.lookupFunction<
+    _speakerText(modelPath, 'modelPath');
+    _speakerInt32(nThreads, 'nThreads');
+    _speakerInt32(pcm16k.length, 'PCM length');
+    if (pcm16k.isEmpty) throw ArgumentError('PCM must not be empty');
+    final fn = lib.lookupFunction<
         Pointer<Void> Function(Pointer<Float>, Int32, Pointer<Utf8>, Int32),
         Pointer<Void> Function(Pointer<Float>, int, Pointer<Utf8>,
             int)>('crispasr_pyannote_cache_compute_abi');
-    final pcmPtr = malloc<Float>(pcm16k.length);
-    pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
-    final mp = modelPath.toNativeUtf8();
-    _handle = computeFn(pcmPtr, pcm16k.length, mp, nThreads);
-    malloc.free(pcmPtr);
-    malloc.free(mp);
+    _handle = using((arena) {
+      final pcm = arena<Float>(pcm16k.length);
+      pcm.asTypedList(pcm16k.length).setAll(0, pcm16k);
+      return fn(pcm, pcm16k.length, modelPath.toNativeUtf8(allocator: arena),
+          nThreads);
+    });
     if (_handle == nullptr) {
       throw Exception('Failed to compute pyannote cache from $modelPath');
     }
   }
 
-  /// Score `segs` against the cached posteriors. Each segment's
-  /// `speaker` is set to 0/1/2 or -1 for silence.
+  Pointer<Void> get _checked {
+    if (_handle == nullptr) throw StateError('Pyannote cache is closed');
+    return _handle;
+  }
+
+  /// Score segments; native failure leaves the caller's segments unchanged.
   void apply(List<DiarizeSegment> segs, {double sliceT0 = 0.0}) {
+    _checked;
+    final offset = _speakerCs(sliceT0, 'sliceT0');
+    _speakerInt32(segs.length, 'Segment count');
     if (segs.isEmpty) return;
-    // ABI segment layout: t0_cs i64, t1_cs i64, speaker i32, _pad i32.
-    final segPtr = malloc<Uint8>(segs.length * 24);
-    final segBytes = segPtr.asTypedList(segs.length * 24);
-    final bd = segBytes.buffer.asByteData();
-    for (var i = 0; i < segs.length; i++) {
-      bd.setInt64(i * 24, (segs[i].t0 * 100).round(), Endian.host);
-      bd.setInt64(i * 24 + 8, (segs[i].t1 * 100).round(), Endian.host);
-      bd.setInt32(i * 24 + 16, segs[i].speaker, Endian.host);
-      bd.setInt32(i * 24 + 20, 0, Endian.host);
-    }
-    final applyFn = _lib.lookupFunction<
-        Int32 Function(Pointer<Void>, Int64, Pointer<Uint8>, Int32),
-        int Function(Pointer<Void>, int, Pointer<Uint8>,
-            int)>('crispasr_pyannote_cache_apply_abi');
-    final rc = applyFn(_handle, (sliceT0 * 100).round(), segPtr, segs.length);
-    if (rc != 0) {
-      malloc.free(segPtr);
-      throw Exception('crispasr_pyannote_cache_apply_abi returned $rc');
-    }
-    for (var i = 0; i < segs.length; i++) {
-      segs[i] = DiarizeSegment(
-        t0: segs[i].t0,
-        t1: segs[i].t1,
-        speaker: bd.getInt32(i * 24 + 16, Endian.host),
-      );
-    }
-    malloc.free(segPtr);
+    final input = List<DiarizeSegment>.of(segs);
+    using((arena) {
+      final ptr = arena<Uint8>(input.length * 24);
+      final bytes = ptr.asTypedList(input.length * 24).buffer.asByteData();
+      for (var i = 0; i < input.length; i++) {
+        final start = _speakerCs(input[i].t0, 't0');
+        final end = _speakerCs(input[i].t1, 't1');
+        if (start < 0 || end < start) {
+          throw ArgumentError('Invalid segment bounds');
+        }
+        bytes.setInt64(i * 24, start, Endian.host);
+        bytes.setInt64(i * 24 + 8, end, Endian.host);
+        bytes.setInt32(i * 24 + 16, _speakerInt32(input[i].speaker, 'speaker'),
+            Endian.host);
+        bytes.setInt32(i * 24 + 20, 0, Endian.host);
+      }
+      final fn = _lib.lookupFunction<
+          Int32 Function(Pointer<Void>, Int64, Pointer<Uint8>, Int32),
+          int Function(Pointer<Void>, int, Pointer<Uint8>,
+              int)>('crispasr_pyannote_cache_apply_abi');
+      final rc = fn(_checked, offset, ptr, input.length);
+      if (rc != 0) {
+        throw Exception('crispasr_pyannote_cache_apply_abi returned $rc');
+      }
+      final updated = List<DiarizeSegment>.generate(
+          input.length,
+          (i) => DiarizeSegment(
+              t0: input[i].t0,
+              t1: input[i].t1,
+              speaker: bytes.getInt32(i * 24 + 16, Endian.host)));
+      for (var i = 0; i < updated.length; i++) {
+        segs[i] = updated[i];
+      }
+    });
   }
 
   void close() {
     if (_handle == nullptr) return;
-    final freeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
+    final fn = _lib.lookupFunction<Void Function(Pointer<Void>),
         void Function(Pointer<Void>)>('crispasr_pyannote_cache_free_abi');
-    freeFn(_handle);
+    fn(_handle);
     _handle = nullptr;
   }
 }
@@ -4474,17 +6999,22 @@ class ParakeetResult {
 
   ParakeetResult._(this._lib, this._handle);
 
+  Pointer<Void> get _checked {
+    if (_handle == nullptr) throw StateError("Parakeet result freed");
+    return _handle;
+  }
+
   String get text {
     final fn = _lib.lookupFunction<Pointer<Utf8> Function(Pointer<Void>),
         Pointer<Utf8> Function(Pointer<Void>)>('crispasr_parakeet_result_text');
-    final p = fn(_handle);
-    return p == nullptr ? '' : p.toDartString();
+    final p = fn(_checked);
+    return p == nullptr ? '' : _decodeCString(p, allowMalformed: true);
   }
 
   int get nWords {
     final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
         int Function(Pointer<Void>)>('crispasr_parakeet_result_n_words');
-    return fn(_handle);
+    return fn(_checked);
   }
 
   String wordText(int i) {
@@ -4492,26 +7022,26 @@ class ParakeetResult {
         Pointer<Utf8> Function(Pointer<Void>, Int32),
         Pointer<Utf8> Function(
             Pointer<Void>, int)>('crispasr_parakeet_result_word_text');
-    final p = fn(_handle, i);
-    return p == nullptr ? '' : p.toDartString();
+    final p = fn(_checked, i);
+    return p == nullptr ? '' : _decodeCString(p, allowMalformed: true);
   }
 
   int wordT0(int i) {
     final fn = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_parakeet_result_word_t0');
-    return fn(_handle, i);
+    return fn(_checked, i);
   }
 
   int wordT1(int i) {
     final fn = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_parakeet_result_word_t1');
-    return fn(_handle, i);
+    return fn(_checked, i);
   }
 
   int get nTokens {
     final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
         int Function(Pointer<Void>)>('crispasr_parakeet_result_n_tokens');
-    return fn(_handle);
+    return fn(_checked);
   }
 
   String tokenText(int i) {
@@ -4519,20 +7049,28 @@ class ParakeetResult {
         Pointer<Utf8> Function(Pointer<Void>, Int32),
         Pointer<Utf8> Function(
             Pointer<Void>, int)>('crispasr_parakeet_result_token_text');
-    final p = fn(_handle, i);
-    return p == nullptr ? '' : p.toDartString();
+    final p = fn(_checked, i);
+    return p == nullptr ? '' : _decodeCString(p, allowMalformed: true);
+  }
+
+  Uint8List tokenBytes(int i) {
+    final fn = _lib.lookupFunction<
+        Pointer<Utf8> Function(Pointer<Void>, Int32),
+        Pointer<Utf8> Function(
+            Pointer<Void>, int)>('crispasr_parakeet_result_token_text');
+    return _copyCStringBytes(fn(_checked, i));
   }
 
   int tokenT0(int i) {
     final fn = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_parakeet_result_token_t0');
-    return fn(_handle, i);
+    return fn(_checked, i);
   }
 
   int tokenT1(int i) {
     final fn = _lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_parakeet_result_token_t1');
-    return fn(_handle, i);
+    return fn(_checked, i);
   }
 
   double tokenP(int i) {
@@ -4540,14 +7078,14 @@ class ParakeetResult {
         Float Function(Pointer<Void>, Int32),
         double Function(
             Pointer<Void>, int)>('crispasr_parakeet_result_token_p');
-    return fn(_handle, i);
+    return fn(_checked, i);
   }
 
   void free() {
     if (_handle == nullptr) return;
     final fn = _lib.lookupFunction<Void Function(Pointer<Void>),
         void Function(Pointer<Void>)>('crispasr_parakeet_result_free');
-    fn(_handle);
+    fn(_checked);
     _handle = nullptr;
   }
 }
@@ -4575,24 +7113,26 @@ class CrispasrParakeet {
 
   /// Transcribe mono 16 kHz float32 PCM. The returned [ParakeetResult]
   /// must be freed by the caller via [ParakeetResult.free].
-  ParakeetResult transcribe(Float32List pcm16k, {String? language}) {
+  ParakeetResult transcribe(Float32List pcm16k,
+      {String? language, int offsetCs = 0}) {
+    if (_handle == nullptr) throw StateError('Parakeet context is closed');
+    if (pcm16k.isEmpty) throw ArgumentError('Nonempty PCM required');
+    if (language != null && language.isNotEmpty && language != 'en') {
+      throw ArgumentError(
+          'Legacy Parakeet has no language parameter; use a unified Session');
+    }
     final pcmPtr = malloc<Float>(pcm16k.length);
-    pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
-    final langPtr = language != null ? language.toNativeUtf8() : nullptr;
     try {
+      pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
       final fn = _lib.lookupFunction<
-          Pointer<Void> Function(
-              Pointer<Void>, Pointer<Float>, Int32, Pointer<Utf8>),
+          Pointer<Void> Function(Pointer<Void>, Pointer<Float>, Int32, Int64),
           Pointer<Void> Function(Pointer<Void>, Pointer<Float>, int,
-              Pointer<Utf8>)>('crispasr_parakeet_transcribe');
-      final res = fn(_handle, pcmPtr, pcm16k.length, langPtr.cast<Utf8>());
-      if (res == nullptr) {
-        throw Exception('crispasr_parakeet_transcribe returned null');
-      }
-      return ParakeetResult._(_lib, res);
+              int)>('crispasr_parakeet_transcribe');
+      final result = fn(_handle, pcmPtr, pcm16k.length, offsetCs);
+      if (result == nullptr) throw StateError('Parakeet transcription failed');
+      return ParakeetResult._(_lib, result);
     } finally {
       malloc.free(pcmPtr);
-      if (langPtr != nullptr) malloc.free(langPtr);
     }
   }
 
@@ -4797,12 +7337,19 @@ class CrispasrWatermark {
 
   /// Embed a watermark into float32 mono PCM (in-place).
   ///
-  /// [alpha] controls spread-spectrum strength (0.005 default); ignored
-  /// when AudioSeal is loaded.
+  /// [alpha] controls spread-spectrum strength; ignored when AudioSeal is
+  /// loaded. The default (`<= 0`) selects the band-limited strength that makes
+  /// the mark reliably *detectable* — the property EU AI Act Art. 50(2)
+  /// requires, and the reason this is the call `synthesizeRaw` callers use to
+  /// discharge marking themselves.
+  ///
+  /// This defaulted to `0.005`, which the C ABI documents as too faint to
+  /// reliably detect on real speech. An explicit positive alpha is used
+  /// verbatim and bypasses the robust default; only pass one to A/B strength.
   ///
   /// Returns a new [Float32List] with the watermark applied.
   static Float32List embed(Float32List pcm,
-      {double alpha = 0.005, DynamicLibrary? lib}) {
+      {double alpha = -1.0, DynamicLibrary? lib}) {
     lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
     final fn = lib.lookupFunction<Void Function(Pointer<Float>, Int32, Float),
         void Function(Pointer<Float>, int, double)>('crispasr_watermark_embed');
@@ -4828,6 +7375,141 @@ class CrispasrWatermark {
     final score = fn(ptr, pcm.length);
     malloc.free(ptr);
     return score;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// C2PA (Content Credentials) signing — EU AI Act Art. 50
+// ---------------------------------------------------------------------------
+
+/// Cryptographic C2PA signing for AI-generated audio.
+///
+/// Wraps the native `crispasr_c2pa_sign()` / `crispasr_pcm_to_wav()` C-ABI.
+/// The native layer uses ES256 (P-256 ECDSA) via the vendored c2pa-audio
+/// submodule — no external dependencies. When [certPath] and [keyPath] are
+/// omitted, a bundled self-signed certificate is used (CN = "CrispASR
+/// (AI-generated, self-signed)"). The self-signed cert is sufficient for
+/// machine-readable AI marking per EU AI Act Art. 50.
+class CrispasrC2pa {
+  CrispasrC2pa._();
+
+  /// Check whether the loaded dylib exports the C2PA signing symbols.
+  static bool isAvailable({DynamicLibrary? lib}) {
+    lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+    return lib.providesSymbol('crispasr_c2pa_sign') &&
+        lib.providesSymbol('crispasr_c2pa_free');
+  }
+
+  /// Sign an in-memory audio container (WAV, MP3, or M4A bytes) with a
+  /// C2PA manifest. Returns signed bytes, or `null` if signing fails or
+  /// the format is unsupported.
+  ///
+  /// [format] is a MIME type: `"audio/wav"`, `"audio/mpeg"`, `"audio/mp4"`.
+  /// [certPath] / [keyPath] are optional PEM file paths; when null the
+  /// bundled self-signed default cert is used.
+  static Uint8List? sign(
+    Uint8List data, {
+    required String format,
+    String? certPath,
+    String? keyPath,
+    DynamicLibrary? lib,
+  }) {
+    if ((certPath == null) != (keyPath == null)) {
+      throw ArgumentError('certificate and key must be paired');
+    }
+    lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+    if (!lib.providesSymbol('crispasr_c2pa_sign')) return null;
+
+    final signFn = lib.lookupFunction<
+        Pointer<Uint8> Function(Pointer<Uint8>, UintPtr, Pointer<Utf8>,
+            Pointer<Utf8>, Pointer<Utf8>, Pointer<UintPtr>),
+        Pointer<Uint8> Function(
+            Pointer<Uint8>,
+            int,
+            Pointer<Utf8>,
+            Pointer<Utf8>,
+            Pointer<Utf8>,
+            Pointer<UintPtr>)>('crispasr_c2pa_sign');
+
+    final freeFn = lib.lookupFunction<Void Function(Pointer<Uint8>),
+        void Function(Pointer<Uint8>)>('crispasr_c2pa_free');
+
+    final dataPtr = malloc<Uint8>(data.length);
+    dataPtr.asTypedList(data.length).setAll(0, data);
+
+    final fmtPtr = format.toNativeUtf8();
+    final certPtr = certPath != null ? certPath.toNativeUtf8() : nullptr;
+    final keyPtr = keyPath != null ? keyPath.toNativeUtf8() : nullptr;
+    final outLenPtr = malloc<UintPtr>();
+
+    final result = signFn(
+      dataPtr,
+      data.length,
+      fmtPtr.cast(),
+      certPtr.cast(),
+      keyPtr.cast(),
+      outLenPtr,
+    );
+
+    malloc.free(dataPtr);
+    malloc.free(fmtPtr);
+    if (certPtr != nullptr) malloc.free(certPtr);
+    if (keyPtr != nullptr) malloc.free(keyPtr);
+
+    if (result == nullptr) {
+      malloc.free(outLenPtr);
+      return null;
+    }
+
+    final outLen = outLenPtr.value;
+    malloc.free(outLenPtr);
+
+    try {
+      return Uint8List.fromList(result.asTypedList(outLen));
+    } finally {
+      freeFn(result);
+    }
+  }
+
+  /// Convert float32 mono PCM to a WAV file with AI-provenance LIST/INFO
+  /// metadata. The returned WAV can be fed to [sign] for full C2PA signing.
+  static Uint8List? pcmToWav(
+    Float32List pcm, {
+    int sampleRate = 24000,
+    DynamicLibrary? lib,
+  }) {
+    lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+    if (!lib.providesSymbol('crispasr_pcm_to_wav')) return null;
+
+    final fn = lib.lookupFunction<
+        Pointer<Uint8> Function(Pointer<Float>, Int32, Int32, Pointer<UintPtr>),
+        Pointer<Uint8> Function(
+            Pointer<Float>, int, int, Pointer<UintPtr>)>('crispasr_pcm_to_wav');
+
+    final freeFn = lib.lookupFunction<Void Function(Pointer<Uint8>),
+        void Function(Pointer<Uint8>)>('crispasr_c2pa_free');
+
+    final pcmPtr = malloc<Float>(pcm.length);
+    pcmPtr.asTypedList(pcm.length).setAll(0, pcm);
+    final outLenPtr = malloc<UintPtr>();
+
+    final result = fn(pcmPtr, pcm.length, sampleRate, outLenPtr);
+
+    malloc.free(pcmPtr);
+
+    if (result == nullptr) {
+      malloc.free(outLenPtr);
+      return null;
+    }
+
+    final outLen = outLenPtr.value;
+    malloc.free(outLenPtr);
+
+    try {
+      return Uint8List.fromList(result.asTypedList(outLen));
+    } finally {
+      freeFn(result);
+    }
   }
 }
 
@@ -4884,44 +7566,13 @@ List<SessionSegment> drainStreamedSegments({String? libPath}) {
   final res = drain();
   if (res == nullptr) return const [];
 
-  // Read segments using the same accessors as CrispasrSession._readSegments.
-  final nSegs = lib.lookupFunction<Int32 Function(Pointer<Void>),
-      int Function(Pointer<Void>)>('crispasr_session_result_n_segments')(res);
-  final segText = lib.lookupFunction<
-      Pointer<Utf8> Function(Pointer<Void>, Int32),
-      Pointer<Utf8> Function(Pointer<Void>, int)>(
-    'crispasr_session_result_segment_text',
-  );
-  final segT0 = lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
-      int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t0');
-  final segT1 = lib.lookupFunction<Int64 Function(Pointer<Void>, Int32),
-      int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t1');
-  // Per-segment no_speech_prob (Whisper); probe like elsewhere, -1.0 fallback.
-  final segNSPFn =
-      lib.providesSymbol('crispasr_session_result_segment_no_speech_prob')
-          ? lib.lookupFunction<
-              Float Function(Pointer<Void>, Int32),
-              double Function(Pointer<Void>,
-                  int)>('crispasr_session_result_segment_no_speech_prob')
-          : null;
-
-  final out = <SessionSegment>[];
-  for (var i = 0; i < nSegs; i++) {
-    final tp = segText(res, i);
-    final text = tp == nullptr ? '' : tp.toDartString();
-    final t0 = segT0(res, i) / 100.0;
-    final t1 = segT1(res, i) / 100.0;
-    final nsp = segNSPFn == null ? -1.0 : segNSPFn(res, i);
-    out.add(SessionSegment(
-        text: text.trim(), start: t0, end: t1, noSpeechProb: nsp));
-  }
-
-  // Free the result.
   final free = lib.lookupFunction<Void Function(Pointer<Void>),
       void Function(Pointer<Void>)>('crispasr_session_result_free');
-  free(res);
-
-  return out;
+  try {
+    return CrispasrSession._readSegments(lib, res);
+  } finally {
+    free(res);
+  }
 }
 
 /// Reset the streamed-segment buffer. Call before starting a new
@@ -4948,7 +7599,13 @@ int getStreamedTokenCount({String? libPath}) {
 }
 
 /// Drain all buffered streamed tokens. Returns a list of token strings.
-List<String> drainStreamedTokens({String? libPath}) {
+List<String> drainStreamedTokens({String? libPath}) =>
+    drainStreamedTokenBytes(libPath: libPath)
+        .map((bytes) => utf8.decode(bytes, allowMalformed: true))
+        .toList();
+
+/// Drain lossless UTF-8 token pieces. Concatenate before decoding split characters.
+List<Uint8List> drainStreamedTokenBytes({String? libPath}) {
   final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
   if (!lib.providesSymbol('crispasr_drain_streamed_tokens')) return const [];
   final countPtr = calloc<Int32>();
@@ -4958,21 +7615,16 @@ List<String> drainStreamedTokens({String? libPath}) {
         Pointer<Utf8> Function(
             Pointer<Int32>)>('crispasr_drain_streamed_tokens');
     final ptr = fn(countPtr);
-    if (ptr == nullptr) return const [];
-    final count = countPtr.value;
-    if (count <= 0) return const [];
-    // Parse null-separated strings
-    final bytes = ptr.cast<Uint8>();
-    final result = <String>[];
-    var start = 0;
-    for (var i = 0; result.length < count; i++) {
-      if (bytes[i] == 0) {
-        result.add(Pointer<Utf8>.fromAddress(ptr.address + start)
-            .toDartString(length: i - start));
-        start = i + 1;
-      }
+    if (ptr == nullptr || countPtr.value <= 0) return const [];
+    final out = <Uint8List>[];
+    var offset = 0;
+    for (var i = 0; i < countPtr.value; ++i) {
+      final bytes =
+          _copyCStringBytes((ptr.cast<Uint8>() + offset).cast<Utf8>());
+      out.add(bytes);
+      offset += bytes.length + 1;
     }
-    return result;
+    return out;
   } finally {
     calloc.free(countPtr);
   }
@@ -5064,19 +7716,17 @@ DecodedAudioStereo decodeAudioFileStereo(String path, {String? libPath}) {
     final n = nOut.value;
     final sr = srOut.value;
     final ch = chOut.value;
-    if (n <= 0) {
+    if (n <= 0 || leftOut.value == nullptr || rightOut.value == nullptr) {
       throw Exception('Stereo audio decoded to empty buffer: $path');
     }
 
     final leftPtr = leftOut.value;
     final leftCopy = Float32List(n);
     leftCopy.setAll(0, leftPtr.asTypedList(n));
-    free(leftPtr);
 
     final rightPtr = rightOut.value;
     final rightCopy = Float32List(n);
     rightCopy.setAll(0, rightPtr.asTypedList(n));
-    free(rightPtr);
 
     return DecodedAudioStereo(
       left: leftCopy,
@@ -5085,11 +7735,106 @@ DecodedAudioStereo decodeAudioFileStereo(String path, {String? libPath}) {
       sourceChannels: ch,
     );
   } finally {
+    final left = leftOut.value, right = rightOut.value;
+    if (left != nullptr) free(left);
+    if (right != nullptr && right != left) free(right);
     calloc.free(pathPtr);
     calloc.free(leftOut);
     calloc.free(rightOut);
     calloc.free(nOut);
     calloc.free(srOut);
     calloc.free(chOut);
+  }
+}
+
+/// Decode any audio file to [targetRate] mono float32 PCM (no down-then-up resample).
+/// Throws when the symbol is absent or decoding fails.
+DecodedAudio decodeAudioFileAtRate(String path, int targetRate,
+    {String? libPath}) {
+  if (targetRate <= 0 || targetRate > 384000) {
+    throw ArgumentError('targetRate must be in (0, 384000]');
+  }
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_audio_load_at_rate')) {
+    throw UnsupportedError(
+        'crispasr_audio_load_at_rate not in this libcrispasr');
+  }
+  final fn = lib.lookupFunction<
+      Int32 Function(Pointer<Utf8>, Int32, Pointer<Pointer<Float>>,
+          Pointer<Int32>, Pointer<Int32>),
+      int Function(Pointer<Utf8>, int, Pointer<Pointer<Float>>, Pointer<Int32>,
+          Pointer<Int32>)>(
+    'crispasr_audio_load_at_rate',
+  );
+  final free = lib.lookupFunction<Void Function(Pointer<Float>),
+      void Function(Pointer<Float>)>('crispasr_audio_free');
+  final pathPtr = path.toNativeUtf8();
+  final pcmOut = calloc<Pointer<Float>>();
+  final nOut = calloc<Int32>();
+  final srOut = calloc<Int32>();
+  try {
+    final rc = fn(pathPtr, targetRate, pcmOut, nOut, srOut);
+    if (rc != 0) {
+      throw Exception(
+          'crispasr_audio_load_at_rate failed (code $rc) for $path');
+    }
+    final ptr = pcmOut.value;
+    final n = nOut.value;
+    final sr = srOut.value;
+    if (ptr == nullptr || n <= 0) {
+      throw Exception('Audio decoded to empty buffer: $path');
+    }
+    final copy = Float32List(n);
+    copy.setAll(0, ptr.asTypedList(n));
+    return DecodedAudio(samples: copy, sampleRate: sr > 0 ? sr : targetRate);
+  } finally {
+    if (pcmOut.value != nullptr) free(pcmOut.value);
+    calloc.free(pathPtr);
+    calloc.free(pcmOut);
+    calloc.free(nOut);
+    calloc.free(srOut);
+  }
+}
+
+/// Resample mono float PCM in memory with the CLI's Kaiser polyphase filter.
+/// Returns ceil(n * targetRate / sourceRate) samples. Throws on bad args.
+Float32List audioResample(Float32List pcm, int sourceRate, int targetRate,
+    {String? libPath}) {
+  if (sourceRate <= 0 || targetRate <= 0) {
+    throw ArgumentError('rates must be positive');
+  }
+  if (pcm.isEmpty) return Float32List(0);
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_audio_resample')) {
+    throw UnsupportedError('crispasr_audio_resample not in this libcrispasr');
+  }
+  final fn = lib.lookupFunction<
+      Int32 Function(Pointer<Float>, Int32, Int32, Int32,
+          Pointer<Pointer<Float>>, Pointer<Int32>),
+      int Function(Pointer<Float>, int, int, int, Pointer<Pointer<Float>>,
+          Pointer<Int32>)>(
+    'crispasr_audio_resample',
+  );
+  final free = lib.lookupFunction<Void Function(Pointer<Float>),
+      void Function(Pointer<Float>)>('crispasr_audio_free');
+  final inPtr = calloc<Float>(pcm.length);
+  inPtr.asTypedList(pcm.length).setAll(0, pcm);
+  final outPtr = calloc<Pointer<Float>>();
+  final nOut = calloc<Int32>();
+  try {
+    final rc = fn(inPtr, pcm.length, sourceRate, targetRate, outPtr, nOut);
+    if (rc != 0) throw Exception('crispasr_audio_resample failed (rc=$rc)');
+    final p = outPtr.value;
+    final n = nOut.value;
+    if (n == 0) return Float32List(0);
+    if (p == nullptr) throw Exception('resample returned null with n=$n');
+    final copy = Float32List(n);
+    copy.setAll(0, p.asTypedList(n));
+    return copy;
+  } finally {
+    if (outPtr.value != nullptr) free(outPtr.value);
+    calloc.free(inPtr);
+    calloc.free(outPtr);
+    calloc.free(nOut);
   }
 }

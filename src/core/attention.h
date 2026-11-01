@@ -76,7 +76,31 @@ inline ggml_type kv_dtype_parse(const char* s, const char* backend_tag, const ch
         return GGML_TYPE_Q8_0;
     if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "Q4_0") == 0)
         return GGML_TYPE_Q4_0;
-    std::fprintf(stderr, "%s: %s='%s' unrecognised, defaulting to f16\n", backend_tag, env_name, s);
+    // q4_1 / q5_0 / q5_1 are block-32 like q4_0 and q8_0, and every backend
+    // that matters implements both halves of the cache round-trip for them:
+    // `ggml_set_rows` F32->X (CPU via from_float, Metal via kernel_set_rows_q32)
+    // and `ggml_cpy` X->F32 for the dequant-on-read. Accepting them is not a
+    // new code path, only a wider parse.
+    //
+    // They used to fall through to the warning below and be silently served as
+    // F16. That is worse than it sounds: it makes a narrowing table LIE. An
+    // ark-asr empty-transcript hunt was narrowed as "q4_1/q5_0/q5_1 all fine,
+    // only q8_0 empty", which reads like a q8_0-specific defect — but those
+    // three arms were never quantised at all, so the only real comparison was
+    // q4_0 against q8_0. (The true cause was neither: the ark prompt was
+    // missing upstream's instruction text. See PLAN.md.) A knob that quietly
+    // does something else turns a measurement into a guess.
+    if (std::strcmp(s, "q4_1") == 0 || std::strcmp(s, "Q4_1") == 0)
+        return GGML_TYPE_Q4_1;
+    if (std::strcmp(s, "q5_0") == 0 || std::strcmp(s, "Q5_0") == 0)
+        return GGML_TYPE_Q5_0;
+    if (std::strcmp(s, "q5_1") == 0 || std::strcmp(s, "Q5_1") == 0)
+        return GGML_TYPE_Q5_1;
+    // Still reachable for k-quants (q4_k, q6_k, …): their 256-element blocks
+    // cannot tile a head_dim-wide row on the usual 64/80/128 head dims, and
+    // ggml has no set_rows path for them. Falling back to F16 is right; saying
+    // so is the point.
+    std::fprintf(stderr, "%s: %s='%s' is not a supported KV cache type, using f16 instead\n", backend_tag, env_name, s);
     return GGML_TYPE_F16;
 }
 
@@ -202,10 +226,16 @@ struct kv_snapshot_pool {
     void alloc_device(kv_snapshot* s) {
         const ggml_init_params ip = {ggml_tensor_overhead() * (live.size() + 1) + 256, nullptr, /*no_alloc=*/true};
         s->meta = ggml_init(ip);
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(live[0]->buffer);
+        // Size by the buffer type's alloc size, not ggml_nbytes: they differ on
+        // CUDA for quantized tensors (row padding for MMQ), and
+        // ggml_backend_tensor_alloc() asserts against the former. KV snapshots
+        // are F16/F32 today so the two agree, but sizing one way and allocating
+        // the other is the exact bug that made moonshine abort at load — no
+        // reason to leave the same shape here waiting for a quantized cache.
         size_t total = 0;
         for (ggml_tensor* t : live)
-            total += ggml_nbytes(t);
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(live[0]->buffer);
+            total += ggml_backend_buft_get_alloc_size(buft, t);
         s->buf = ggml_backend_buft_alloc_buffer(buft, total);
         char* base = (char*)ggml_backend_buffer_get_base(s->buf);
         size_t off = 0;
@@ -213,7 +243,7 @@ struct kv_snapshot_pool {
         for (size_t i = 0; i < live.size(); i++) {
             s->dev[i] = ggml_new_tensor(s->meta, live[i]->type, GGML_MAX_DIMS, live[i]->ne);
             ggml_backend_tensor_alloc(s->buf, s->dev[i], base + off);
-            off += ggml_nbytes(live[i]);
+            off += ggml_backend_buft_get_alloc_size(buft, live[i]);
         }
     }
 
@@ -531,6 +561,7 @@ static inline ggml_tensor* encoder_self_attn(ggml_context* ctx, ggml_tensor* x, 
     Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
     K = ggml_permute(ctx, K, 0, 2, 1, 3);
     V = ggml_permute(ctx, V, 0, 2, 1, 3);
+    // cppcheck-suppress uninitvar
     if (p.permute_cont) {
         Q = ggml_cont(ctx, Q);
         K = ggml_cont(ctx, K);
@@ -616,6 +647,20 @@ struct KvSelfAttnParams {
     // Default false → legacy F16 fast path on Metal/CPU. Caller sets it true only
     // for the Vulkan-native graph.
     bool force_kv_read_f32 = false;
+    // Use explicit eager attention (mul_mat + soft_max_ext) with the QK^T scores
+    // forced to GGML_PREC_F32, instead of ggml_flash_attn_ext. Slower, but the F32
+    // scores are precise enough that a near-degenerate softmax doesn't flip which
+    // key wins — required for MOSS-TTS-Local's 4B backbone, whose 2-way stop head
+    // is sensitive to a sub-ε score error at layer ~10 (#249). This is the same
+    // eager+F32 attention llama.cpp uses for LM decode. Default false →
+    // flash_attn_ext perf path for every other (non-sensitive) backend. Env
+    // CRISPASR_CORE_ATTN_EAGER_F32 overrides per-run for A/B testing.
+    bool eager_f32_attn = false;
+    // YaRN: ggml includes its logarithmic magnitude correction when ext_factor
+    // is nonzero. Callers must compensate a model-specific attention factor.
+    float rope_freq_scale = 1.0f;
+    float rope_ext_factor = 0.0f;
+    float rope_attn_factor = 1.0f;
 };
 
 // KV-cached self-attention. Writes the new K/V into the persistent cache
@@ -676,6 +721,12 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     const int grp = p.n_kv_grp;
     const int T = (int)x->ne[1];
     const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
+    // #337: the mask must be exactly Lk wide. ggml_flash_attn_ext does not check
+    // it, CPU/CUDA/Metal read the mask through its own strides and so tolerate a
+    // wider one, but the Vulkan FA shader derives the mask row stride from KV and
+    // silently masks the wrong keys. The eager path asserts the same thing inside
+    // ggml_soft_max_ext; checking here makes every backend fail at graph build.
+    GGML_ASSERT(!causal_mask || causal_mask->ne[0] == Lk);
 
     // ---- Q/K/V projections ----
     ggml_tensor* Q;
@@ -743,6 +794,28 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
         V = ggml_rms_norm(ctx0, V, p.qk_norm_eps);
     }
 
+    // CrispASR debug hook (#249): tap the post-QK-norm, PRE-RoPE Q/K/V so the
+    // moss-tts-local attention diff can split projection+qk-norm from RoPE against
+    // the HF reference (q_norm / k_norm / v_proj module outputs). Same env knob as
+    // the FA dump below; read-only set_output, bit-identical when the knob is unset.
+    {
+        const char* pre_env = std::getenv("CRISPASR_CORE_ATTN_DUMP_FA_LAYER");
+        if (pre_env && (int)il == (int)std::strtol(pre_env, nullptr, 10)) {
+            ggml_tensor* Qn = ggml_cont(ctx0, Q);
+            ggml_set_name(Qn, "DBG_Q_prerope");
+            ggml_set_output(Qn);
+            ggml_build_forward_expand(gf, Qn);
+            ggml_tensor* Kn = ggml_cont(ctx0, K);
+            ggml_set_name(Kn, "DBG_K_prerope");
+            ggml_set_output(Kn);
+            ggml_build_forward_expand(gf, Kn);
+            ggml_tensor* Vn = ggml_cont(ctx0, V);
+            ggml_set_name(Vn, "DBG_V_new");
+            ggml_set_output(Vn);
+            ggml_build_forward_expand(gf, Vn);
+        }
+    }
+
     // ---- RoPE (NEOX for most models, NORMAL for fairseq2/omniasr) ----
     // p.n_rot > 0 selects partial-rotary mode (only the first n_rot
     // entries of each head are rotated; the rest pass through). 0
@@ -753,10 +826,9 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     if (p.rope_theta > 0.0f) {
         const int n_rot = p.n_rot > 0 ? p.n_rot : hd;
         Q = ggml_rope_ext(ctx0, Q, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta,
-                          /*freq_scale*/ 1.0f, /*ext_factor*/ 0.0f,
-                          /*attn_factor*/ 1.0f, p.rope_beta_fast, p.rope_beta_slow);
-        K = ggml_rope_ext(ctx0, K, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta, 1.0f,
-                          0.0f, 1.0f, p.rope_beta_fast, p.rope_beta_slow);
+                          p.rope_freq_scale, p.rope_ext_factor, p.rope_attn_factor, p.rope_beta_fast, p.rope_beta_slow);
+        K = ggml_rope_ext(ctx0, K, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta,
+                          p.rope_freq_scale, p.rope_ext_factor, p.rope_attn_factor, p.rope_beta_fast, p.rope_beta_slow);
     }
 
     // ---- Permute new K/V to (hd, T, n_kv) for cache write ----
@@ -899,9 +971,37 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     // ---- Permute Q to (hd, T, n_q) for flash-attn ----
     Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
 
-    // ---- Flash attention + reshape + output projection ----
-    ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, causal_mask, p.attn_scale, /*max_bias*/ 0.0f,
-                                            /*logit_softcap*/ 0.0f);
+    // ---- Attention: flash by default, or explicit eager (CRISPASR_CORE_ATTN_EAGER_F32
+    // =1). The eager path is the full-scores softmax llama.cpp uses for LM decode:
+    // mul_mat QK^T -> soft_max_ext -> mul_mat V. Unlike flash_attn_ext's streaming
+    // (online) softmax, it computes the whole score row before normalizing, so at a
+    // near-degenerate (attention-sink) softmax it can land on a different side of a
+    // sub-ε tie — the candidate mechanism for the MOSS-TTS-Local 4B layer-10
+    // divergence (#249). ggml_mul_mat_set_prec(F32) additionally forces F32 score
+    // accumulation on CUDA/Metal (a no-op on CPU, which is already F32). ----
+    // env overrides the per-call param: unset -> use p.eager_f32_attn; 0/1 forces.
+    static const int s_eager_env = []() {
+        const char* s = std::getenv("CRISPASR_CORE_ATTN_EAGER_F32");
+        if (!s || !*s)
+            return -1;
+        return std::strcmp(s, "0") != 0 ? 1 : 0;
+    }();
+    const bool use_eager = (s_eager_env >= 0) ? (s_eager_env == 1) : p.eager_f32_attn;
+    ggml_tensor* attn;
+    if (use_eager) {
+        ggml_tensor* scores = ggml_mul_mat(ctx0, Kfull, Q); // (Lk, T, n_q)
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        scores = ggml_soft_max_ext(ctx0, scores, causal_mask, p.attn_scale, 0.0f);
+        ggml_tensor* Vt = ggml_cont(ctx0, ggml_transpose(ctx0, Vfull)); // (Lk, hd, n_q)
+        attn = ggml_mul_mat(ctx0, Vt, scores);                          // (hd, T, n_q) = [d, query, head]
+        // Match flash_attn_ext's (hd, n_q, T) = [d, head, query] layout so the shared
+        // reshape_2d(hd*n_q, T) below packs [head,query] correctly (else it scrambles
+        // heads with queries — cos -0.05).
+        attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3)); // (hd, n_q, T)
+    } else {
+        attn = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, causal_mask, p.attn_scale, /*max_bias*/ 0.0f,
+                                   /*logit_softcap*/ 0.0f);
+    }
     if (dbg_dump) {
         ggml_set_name(attn, "DBG_fa_out");
         ggml_set_output(attn);

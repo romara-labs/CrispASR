@@ -42,6 +42,7 @@
 #include "core/gguf_loader.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -52,6 +53,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Hyperparameters
@@ -301,7 +303,7 @@ struct granite_nle_context {
 static bool granite_nle_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GRANITE_NLE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GRANITE_NLE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -540,17 +542,17 @@ extern "C" struct granite_nle_context* granite_nle_init_from_file(const char* pa
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!granite_nle_load_model(ctx->model, path, ctx->backend)) {
-        delete ctx;
+        granite_nle_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -722,7 +724,7 @@ extern "C" void granite_nle_free(struct granite_nle_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -1273,7 +1275,7 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
     // debugging). The graph path also populates ctx->last_ctc_logits and
     // ctx->last_bpe_logits.
     bool use_graph = true;
-    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+    if (const char* e = crispasr_env::get("CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH"))
         if (e[0] != '0' && e[0] != '\0')
             use_graph = false;
     if (use_graph) {
@@ -1361,7 +1363,7 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
         core_conformer_ibm::shaw_block_attention_cpu(attn_out.data(), Q.data(), K.data(), V.data(),
                                                      ctx->rpe_per_layer[il].empty() ? nullptr
                                                                                     : ctx->rpe_per_layer[il].data(),
-                                                     T, n_heads, hd, ctx_size, attn_scale, remainder);
+                                                     T, n_heads, hd, ctx_size, attn_scale, remainder, ctx->n_threads);
 
         nle_run_matmul(ctx, proj_out.data(), attn_out.data(), d, T, b.attn_out_w, b.attn_out_b, d);
         for (size_t i = 0; i < (size_t)d * T; i++)
@@ -1388,7 +1390,7 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
             if (b.post_norm_b)
                 ggml_backend_tensor_get(b.post_norm_b, nb.data(), 0, d * sizeof(float));
             core_cpu::layernorm(hidden.data(), hidden.data(), b.post_norm_w ? nw.data() : nullptr,
-                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
+                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f, ctx->n_threads);
         }
 
         // Self-conditioning residual: HF runs `out(hidden) → softmax → out_mid()`
@@ -1855,7 +1857,7 @@ extern "C" float* granite_nle_run_llm_editing(struct granite_nle_context* ctx, c
                 s / (n_text * vocab));
     }
 
-    if (const char* p = std::getenv("GRANITE_NLE_EDIT_DUMP")) {
+    if (const char* p = crispasr_env::get("CRISPASR_GRANITE_NLE_EDIT_DUMP")) {
         FILE* fp = std::fopen(p, "wb");
         if (fp) {
             std::fwrite(result, sizeof(float), (size_t)vocab * n_text, fp);

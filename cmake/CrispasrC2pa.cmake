@@ -63,8 +63,8 @@ if (CRISPASR_C2PA_FETCH AND NOT EXISTS "${_c2pa_hint}/include/c2pa.h")
     endif()
 endif()
 
-find_library(C2PA_LIBRARY NAMES c2pa_c c2pa HINTS "${_c2pa_hint}/lib")
-find_path(C2PA_INCLUDE_DIR NAMES c2pa.h c2pa/c2pa.h HINTS "${_c2pa_hint}/include")
+find_library(C2PA_LIBRARY NAMES c2pa_c c2pa HINTS "${_c2pa_hint}/lib" NO_CMAKE_FIND_ROOT_PATH)
+find_path(C2PA_INCLUDE_DIR NAMES c2pa.h c2pa/c2pa.h HINTS "${_c2pa_hint}/include" NO_CMAKE_FIND_ROOT_PATH)
 
 set(CRISPASR_C2PA_STATIC OFF)
 if (C2PA_LIBRARY)
@@ -96,6 +96,14 @@ function(crispasr_enable_c2pa TARGET)
     target_link_libraries(${TARGET} PRIVATE ${C2PA_LIBRARY})
     target_include_directories(${TARGET} PRIVATE ${C2PA_INCLUDE_DIR})
     target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_C2PA=1)
+    # On Apple platforms the STATIC c2pa lib (iOS) pulls in c2pa-rs's native TLS /
+    # keychain deps, so the consuming target must link the system frameworks or
+    # the app link fails with undefined _SecTrust*/_CF*/_SCDynamicStore* symbols.
+    # (The macOS DYNAMIC .dylib links these itself, so only guard the static case.)
+    if (CRISPASR_C2PA_STATIC AND APPLE)
+        target_link_libraries(${TARGET} PRIVATE "-framework Security" "-framework CoreFoundation"
+                                                "-framework SystemConfiguration")
+    endif()
     if (NOT CRISPASR_C2PA_STATIC)
         if (APPLE)
             set_property(TARGET ${TARGET} APPEND PROPERTY BUILD_RPATH "@loader_path")

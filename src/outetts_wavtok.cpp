@@ -9,6 +9,7 @@
 
 #include "outetts_wavtok.h"
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -24,6 +25,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -36,7 +38,7 @@
 static bool wavtok_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("WAVTOK_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_WAVTOK_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -157,7 +159,7 @@ struct wavtok_decoder_ctx {
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -622,12 +624,12 @@ extern "C" struct wavtok_decoder_ctx* wavtok_decoder_init_from_file(const char* 
     }
 
     // Backend
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, params.n_threads);
     c->backend = c->backend_cpu; // decoder is small, CPU is fine
 
     // Pass 2: weights
@@ -664,13 +666,13 @@ extern "C" float* wavtok_decoder_decode(struct wavtok_decoder_ctx* ctx, const in
     const int n_freq = n_fft / 2 + 1; // 641
 
     // Env var overrides for diff testing
-    const char* env_dump = std::getenv("WAVTOK_DUMP_DIR");
+    const char* env_dump = crispasr_env::get("CRISPASR_WAVTOK_DUMP_DIR");
     const char* dump_dir_eff = ctx->params.dump_dir ? ctx->params.dump_dir : env_dump;
     const bool dumping = dump_dir_eff != nullptr;
 
     // Allow overriding input codes for diff testing (e.g. "0,1,2,3,4,5,6,7,8,9")
     std::vector<int32_t> fixed_codes;
-    const char* env_codes = std::getenv("WAVTOK_FIXED_CODES");
+    const char* env_codes = crispasr_env::get("CRISPASR_WAVTOK_FIXED_CODES");
     if (env_codes && env_codes[0]) {
         std::string sc(env_codes);
         size_t pos = 0;

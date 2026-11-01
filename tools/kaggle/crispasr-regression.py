@@ -54,6 +54,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,7 +154,7 @@ def step(name: str, **extra) -> None:
 # capture buffers parent stdout heavily, and the C++ build's
 # subprocess.check_call lets ninja/g++ output flow through that
 # buffered pipe — fine when the build is fast, invisible when slow.
-# Same pattern as chr1str/qwen3-export (which ran fluently): Popen
+# Same pattern as ${KAGGLE_ACCOUNT}/qwen3-export (which ran fluently): Popen
 # the child with stdout=PIPE, iterate line-by-line in Python, print
 # each line with explicit flush. The heartbeat thread runs in
 # parallel and writes step("<label>.heartbeat") every 30 s including
@@ -180,7 +181,7 @@ def sh_with_progress(cmd: str, cwd: Path | None = None) -> None:
     updates _BUILD_PROGRESS as ninja emits lines. Forwards every
     line to the parent stdout (with explicit flush) so Kaggle's
     log capture sees the full build log in near-real-time.
-    Pattern lifted from chr1str/qwen3-export which uses the same
+    Pattern lifted from ${KAGGLE_ACCOUNT}/qwen3-export which uses the same
     Popen+iter approach and runs fluently."""
     print(f"$ {cmd}", flush=True)
     proc = subprocess.Popen(
@@ -287,7 +288,7 @@ def kaggle_secret(name: str, retries: int = 3, backoff_s: float = 5.0) -> str | 
     """Pull a Kaggle secret if available, with verbose diagnostics if
     not. The previous silent fall-back to anonymous made a missing
     secret look identical to a missing-attach-toggle, which burned us
-    on chr1str/crispasr-auto-rebake-refs.
+    on ${KAGGLE_ACCOUNT}/crispasr-auto-rebake-refs.
 
     Kaggle injects `KAGGLE_USER_SECRETS_TOKEN` (a JWT) into the runtime
     ONLY when at least one secret is attached to the kernel. So if
@@ -342,10 +343,10 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     Secrets API entirely — datasets are filesystem-mounted at
     `/kaggle/input/<dataset-slug>/<files>` before the script runs.
 
-    Expected dataset: `chr1str/crispasr-hf-token` (private) containing
+    Expected dataset: `${KAGGLE_ACCOUNT}/crispasr-hf-token` (private) containing
     a single file `hf_token.txt` with the write-scoped HF token.
     Mounted via `tools/kaggle/rebake/kernel-metadata.json:
-    dataset_sources: ["chr1str/crispasr-hf-token"]`.
+    dataset_sources: ["${KAGGLE_ACCOUNT}/crispasr-hf-token"]`.
 
     Note: Kaggle's UI has NO "Add-ons → Variables" option — only
     Secrets, Internet, Accelerator, Data Sources. The previous
@@ -357,11 +358,19 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     ]
     input_root = Path("/kaggle/input")
     if input_root.exists():
-        for sub in input_root.iterdir():
-            if "hf-token" in sub.name or "hf_token" in sub.name:
-                p = sub / filename
-                if p not in candidates:
-                    candidates.append(p)
+        # Classic mounts (/kaggle/input/<slug>/) AND the newer nested layout
+        # (/kaggle/input/datasets/<owner>/<slug>/). This inline copy only knew
+        # the classic one, so on current workers every run printed "HF auth:
+        # anonymous" and a rebake could not upload (2026-09-27). Probe the
+        # file in every dataset dir, like kaggle_harness.kaggle_token_from_dataset.
+        dirs = sorted(d for d in input_root.iterdir() if d.is_dir() and d.name != "datasets")
+        nested = input_root / "datasets"
+        if nested.is_dir():
+            dirs += sorted(d for o in nested.iterdir() if o.is_dir() for d in o.iterdir() if d.is_dir())
+        for sub in dirs:
+            p = sub / filename
+            if p not in candidates:
+                candidates.append(p)
     for p in candidates:
         if p.exists():
             try:
@@ -408,7 +417,7 @@ if hf_token:
     print("HF auth: token present (will verify next)", flush=True)
 else:
     print("HF auth: anonymous (rebake+upload will fail without HF_TOKEN). "
-          "Ensure the private Kaggle Dataset chr1str/crispasr-hf-token is "
+          "Ensure the private Kaggle Dataset ${KAGGLE_ACCOUNT}/crispasr-hf-token is "
           "attached to this kernel (kernel-metadata.json:dataset_sources) "
           "AND that the file hf_token.txt in it contains a write-scoped "
           "HuggingFace token. Kaggle's Secrets API is the alternative but "
@@ -519,6 +528,55 @@ if MODE == "rebake":
             "nemo_toolkit[asr]", "transformers", "torch", "torchaudio",
             "numpy", "gguf",
         ])
+
+    # ── Optional per-backend reference deps (2026-09-07) ──────────────────
+    # The list above is the NeMo family's, which is why parakeet-* and
+    # canary-1b-v2 bake and 32 other entries return `dump_reference exit=1`.
+    # The v3 rebake log named every missing import:
+    #     funasr, whisper, qwen_asr, fireredasr, mimo_audio_tokenizer, src
+    # plus a transformers too old for VoxtralRealtimeForConditionalGeneration.
+    #
+    # INSTALLED ONE AT A TIME AND TOLERANTLY, on purpose. The block above is a
+    # check_call, so a single unavailable wheel there would abort the whole
+    # rebake and take the backends that DO work down with it — trading 9 good
+    # dumps for a dependency that only ever mattered to one entry. Each of
+    # these was confirmed to exist on PyPI before being listed; the loop is
+    # belt-and-braces for a yanked release or a resolver conflict on the day.
+    OPTIONAL_REF_DEPS = [
+        "funasr",           # funasr-nano, funasr-mlt-nano, sensevoice, paraformer
+        "openai-whisper",   # imported as `whisper` by several reference dumpers
+        "qwen-asr",         # qwen3-asr-0.6b
+        "fireredasr",       # firered-asr2-aed, firered-lid
+        "modelscope",       # funasr/sensevoice model resolution
+        "zstandard",        # phonon2 transport archive
+    ]
+    for _dep in OPTIONAL_REF_DEPS:
+        with build_heartbeat(f"pip.install.optional.{_dep}"):
+            rc = subprocess.call([sys.executable, "-m", "pip", "install", "--quiet", _dep])
+            if rc == 0:
+                print("  optional ref dep %s: ok" % _dep, flush=True)
+            else:
+                print("  optional ref dep %s: UNAVAILABLE (rc=%d) — its backends will "
+                      "still report dump_reference exit=1" % (_dep, rc), flush=True)
+
+    # Voxtral realtime needs a newer transformers than Kaggle ships; upgrading
+    # is separate from the list above because it MUTATES an existing pin that
+    # the NeMo stack also depends on, so a failure here is worth seeing rather
+    # than silently tolerated alongside the optional installs.
+    # Only when a voxtral entry is in the batch: the upgrade breaks qwen_asr
+    # (TypeError: check_model_inputs() missing 'func' - rebake 2026-09-27), so
+    # an unconditional upgrade trades qwen3-asr for a backend not being baked.
+    _batch = [b.strip() for b in os.environ.get("CRISPASR_REGRESSION_BACKENDS", "").split(",") if b.strip()]
+    if not _batch or any("voxtral" in b for b in _batch):
+        with build_heartbeat("pip.install.transformers_upgrade"):
+            rc = subprocess.call([sys.executable, "-m", "pip", "install", "--quiet",
+                                  "--upgrade", "transformers"])
+            print("  transformers upgrade: %s" % ("ok" if rc == 0 else "FAILED rc=%d" % rc), flush=True)
+    else:
+        print("  transformers upgrade: skipped (no voxtral entry in this batch)", flush=True)
+    # mimo_audio_tokenizer is NOT on PyPI (checked: 404). mimo-asr and
+    # mimo-audio-tokenizer stay unbakeable until their reference module vendors
+    # it or points at a source checkout. Recorded so the gap is a known one.
 
 # ─────────────────────────── cell 3 (code) ───────────────────────────
 step("cell_3_begin")
@@ -679,18 +737,40 @@ def run_validate() -> list[dict]:
         name = entry["name"]
         print(f"\n========== validate :: {name} ==========")
         t0 = time.time()
+        gguf_local = None  # reset per iteration: the finally-block eviction below
+                           # must never see a stale path from the previous backend
         try:
+            run_one.validate_exact_diff_transcript(entry)
             from huggingface_hub import hf_hub_download
             gguf_local = Path(hf_hub_download(
                 repo_id=entry["gguf"]["repo"],
                 filename=entry["gguf"]["file"],
                 revision=entry["gguf"]["revision"],
             ))
-            ref_local = Path(hf_hub_download(
-                repo_id=MANIFEST["fixtures"]["repo"],
-                filename=entry["fixture_ref_path"],
-                revision=MANIFEST["fixtures"]["revision"],
-            ))
+            # `gguf.companion_files` (moonshine's tokenizer.bin, index-echo's
+            # decoder GGUF, …) must sit next to the model. Same repo + revision
+            # lands them in the same snapshot directory. run_one.py has always
+            # fetched them; this script did not, so every backend with a
+            # companion died here with "failed to initialise backend" (exit 13)
+            # — which read as a backend regression and was a missing download.
+            for companion in entry["gguf"].get("companion_files", []):
+                hf_hub_download(
+                    repo_id=entry["gguf"]["repo"],
+                    filename=companion,
+                    revision=entry["gguf"]["revision"],
+                )
+            # `skip_diff: true` entries are transcript-only and carry no
+            # reference dump — 38 of 45 backends. Downloading a fixture for them
+            # raised KeyError: 'fixture_ref_path' and failed the backend before it
+            # ever ran. run_one.py already treats skip_diff this way.
+            skip_diff = bool(entry.get("skip_diff", False))
+            ref_local = None
+            if not skip_diff:
+                ref_local = Path(hf_hub_download(
+                    repo_id=MANIFEST["fixtures"]["repo"],
+                    filename=entry["fixture_ref_path"],
+                    revision=MANIFEST["fixtures"]["revision"],
+                ))
             if "fixture_sample_path" in entry:
                 sample = Path(hf_hub_download(
                     repo_id=MANIFEST["fixtures"]["repo"],
@@ -700,30 +780,78 @@ def run_validate() -> list[dict]:
             else:
                 sample = REPO / entry["sample"]
 
+            if "transcript_reference" in entry:
+                if ref_local is None:
+                    raise ValueError("Transcript provenance requires an independent reference dump")
+                run_one.verify_transcript_reference(entry, ref_local, sample, HF_CACHE)
+
             crispasr_bin = BUILD / "bin" / "crispasr"
             diff_bin = BUILD / "bin" / "crispasr-diff"
 
-            actual = run_one.run_transcript(crispasr_bin, gguf_local, sample)
-            transcript_ok = (actual == entry["expected_transcript"])
-            stages = run_one.run_diff(
-                diff_bin, entry["backend_id"], gguf_local, ref_local, sample)
-            passes, fails, missing, extras = run_one.evaluate_stage_thresholds(
-                stages, entry["diff_thresholds"])
-            ok = transcript_ok and not fails and not missing
+            # `transcript_format: srt` (index-echo's bilingual cues): the same
+            # cue-joining run_one.py does. Without it only the last stdout line
+            # was compared and index-echo could never pass here.
+            actual = run_one.run_transcript(crispasr_bin, gguf_local, sample,
+                                            srt=entry.get("transcript_format") == "srt")
+            # Same rule as GH (run_one.transcript_gate): WER-normalised, not
+            # byte-exact, honouring transcript_tolerance.
+            transcript_ok, _tlines = run_one.transcript_gate(entry, actual)
+            for _l in _tlines:
+                print(_l)
+            control_ok = True
+            control = None
+            if skip_diff:
+                stages, passes, fails, missing, extras = {}, [], [], [], {}
+                ok = transcript_ok
+            else:
+                # diff_gguf: full-precision file for the stage diff (run_one.py).
+                # Same repo as the quant by default, so the per-backend
+                # models--* eviction below frees it too.
+                diff_gguf = gguf_local
+                if entry.get("diff_gguf"):
+                    dg = entry["diff_gguf"]
+                    diff_gguf = Path(hf_hub_download(
+                        repo_id=dg.get("repo", entry["gguf"]["repo"]), filename=dg["file"],
+                        revision=dg.get("revision", entry["gguf"]["revision"])))
+                if entry.get("require_exact_diff_transcript", False):
+                    control = run_one.run_transcript(
+                        crispasr_bin, diff_gguf, sample,
+                        srt=entry.get("transcript_format") == "srt", label="transcript-f16")
+                    control_ok, control_lines = run_one.exact_diff_transcript_gate(entry, control)
+                    for line in control_lines:
+                        print(f"[transcript-f16] {line}")
+                stages = run_one.run_diff(
+                    diff_bin, entry["backend_id"], diff_gguf, ref_local, sample)
+                passes, fails, missing, extras = run_one.evaluate_stage_thresholds(
+                    stages, entry["diff_thresholds"], **run_one.stage_gate_kwargs(entry))
+                # Print every stage: the counts alone ("fails=75") said nothing
+                # about WHICH stage broke first, and the results jsonl is not
+                # always retrievable (kernels output 429s).
+                for _st, _v, _th in sorted(passes + fails, key=lambda x: x[0]):
+                    print(f"    {'PASS' if _v >= _th else 'FAIL'} {_st:32s} cos_min={_v:.6f} (>= {_th})")
+                for _st, _v in extras:
+                    print(f"    INFO {_st:32s} cos_min={_v:.6f}")
+                for _st in missing:
+                    print(f"    MISSING {_st}")
+                ok = transcript_ok and control_ok and not fails and not missing
             results.append({
                 "backend": name,
                 "mode": "validate",
                 "ok": ok,
                 "elapsed_s": round(time.time() - t0, 2),
                 "transcript_match": transcript_ok,
+                "exact_diff_transcript_match": control_ok if control is not None else None,
+                "exact_diff_transcript_actual": control,
                 "transcript_actual": actual if not transcript_ok else None,
-                "stages": {s: stages.get(s) for s in entry["diff_thresholds"]},
+                "stages": {s: stages.get(s) for s in entry.get("diff_thresholds", {})},
                 "extras": dict(extras),
                 "missing": missing,
             })
             print(f"  -> ok={ok}  transcript={transcript_ok}  "
                   f"passes={len(passes)}  fails={len(fails)}  missing={len(missing)}")
-        except Exception as exc:
+        # SystemExit too: run_one.die() raises it (kyutai: "crispasr-diff produced no
+        # parseable stage lines") and it ended the whole run, skipping every later entry.
+        except (Exception, SystemExit) as exc:
             results.append({
                 "backend": name,
                 "mode": "validate",
@@ -732,6 +860,29 @@ def run_validate() -> list[dict]:
                 "error": f"{type(exc).__name__}: {exc}",
             })
             print(f"  -> ERROR  {type(exc).__name__}: {exc}")
+        finally:
+            # Free the model before the next backend. The 45-backend sweep pulls
+            # far more than /kaggle/working holds — the previous run died partway
+            # through with "No space left on device (os error 28)" and every
+            # remaining backend then failed on disk rather than on merit.
+            # Keeping one model at a time is what makes a full sweep possible;
+            # the ASR ground-truth model and fixtures are small and are re-used,
+            # so only the backend under test is evicted.
+            try:
+                import shutil as _sh
+                for _p in (locals().get("gguf_local"),):
+                    if _p is None:
+                        continue
+                    # hf_hub_download returns .../snapshots/<rev>/<file>; drop the
+                    # whole models--* tree so blobs go too, not just the symlink.
+                    _root = Path(_p)
+                    while _root.parent != _root and not _root.name.startswith("models--"):
+                        _root = _root.parent
+                    if _root.name.startswith("models--") and _root.is_dir():
+                        _sh.rmtree(_root, ignore_errors=True)
+                        print(f"  freed {_root.name}", flush=True)
+            except Exception as _e:
+                print(f"  cleanup skipped: {_e}", flush=True)
 
     return results
 
@@ -763,7 +914,9 @@ def run_rebake() -> list[dict]:
         name = entry["name"]
         print(f"\n========== rebake :: {name} ==========")
         t0 = time.time()
-        # `backend_id` is the registered name in tools/dump_reference.py;
+        # `reference_backend` may differ from the runtime backend for HF
+        # variants such as Phonon-2, which runs on Parakeet but is not a .nemo.
+        reference_backend = entry.get("reference_backend", entry["backend_id"])
         # `fixture_ref_path` is what `manifest.json` says we'll ship.
         # Default for never-done entries (no fixture_ref_path field yet):
         # use `<name>/ref.gguf`. When skip_diff flips to false the
@@ -804,15 +957,55 @@ def run_rebake() -> list[dict]:
         else:
             sample = REPO / entry["sample"]
 
+        # Several reference modules read files straight from --model-dir
+        # (granite: <dir>/config.json; kyutai: the mimi safetensors next to the
+        # LM) and fail on a bare HF id - rebake 2026-09-27. Hand them a full
+        # local snapshot; an id that is already a path is used as-is.
+        model_dir = source
+        # NeMo-family dumpers take the bare id (from_pretrained / restore_from
+        # on a .nemo) and break on a directory (batch 3: parakeet tarfile
+        # IsADirectoryError, nemotron HFValidationError) - so only these get one.
+        needs_snapshot = entry["backend_id"] in ("granite", "granite-4.1", "kyutai-stt", "mini-omni2")
+        if needs_snapshot and not Path(source).exists() and re.fullmatch(r"[\w.-]+/[\w.-]+", source):
+            # In a FRESH interpreter: the rebake pip installs replace
+            # huggingface_hub after this process imported it, and an in-process
+            # snapshot_download then dies on a half-old module
+            # (AttributeError: ...HF_HUB_ENABLE_HF_TRANSFER, batch 2).
+            with build_heartbeat(f"snapshot.{name}"):
+                _r = subprocess.run(
+                    [sys.executable, "-c",
+                     "import sys; from huggingface_hub import snapshot_download; "
+                     "print('@@' + snapshot_download(repo_id=sys.argv[1]))", source],
+                    capture_output=True, text=True)
+            _m = re.search(r"^@@(.+)$", _r.stdout, re.M)
+            if _m and Path(_m.group(1)).is_dir():
+                model_dir = _m.group(1)
+            else:
+                print(f"  snapshot_download({source}) failed rc={_r.returncode}: "
+                      f"{(_r.stderr or _r.stdout)[-400:]}; passing the id", flush=True)
+        # Per-backend reference prerequisites that are not pip packages.
+        # mini-omni2's reference imports the MODIFIED litgpt vendored in the
+        # upstream repo (post_adapter / whisper_adapter do not exist in PyPI
+        # litgpt): "No module named 'litgpt'" in batch 1.
+        ref_env = dict(os.environ)
+        if entry["backend_id"] == "mini-omni2":
+            mo_dir = WORK / "_mini-omni2"
+            if not mo_dir.exists():
+                subprocess.call(["git", "clone", "--depth", "1", "https://github.com/gpt-omni/mini-omni2.git", str(mo_dir)])
+            ref_env["MINI_OMNI2_REPO"] = str(mo_dir)
+        if entry["backend_id"] == "kyutai-stt":
+            # LM stages import `moshi`; its own torch pin would replace the
+            # stack every other dumper runs on, so code only (batch 3).
+            subprocess.call([sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "moshi"])
         cmd = [
             sys.executable, "-u", str(REPO / "tools" / "dump_reference.py"),
-            "--backend", entry["backend_id"],
-            "--model-dir", source,
+            "--backend", reference_backend,
+            "--model-dir", model_dir,
             "--audio", str(sample),
             "--output", str(out_path),
         ]
         try:
-            subprocess.check_call(cmd, cwd=str(REPO))
+            subprocess.check_call(cmd, cwd=str(REPO), env=ref_env)
             results.append({
                 "backend": name,
                 "mode": "rebake",
@@ -863,11 +1056,87 @@ def run_rebake() -> list[dict]:
     return results
 
 
+# ─────────────────────────── cell 6b (code) ──────────────────────────
+step("cell_6b_begin")
+# ── VALIDATE mode: TTS -> ASR roundtrips ─────────────────────────────────
+#
+# The manifest has carried a `tts_backends` section for a while, but this suite
+# only ever iterated `backends` — so the 21 WER-gated TTS roundtrips were in the
+# manifest and never run by the thing called "the full regression suite".
+# run_one.tts_roundtrip_for already implements one (synthesise the phrase,
+# transcribe it with the pinned ASR backend, assert WER <= wer_max) and returns a
+# failure count, handling `advisory: true` entries internally by reporting and
+# returning 0. Driving it here is what makes the sweep actually full.
+def run_validate_tts() -> list[dict]:
+    sys.path.insert(0, str(REPO / "tests" / "regression"))
+    import run_one  # noqa: E402
+
+    entries = [e for e in MANIFEST.get("tts_backends", [])
+               if not want or e["name"] in want]
+    if not entries:
+        return []
+
+    print(f"\nProcessing {len(entries)} TTS backend(s):")
+    for e in entries:
+        print(f"  - {e['name']:30s} (gguf ~{e['gguf'].get('approx_size_mb','?')} MB)")
+
+    crispasr_bin = BUILD / "bin" / "crispasr"
+    out = []
+    for entry in entries:
+        name = entry["name"]
+        print(f"\n========== tts-roundtrip :: {name} ==========")
+        t0 = time.time()
+        work = Path(tempfile.mkdtemp(prefix=f"tts-{name}-"))
+        try:
+            failures = run_one.tts_roundtrip_for(name, MANIFEST, work, crispasr_bin)
+            out.append({
+                "backend": name,
+                "mode": "validate-tts",
+                "ok": failures == 0,
+                "advisory": bool(entry.get("advisory", False)),
+                "elapsed_s": round(time.time() - t0, 2),
+            })
+            print(f"  -> ok={failures == 0}")
+        # SystemExit too: run_one.die() raises it, and one bad entry must not
+        # abort the remaining backends the way a bare `except Exception` would.
+        except (Exception, SystemExit) as exc:
+            out.append({
+                "backend": name,
+                "mode": "validate-tts",
+                "ok": False,
+                "advisory": bool(entry.get("advisory", False)),
+                "elapsed_s": round(time.time() - t0, 2),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            print(f"  -> ERROR  {type(exc).__name__}: {exc}")
+        finally:
+            # Same eviction discipline as the ASR pass: TTS GGUFs are large
+            # (tada 2.2 GB, f5 953 MB) and /kaggle/working does not hold them all.
+            #
+            # Evict THIS entry's repos only. HF_HOME is shared (set in cell 2), so
+            # the per-job work dir holds nothing and a blanket models--* wipe would
+            # also evict the pinned ASR ground-truth model — re-downloading
+            # parakeet for all 21 entries instead of once.
+            shutil.rmtree(work, ignore_errors=True)
+            repos = {entry["gguf"]["repo"]}
+            for key in ("voice", "codec"):
+                if isinstance(entry.get(key), dict) and "repo" in entry[key]:
+                    repos.add(entry[key]["repo"])
+            hub = Path(os.environ["HF_HOME"]) / "hub"
+            for repo in repos:
+                d = hub / ("models--" + repo.replace("/", "--"))
+                if d.is_dir():
+                    shutil.rmtree(d, ignore_errors=True)
+                    print(f"  freed {d.name}", flush=True)
+    return out
+
+
 # ─────────────────────────── cell 7 (code) ───────────────────────────
 step("cell_7_begin")
 # ── Dispatch + upload ─────────────────────────────────────────────────────
 if MODE == "validate":
     RESULTS_DATA = run_validate()
+    RESULTS_DATA += run_validate_tts()
 elif MODE == "rebake":
     RESULTS_DATA = run_rebake()
 else:
@@ -882,8 +1151,12 @@ print(f"\nResults: {results_jsonl}")
 
 # Summary line for stdout (so a Kaggle screenshot is self-contained).
 n_ok = sum(1 for r in RESULTS_DATA if r.get("ok"))
-n_fail = sum(1 for r in RESULTS_DATA if not r.get("ok"))
-print(f"\nSUMMARY  mode={MODE}  ok={n_ok}/{len(RESULTS_DATA)}  fail={n_fail}")
+# `advisory: true` entries report but never gate (weak / high-variance models).
+n_fail = sum(1 for r in RESULTS_DATA
+             if not r.get("ok") and not r.get("advisory"))
+n_advisory = sum(1 for r in RESULTS_DATA
+                 if not r.get("ok") and r.get("advisory"))
+print(f"\nSUMMARY  mode={MODE}  ok={n_ok}/{len(RESULTS_DATA)}  fail={n_fail}  advisory={n_advisory}")
 for r in RESULTS_DATA:
     flag = "✓" if r.get("ok") else "✗"
     print(f"  {flag} {r['backend']:30s} {r['elapsed_s']:6.1f}s  {r.get('error', '')}")

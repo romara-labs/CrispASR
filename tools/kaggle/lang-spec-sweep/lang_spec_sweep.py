@@ -174,7 +174,7 @@ def _token_from_dataset() -> str | None:
     roots = [
         Path("/kaggle/input"),
         Path("/kaggle/input/datasets"),
-        Path("/kaggle/input/datasets/chr1str"),
+        Path("/kaggle/input/datasets/$KAGGLE_ACCOUNT"),
     ]
     for root in roots:
         if not root.exists():
@@ -240,7 +240,7 @@ _ccache_dir = WORK / ".ccache"
 _ccache_dir.mkdir(parents=True, exist_ok=True)
 for candidate in [
     Path("/kaggle/input/crispasr-ccache/ccache.tar"),
-    Path("/kaggle/input/datasets/chr1s4/crispasr-ccache/ccache.tar"),
+    Path("/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-ccache/ccache.tar"),
 ]:
     if candidate.exists():
         step("ccache.warm", source=str(candidate))
@@ -285,7 +285,7 @@ with heartbeat("build.configure"):
     sh_stream(
         f"cmake -G {'Ninja' if _HAS_NINJA else 'Unix Makefiles'} "
         f"-B {BUILD} -S {REPO} "
-        f"-DCMAKE_BUILD_TYPE=Release "
+        f"-DCMAKE_BUILD_TYPE=Release -DCRISPASR_NO_C2PA_NATIVE=ON "
         f"{_ccache_flags}"
         f"{cmake_extra}"
     )

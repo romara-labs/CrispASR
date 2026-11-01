@@ -19,10 +19,11 @@ struct kyutai_stt_context;
 
 struct kyutai_stt_context_params {
     int n_threads;
-    int verbosity;     // 0=silent 1=normal 2=verbose
-    bool use_gpu;      // false => force CPU backend
-    float temperature; // 0 = greedy argmax, >0 = softmax sampling
-    int beam_size; // 1 = greedy/sampled (default); >1 = deterministic beam search over text-token decisions per frame
+    int verbosity;         // 0=silent 1=normal 2=verbose
+    bool use_gpu;          // false => force CPU backend
+    float temperature;     // 0 = greedy argmax, >0 = softmax sampling
+    int beam_size;         // 1 = greedy/sampled (default); >1 = deterministic beam search
+    int input_sample_rate; // 0 or 16000 = legacy (resample 16k→24k); 24000 = skip resample
 };
 
 struct kyutai_stt_context_params kyutai_stt_context_default_params(void);
@@ -31,8 +32,8 @@ struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path_model, str
 
 void kyutai_stt_free(struct kyutai_stt_context* ctx);
 
-// High-level: transcribe raw 16 kHz mono PCM audio.
-// Internally resamples to 24 kHz for Mimi codec.
+// High-level: transcribe raw PCM audio (16 kHz default; set
+// input_sample_rate=24000 in params to skip the internal resample).
 // Returns malloc'd UTF-8 string, caller frees with free().
 char* kyutai_stt_transcribe(struct kyutai_stt_context* ctx, const float* samples, int n_samples);
 
@@ -62,6 +63,10 @@ void kyutai_stt_set_seed(struct kyutai_stt_context* ctx, unsigned int seed);
 // temperature sampling. Beam path snapshots the LM KV per beam each frame
 // and picks by cumulative log-prob across all T_frames.
 void kyutai_stt_set_beam_size(struct kyutai_stt_context* ctx, int beam_size);
+
+// Tell the backend what sample rate the next transcribe's PCM is at.
+// 0 or 16000 = legacy (resample 16k→24k); 24000 = skip resample.
+void kyutai_stt_set_input_sample_rate(struct kyutai_stt_context* ctx, int rate);
 
 // ---- Per-token + word-level timing (PLAN #61c) ----
 //
@@ -101,6 +106,15 @@ void kyutai_stt_result_ex_free(struct kyutai_stt_result_ex* r);
 // Returns the model's audio_delay_seconds + audio_silence_prefix_seconds.
 // The CLI wrapper uses this to size the silence tail it appends: the tail
 // must be at least as long as the lookahead so the LM can flush the final word.
+/// Does this checkpoint support `lang` (ISO-639-1, lowercase)? Empty or "auto"
+/// always returns 1. stt-1b-en_fr supports en+fr; stt-2.6b-en is English-only,
+/// and CrispASR used to warn "English-only model" for both (#366).
+int kyutai_stt_supports_language(struct kyutai_stt_context* ctx, const char* lang);
+
+/// Comma-separated languages this checkpoint supports, for diagnostics.
+/// Owned by the context; valid until kyutai_stt_free.
+const char* kyutai_stt_languages(struct kyutai_stt_context* ctx);
+
 float kyutai_stt_total_lookahead_seconds(struct kyutai_stt_context* ctx);
 
 // Like kyutai_stt_transcribe but returns per-token + word-level timing.

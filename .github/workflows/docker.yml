@@ -37,9 +37,15 @@ jobs:
       matrix:
         config:
           - { tag: "main", dockerfile: ".devops/main.Dockerfile", platform: "linux/amd64" }
-          - { tag: "main-musa", dockerfile: ".devops/main-musa.Dockerfile", platform: "linux/amd64" }
+          # MUSA has a separate manual self-hosted validation workflow. Its SDK
+          # platform/redistribution terms and runtime qualification remain open.
           - { tag: "main-intel", dockerfile: ".devops/main-intel.Dockerfile", platform: "linux/amd64" }
           - { tag: "main-cuda", dockerfile: ".devops/main-cuda.Dockerfile", platform: "linux/amd64" }
+          # main-cuda-portable = same CUDA GPU build as main-cuda, but the CPU ggml backend
+          # is generic SSE2 (every optional ISA OFF). For pre-Haswell CPUs where the stock
+          # main-cuda image SIGILLs at startup on a BMI2 instruction inside ggml_cpu_init()
+          # (#261). Slower CPU kernels; GPU ASR is identical.
+          - { tag: "main-cuda-portable", dockerfile: ".devops/main-cuda-portable.Dockerfile", platform: "linux/amd64" }
           # main-cuda-12 = legacy CUDA 12.4 build for hosts with NVIDIA driver R510-R534
           # (RHEL/older Ubuntu/enterprise clusters). main-cuda needs R535+. Caps at sm_90;
           # RTX 50xx (sm_120, Blackwell) is unsupported here — those users want main-cuda.
@@ -90,7 +96,7 @@ jobs:
           if [ "${{ github.event_name }}" == "push" ]; then
             TAGS="$TAGS,ghcr.io/${REPO}:${{ matrix.config.tag }}-${{ env.COMMIT_SHA }}"
           fi
-          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image (tagged)
         uses: docker/build-push-action@v6

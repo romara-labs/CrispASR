@@ -8,11 +8,69 @@
 #include "whisper_params.h"
 
 #include "nemotron.h"
+#include "core/nemotron_text.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
+
+using core_nemotron_text::strip_lang_tags;
+
+class NemotronRealtimeSession final : public CrispasrRealtimeSession {
+public:
+    explicit NemotronRealtimeSession(nemotron_context* ctx) : ctx_(ctx), stream_(nemotron_stream_create(ctx)) {}
+    ~NemotronRealtimeSession() override { nemotron_stream_free(stream_); }
+
+    bool append(const float* samples, int n_samples, bool flush, callback on_text) override {
+        if (!stream_)
+            return false;
+        struct CallbackState {
+            NemotronRealtimeSession* self;
+            callback* fn;
+        } state{this, &on_text};
+        auto token_cb = [](int id, float, void* userdata) {
+            auto& state = *static_cast<CallbackState*>(userdata);
+            const char* raw = nemotron_token_to_str(state.self->ctx_, id);
+            if (!raw || !*raw)
+                return;
+            std::string piece(raw);
+            size_t pos = 0;
+            while ((pos = piece.find("\xe2\x96\x81", pos)) != std::string::npos) {
+                piece.replace(pos, 3, " ");
+                pos++;
+            }
+            if (state.self->first_token_) {
+                const size_t first = piece.find_first_not_of(" \n");
+                piece = first == std::string::npos ? std::string{} : piece.substr(first);
+                if (!piece.empty())
+                    state.self->first_token_ = false;
+            }
+            state.self->text_ += piece;
+            const std::string clean = strip_lang_tags(state.self->text_);
+            if (!clean.empty())
+                (*state.fn)(clean, false);
+        };
+        if (!nemotron_stream_append(stream_, samples, n_samples, flush, token_cb, &state))
+            return false;
+        if (flush)
+            on_text(strip_lang_tags(text_), true);
+        return true;
+    }
+
+    void reset() override {
+        nemotron_stream_reset(stream_);
+        text_.clear();
+        first_token_ = true;
+    }
+
+private:
+    nemotron_context* ctx_ = nullptr;
+    nemotron_stream* stream_ = nullptr;
+    std::string text_;
+    bool first_token_ = true;
+};
 
 class NemotronBackend : public CrispasrBackend {
 public:
@@ -24,7 +82,7 @@ public:
     uint32_t capabilities() const override {
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
                CAP_PUNCTUATION_NATIVE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_DIARIZE | CAP_AUTO_DOWNLOAD |
-               CAP_UNBOUNDED_INPUT;
+               CAP_UNBOUNDED_INPUT | CAP_STREAMING;
     }
 
     bool init(const whisper_params& p) override {
@@ -63,6 +121,9 @@ public:
         if (!ctx_)
             return out;
 
+        if (!params.language.empty())
+            nemotron_set_language(ctx_, params.language.c_str());
+
         nemotron_set_temperature(ctx_, params.temperature, params.seed);
         nemotron_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
@@ -94,14 +155,16 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs;
-        seg.text = r->text ? r->text : "";
+        seg.text = strip_lang_tags(r->text ? r->text : "");
 
         // Words
         seg.words.reserve(r->n_words);
         for (int i = 0; i < r->n_words; i++) {
             const auto& w = r->words[i];
             crispasr_word cw;
-            cw.text = w.text;
+            cw.text = strip_lang_tags(w.text);
+            if (cw.text.empty())
+                continue; // the tag was a "word" of its own
             cw.t0 = w.t0;
             cw.t1 = w.t1;
             seg.words.push_back(std::move(cw));
@@ -139,6 +202,8 @@ public:
             CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
             return;
         }
+        if (!params.language.empty())
+            nemotron_set_language(ctx_, params.language.c_str());
         std::string accumulated;
         bool first_tok = true;
         // nemotron_transcribe_cb fires per-emitted non-blank RNN-T token
@@ -162,12 +227,21 @@ public:
                     first_tok = false;
             }
             accumulated += piece;
-            if (!accumulated.empty())
-                on_text(accumulated.c_str(), false);
+            const std::string clean = strip_lang_tags(accumulated);
+            if (!clean.empty())
+                on_text(clean, false);
         };
         auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
         nemotron_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
-        on_text(accumulated.c_str(), true);
+        on_text(strip_lang_tags(accumulated), true);
+    }
+
+    std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params& params) override {
+        if (!ctx_)
+            return nullptr;
+        if (!params.language.empty())
+            nemotron_set_language(ctx_, params.language.c_str());
+        return std::make_unique<NemotronRealtimeSession>(ctx_);
     }
 
     void shutdown() override {

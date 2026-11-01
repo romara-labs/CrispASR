@@ -13,6 +13,7 @@
 // See qwen3-asr-todo.md for the full plan.
 
 #include "higgs_stt.h"
+#include "core/crispasr_env.h"
 #include "../crisp_audio/include/crisp_audio.h"
 
 #ifndef M_PI
@@ -53,7 +54,7 @@
 static bool higgs_stt_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("HIGGS_STT_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_HIGGS_STT_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -255,7 +256,8 @@ struct higgs_stt_context {
     int kv_n_used = 0;
 
     int n_threads = 4;
-    int beam_size = 1; // 1 = greedy (default); >1 = beam search (core_beam_decode)
+    int beam_size = 1;         // 1 = greedy (default); >1 = beam search (core_beam_decode)
+    int max_new_tokens = 1024; // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
 
     // Shared audio-tower runtime (loaded lazily on first audio call). The
     // higgs_stt_audio_tower struct above is kept around so existing in-tree
@@ -1211,6 +1213,7 @@ extern "C" const char* higgs_stt_token_text(higgs_stt_context* ctx, int id) {
 #include "core/beam_decode.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (shared with moss-transcribe)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1324,15 +1327,15 @@ extern "C" higgs_stt_context* higgs_stt_init_from_file(const char* path, higgs_s
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
     // crispasr_init_gpu_backend() picks the highest-priority available backend.
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     if (!higgs_stt_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
@@ -1442,9 +1445,9 @@ extern "C" void higgs_stt_free(higgs_stt_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu)
@@ -1525,6 +1528,13 @@ extern "C" void higgs_stt_set_beam_size(higgs_stt_context* ctx, int beam_size) {
         ctx->beam_size = beam_size > 0 ? beam_size : 1;
 }
 
+// #292: forward --max-new-tokens. <= 0 keeps the backend's 1024 default (the KV
+// cache is sized from this, so raising it grows the cache accordingly).
+extern "C" void higgs_stt_set_max_new_tokens(higgs_stt_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
+}
+
 extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return strdup("");
@@ -1581,7 +1591,8 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     free(audio);
 
     // ---- KV-cached greedy decode ----
-    if (!higgs_stt_kv_init(ctx, std::max(4096, T_prompt + 1024))) {
+    const int higgs_max_new = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 1024;
+    if (!higgs_stt_kv_init(ctx, std::max(4096, T_prompt + higgs_max_new))) {
         free(te);
         return strdup("");
     }
@@ -1591,7 +1602,7 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     free(te);
     int n_past = T_prompt;
     std::vector<int32_t> out_ids;
-    const int max_new = 1024;
+    const int max_new = higgs_max_new; // #292: honors --max-new-tokens (see kv_init above)
     const int eos1 = (int)hp.im_end_token_id;
     const int eos2 = (int)hp.pad_token_id; // <|endoftext|>
 
@@ -1646,7 +1657,7 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
 
     // ---- detokenize + post-process ----
     std::string text = core_bpe::detokenize(ctx->vocab.id_to_token, out_ids.data(), out_ids.size());
-    if (getenv("HIGGS_DEBUG")) {
+    if (crispasr_env::get("CRISPASR_HIGGS_DEBUG")) {
         fprintf(stderr, "[higgs] raw %zu tokens, raw text:\n>>>%s<<<\n", out_ids.size(), text.c_str());
     }
     // Strip an optional <think>...</think> reasoning block.

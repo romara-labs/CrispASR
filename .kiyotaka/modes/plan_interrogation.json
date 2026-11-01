@@ -1,0 +1,22 @@
+{
+  "id": "plan_interrogation",
+  "label": "Plan Interrogation & Reality Audit",
+  "description": "Interrogate an existing plan, expose missing analysis, detect hallucinated assumptions, ask mandatory questions and rewrite the plan only after evidence is traced.",
+  "output_folder": "_kiyotaka_interrogation",
+  "required_agents": [
+    "kiyotaka",
+    "kiyotaka-observer",
+    "kiyotaka-excavator",
+    "kiyotaka-architect-reader",
+    "kiyotaka-recorder",
+    "kiyotaka-verifier",
+    "kiyotaka-interrogator",
+    "kiyotaka-assumption-hunter",
+    "kiyotaka-source-tracer",
+    "kiyotaka-coverage-mapper",
+    "kiyotaka-hallucination-detector",
+    "kiyotaka-blocker-judge",
+    "kiyotaka-plan-corrector"
+  ],
+  "installed_at": "2026-06-25T02:53:14.338Z"
+}

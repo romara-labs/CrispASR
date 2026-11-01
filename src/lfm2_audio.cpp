@@ -10,6 +10,7 @@
 // DRY: reuses core/gguf_loader.h, core/mel.h, core/fastconformer.h, core/attention.h
 
 #include "lfm2_audio.h"
+#include "core/crispasr_env.h"
 #include "core/win_compat.h"
 
 #include "ggml.h"
@@ -31,6 +32,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +47,7 @@
 static bool lfm2_audio_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("LFM2_AUDIO_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_LFM2_AUDIO_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -592,14 +594,14 @@ lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, lfm2_audio
     }
     ctx->use_gpu = params.use_gpu;
     // Initialize backend: GPU if available and requested, else CPU
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads);
     ctx->compute_meta.resize(256ULL * 1024 * 1024); // 256 MB scratch for prefill
     ctx->decode_meta.resize(64ULL * 1024 * 1024);   // 64 MB scratch for T=1 decode
 
@@ -662,7 +664,7 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     if (!ctx)
         return;
     if (ctx->detok.buf)
-        ggml_backend_buffer_free(ctx->detok.buf);
+        core_gguf::release_weight_buffer(ctx->detok.buf);
     if (ctx->detok.ctx)
         ggml_free(ctx->detok.ctx);
     if (ctx->sched)
@@ -674,7 +676,7 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     ctx->model.pw_q8.free();
     ctx->model.qkv_fused.free();
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)
@@ -1131,11 +1133,13 @@ static Lfm2StepResult lfm2_backbone_step(lfm2_audio_context* ctx, const float* e
     }
     if (causal_mask) {
         const int Lk = n_past + T_in;
-        std::vector<ggml_fp16_t> mask_data(Lk * T_in);
-        ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), neginf = ggml_fp32_to_fp16(-INFINITY);
-        for (int q = 0; q < T_in; q++)
-            for (int k = 0; k < Lk; k++)
-                mask_data[q * Lk + k] = (k <= n_past + q) ? zero : neginf;
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), neginf = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<ggml_fp16_t> mask_data((size_t)Lk * T_in, neginf);
+        for (int q = 0; q < T_in; q++) {
+            int count = std::min(Lk, n_past + q + 1);
+            if (count > 0)
+                std::fill_n(mask_data.data() + (size_t)q * Lk, count, zero);
+        }
         ggml_backend_tensor_set(causal_mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
     // Set conv state inputs
@@ -1323,14 +1327,20 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
     }
 
     for (int step = 0; step < max_tokens; step++) {
-        // Greedy argmax
-        int best_id = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < (int)logits.size(); i++) {
-            if (logits[i] > best_val) {
+        // Greedy argmax — NaN-robust: a non-finite logits[0] would freeze best_id
+        // at 0 (x > NaN is always false), silently spewing token 0. Seed from
+        // -inf, skip non-finite, and abort if the whole row is non-finite.
+        int best_id = -1;
+        float best_val = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < (int)logits.size(); i++) {
+            if (std::isfinite(logits[i]) && logits[i] > best_val) {
                 best_val = logits[i];
                 best_id = i;
             }
+        }
+        if (best_id < 0) {
+            fprintf(stderr, "lfm2_audio: non-finite logits — aborting decode\n");
+            break;
         }
 
         // Stop on <|im_end|> or <|endoftext|>
@@ -1670,7 +1680,7 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
 
     // Run all 16 LFM2 layers, with optional per-layer snapshots
     std::vector<ggml_tensor*> layer_snaps(hp.lfm_n_layers, nullptr);
-    bool do_snaps = (std::getenv("LFM2_SNAP_LAYERS") != nullptr);
+    bool do_snaps = (crispasr_env::get("CRISPASR_LFM2_SNAP_LAYERS") != nullptr);
 
     for (uint32_t i = 0; i < hp.lfm_n_layers; i++) {
         x = lfm2_build_layer(ctx0, x, model.lfm_layers[i], positions, mask, hidden, n_heads, n_kv, hd, T, norm_eps);
@@ -1726,11 +1736,11 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
         ggml_backend_tensor_set(positions, pos.data(), 0, T * sizeof(int32_t));
     }
     if (mask->buffer) {
-        std::vector<ggml_fp16_t> m((size_t)T * T);
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), neginf = ggml_fp32_to_fp16(-INFINITY);
-        for (int i = 0; i < T; i++)
-            for (int j = 0; j < T; j++)
-                m[(size_t)i * T + j] = (j <= i) ? zero : neginf;
+        std::vector<ggml_fp16_t> m((size_t)T * T, neginf);
+        for (int i = 0; i < T; i++) {
+            std::fill_n(m.data() + (size_t)i * T, i + 1, zero);
+        }
         ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
     }
 
@@ -1842,7 +1852,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
 
     ggml_cgraph* gf0 = ggml_new_graph(ctx0);
     ggml_build_forward_expand(gf0, proj_out);
-    ggml_graph_compute_with_ctx(ctx0, gf0, ctx->n_threads);
+    core_cpu_backend::compute(ctx0, gf0, ctx->n_threads);
 
     // Extract projected values
     std::vector<float> proj_data(codebooks * depth_dim);
@@ -2044,7 +2054,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
             if (vs)
                 ggml_build_forward_expand(gf, vs);
         }
-        ggml_graph_compute_with_ctx(sc, gf, ctx->n_threads);
+        core_cpu_backend::compute(sc, gf, ctx->n_threads);
 
         // Update KV cache from snapshots
         for (int il = 0; il < depth_n_layers; il++) {
@@ -2081,7 +2091,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
             ggml_tensor* emb_out = ggml_dup(sc, emb);
             ggml_cgraph* gf2 = ggml_new_graph(sc);
             ggml_build_forward_expand(gf2, emb_out);
-            ggml_graph_compute_with_ctx(sc, gf2, 1);
+            core_cpu_backend::compute(sc, gf2, 1);
             memcpy(prev_emb.data(), emb_out->data, sizeof(float) * depth_dim);
         }
 
@@ -2104,6 +2114,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
 // ISTFT-based audio decoder: Mimi codes → PCM at 24 kHz.
 // Uses the detokenizer model weights if loaded, otherwise returns nullptr.
 #include "core/istft.h"
+#include "core/ggml_cpu_backend.h"
 
 // Helper: embed audio codes via audio_embedding and sum across codebooks.
 // Returns (hidden,) float vector = sum_c audio_embd[code_c + c * audio_vocab].
@@ -2279,7 +2290,7 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
         ggml_tensor* o = ggml_dup(ec, rows);
         ggml_cgraph* g = ggml_new_graph(ec);
         ggml_build_forward_expand(g, o);
-        ggml_graph_compute_with_ctx(ec, g, 1);
+        core_cpu_backend::compute(ec, g, 1);
         const float* od = (const float*)o->data;
         for (int j = 0; j < h; j++) {
             float s = 0;
@@ -2309,10 +2320,15 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
     memcpy(x->data, up.data(), sizeof(float) * Tu * h);
     ggml_tensor* mask = ggml_new_tensor_2d(c0, GGML_TYPE_F16, Tu, Tu);
     {
-        ggml_fp16_t *m = (ggml_fp16_t*)mask->data, z = ggml_fp32_to_fp16(0.0f), ni = ggml_fp32_to_fp16(-INFINITY);
-        for (int q = 0; q < Tu; q++)
-            for (int k = 0; k < Tu; k++)
-                m[q * Tu + k] = ((k <= q) && (q - k) < d.sliding_window) ? z : ni;
+        ggml_fp16_t* m = (ggml_fp16_t*)mask->data;
+        const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ni = ggml_fp32_to_fp16(-INFINITY);
+        std::fill_n(m, (size_t)Tu * Tu, ni);
+        for (int q = 0; q < Tu; q++) {
+            int k_start = std::max(0, q - (int)d.sliding_window + 1);
+            int count = q - k_start + 1;
+            if (count > 0)
+                std::fill_n(m + (size_t)q * Tu + k_start, count, z);
+        }
     }
     ggml_tensor* pos = ggml_new_tensor_1d(c0, GGML_TYPE_I32, Tu);
     for (int i = 0; i < Tu; i++)
@@ -2370,7 +2386,7 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
     ggml_tensor* out = ggml_dup(c0, lin);
     ggml_set_name(out, "do");
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(c0, gf, ctx->n_threads);
+    core_cpu_backend::compute(c0, gf, ctx->n_threads);
 
     // 4. Split log_mag + angle → ISTFT → PCM
     const float* od = (const float*)out->data;
@@ -2381,7 +2397,8 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
             phase[t * nq + f] = od[t * d.output_size + nq + f];
         }
     ggml_free(c0);
-    auto pcm_v = core_istft::istft(mag.data(), phase.data(), 1280, 320, Tu, nullptr, core_istft::TRIM_SAME);
+    auto pcm_v = core_istft::istft(mag.data(), phase.data(), 1280, 320, Tu, nullptr, core_istft::TRIM_SAME, 0.0f, 1e-8f,
+                                   false, ctx->n_threads);
     for (float& s : pcm_v)
         s = std::max(-1.0f, std::min(1.0f, s));
     float* pcm = (float*)malloc(pcm_v.size() * sizeof(float));

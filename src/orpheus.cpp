@@ -30,6 +30,7 @@
 #include "core/attention.h"
 #include "core/snac.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -49,6 +50,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -59,7 +61,7 @@ namespace {
 static bool orpheus_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("ORPHEUS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_ORPHEUS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -209,10 +211,10 @@ struct orpheus_context {
             ggml_free(ctx_w);
         }
         if (buf_w) {
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         }
         if (buf_w_cpu) {
-            ggml_backend_buffer_free(buf_w_cpu);
+            core_gguf::release_weight_buffer(buf_w_cpu);
         }
         if (backend && backend != backend_cpu) {
             ggml_backend_free(backend);
@@ -372,13 +374,13 @@ extern "C" struct orpheus_context* orpheus_init_from_file(const char* path_model
     }
 
     // Backend selection.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "orpheus: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, c->n_threads);
     c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
@@ -452,7 +454,7 @@ extern "C" void orpheus_set_n_threads(struct orpheus_context* ctx, int n_threads
     }
     ctx->n_threads = n_threads > 0 ? n_threads : 1;
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
 }
 
@@ -950,7 +952,7 @@ static std::vector<int32_t> build_prompt_ids(orpheus_context* c, const std::stri
     // Diff-harness override: force the exact prompt token IDs from the Python
     // reference (avoids any C++/HF BPE tokenizer mismatch), mirroring
     // PARLER_PROMPT_IDS. Comma-separated full prompt (incl. control tokens).
-    if (const char* ov = std::getenv("ORPHEUS_PROMPT_IDS"); ov && *ov) {
+    if (const char* ov = crispasr_env::get("CRISPASR_ORPHEUS_PROMPT_IDS"); ov && *ov) {
         std::vector<int32_t> out;
         const char* p = ov;
         while (*p) {
@@ -1034,7 +1036,7 @@ extern "C" int32_t* orpheus_synthesize_codes(struct orpheus_context* ctx, const 
     std::vector<int32_t> custom_ids;
     custom_ids.reserve(max_audio);
     const int top_k = 50; // engine_class.py default sampling shape
-    const bool debug = ctx->params.verbosity >= 2 || std::getenv("ORPHEUS_DEBUG") != nullptr;
+    const bool debug = ctx->params.verbosity >= 2 || crispasr_env::get("CRISPASR_ORPHEUS_DEBUG") != nullptr;
     int n_dropped = 0;
     int first_tok = -1;
     int last_tok = -1;

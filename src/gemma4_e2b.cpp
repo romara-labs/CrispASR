@@ -17,6 +17,7 @@
 #include "core/greedy_decode.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -32,6 +33,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `GEMMA4_E2B_BENCH=1` for per-stage timings.
@@ -40,7 +42,7 @@
 static bool gemma4_e2b_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GEMMA4_E2B_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1515,7 +1517,7 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
         return nullptr;
     auto& m = ctx->model;
     auto& lhp = m.llm_hp;
-    const bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+    const bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
     const int d = (int)lhp.hidden_size;
     const int total = (int)prompt_ids.size();
 
@@ -1804,13 +1806,13 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
     // Use CPU for weights — the LLM decoder can use ggml_backend_sched
     // to auto-copy to GPU for batched matmuls, and the audio conformer
     // uses single-graph execution.
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "gemma4_e2b: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -2116,7 +2118,7 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
     auto& m = ctx->model;
     auto& ahp = m.audio_hp;
     auto& lhp = m.llm_hp;
-    const bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+    const bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
     const float eps = lhp.rms_norm_eps;
     gemma4_e2b_bench_stage _b_total("total");
 
@@ -2715,9 +2717,9 @@ extern "C" void gemma4_e2b_free(struct gemma4_e2b_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
-        ggml_backend_buffer_free(ctx->model.buf_w);
+        core_gguf::release_weight_buffer(ctx->model.buf_w);
     if (ctx->model.buf_w_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend_cpu)
@@ -2731,7 +2733,7 @@ extern "C" void gemma4_e2b_set_n_threads(struct gemma4_e2b_context* ctx, int n_t
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
         if (ctx->backend_cpu)
-            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+            core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

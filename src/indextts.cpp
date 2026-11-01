@@ -27,6 +27,7 @@
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/tts_ref_cache.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -46,6 +47,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // External text-normalizer hook is available on macOS host + Linux only:
 //   * iOS / tvOS / watchOS / visionOS: system() is __API_UNAVAILABLE(ios)
@@ -77,7 +79,7 @@ namespace {
 static bool indextts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("INDEXTTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_INDEXTTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -332,7 +334,7 @@ static std::string maybe_external_normalize(const std::string& text) {
 }
 #else
 static std::string maybe_external_normalize(const std::string& text) {
-    const char* cmd = getenv("INDEXTTS_TEXT_NORMALIZER");
+    const char* cmd = crispasr_env::get("CRISPASR_INDEXTTS_TEXT_NORMALIZER");
     if (!cmd || !cmd[0]) {
         return text;
     }
@@ -724,7 +726,7 @@ struct indextts_context {
             ggml_free(ctx_w);
         }
         if (buf_w) {
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         }
         if (backend && backend != backend_cpu) {
             ggml_backend_free(backend);
@@ -917,7 +919,7 @@ static std::vector<float> compute_ref_mel(const float* pcm, int n_samples, int i
     }
 
     // Debug: override resampled audio from file if INDEXTTS_AUDIO24K_FILE is set
-    const char* a24k_file = getenv("INDEXTTS_AUDIO24K_FILE");
+    const char* a24k_file = crispasr_env::get("CRISPASR_INDEXTTS_AUDIO24K_FILE");
     if (a24k_file && a24k_file[0]) {
         FILE* f = fopen(a24k_file, "rb");
         if (f) {
@@ -1396,7 +1398,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
     auto mel = compute_ref_mel(ref_pcm, ref_n_samples, ref_sr, &T_mel);
 
     // Debug: override mel from file if INDEXTTS_MEL_FILE is set (MelsTime format)
-    const char* mel_file = getenv("INDEXTTS_MEL_FILE");
+    const char* mel_file = crispasr_env::get("CRISPASR_INDEXTTS_MEL_FILE");
     if (mel_file && mel_file[0]) {
         FILE* f = fopen(mel_file, "rb");
         if (f) {
@@ -1449,7 +1451,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         fprintf(stderr, "indextts: ref mel: %d frames x 100 bands\n", T_mel);
     }
 
-    const bool dbg = getenv("INDEXTTS_DEBUG") != nullptr;
+    const bool dbg = crispasr_env::get("CRISPASR_INDEXTTS_DEBUG") != nullptr;
 
     // Debug: check mel values
     {
@@ -1654,7 +1656,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
     }
 
     // Debug: override conditioning from file
-    const char* cond_file = getenv("INDEXTTS_COND_FILE");
+    const char* cond_file = crispasr_env::get("CRISPASR_INDEXTTS_COND_FILE");
     if (cond_file && cond_file[0]) {
         FILE* f = fopen(cond_file, "rb");
         if (f) {
@@ -2325,7 +2327,7 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
     }
 
     // Backend
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "indextts: failed to init CPU backend\n");
         delete c;
@@ -2470,7 +2472,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     }
 
     // Debug: override conditioning from file (works even without reference audio)
-    const char* cond_file = getenv("INDEXTTS_COND_FILE");
+    const char* cond_file = crispasr_env::get("CRISPASR_INDEXTTS_COND_FILE");
     if (cond_file && cond_file[0]) {
         FILE* f = fopen(cond_file, "rb");
         if (f) {
@@ -2574,7 +2576,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     // full ~158 MiB KV cache per beam. INDEXTTS_BEAM_SIZE=1 skips the swap
     // entirely (greedy, ~2× faster).
     int B = 3;
-    if (const char* bs = getenv("INDEXTTS_BEAM_SIZE")) {
+    if (const char* bs = crispasr_env::get("CRISPASR_INDEXTTS_BEAM_SIZE")) {
         int v = atoi(bs);
         if (v >= 1 && v <= 16) {
             B = v;
@@ -2594,7 +2596,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     //     a parent (children inherit parent's KV, only spend a copy when
     //     siblings split off the same parent).
     bool use_device_kv = false;
-    if (const char* e = getenv("INDEXTTS_KV_DEVICE_COPY")) {
+    if (const char* e = crispasr_env::get("CRISPASR_INDEXTTS_KV_DEVICE_COPY")) {
         use_device_kv = (atoi(e) != 0);
     }
 
@@ -2956,7 +2958,7 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     }
 
     // Debug: override mel codes from file if INDEXTTS_MEL_CODES_FILE is set
-    const char* mc_file = getenv("INDEXTTS_MEL_CODES_FILE");
+    const char* mc_file = crispasr_env::get("CRISPASR_INDEXTTS_MEL_CODES_FILE");
     if (mc_file && mc_file[0]) {
         FILE* f = fopen(mc_file, "rb");
         if (f) {
@@ -3032,7 +3034,7 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
             // conditioning energy. INDEXTTS_SPK_NORM controls the behaviour:
             //   unset / "raw"   → pass through unchanged (matches upstream)
             //   "0.9" / "1.0" …→ rescale to that L2 norm (old behaviour)
-            const char* spk_norm_env = getenv("INDEXTTS_SPK_NORM");
+            const char* spk_norm_env = crispasr_env::get("CRISPASR_INDEXTTS_SPK_NORM");
             float target_norm = 0.0f;
             if (spk_norm_env && spk_norm_env[0] && strcmp(spk_norm_env, "raw") != 0) {
                 target_norm = (float)atof(spk_norm_env);
@@ -3068,7 +3070,7 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     }
 
     // Debug: override latent from file if INDEXTTS_LATENT_FILE is set
-    const char* lat_file = getenv("INDEXTTS_LATENT_FILE");
+    const char* lat_file = crispasr_env::get("CRISPASR_INDEXTTS_LATENT_FILE");
     if (lat_file && lat_file[0]) {
         FILE* f = fopen(lat_file, "rb");
         if (f) {

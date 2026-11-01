@@ -1,10 +1,9 @@
 // mimo_asr.cpp — runtime for XiaomiMiMo/MiMo-V2.5-ASR
 //
-// SCAFFOLD ONLY (April 2026): the model loads, the tensors are
-// populated from the GGUF, and the transcribe entry point returns
-// an explicit "not implemented" string so callers can integrate
-// against the C ABI today and the encoder/LLM forward passes can
-// land incrementally without breaking the build.
+// Native audio-tokenizer -> speech adapter -> Qwen2 language model ASR.
+// CPU decode reuses a T=1 graph; GPU decode currently rebuilds the prefill
+// graph to preserve cross-backend embedding routing. Optional graph-phase
+// instrumentation reports where that path spends its time.
 //
 // Architecture (from the converter docstring + config.json):
 //
@@ -27,22 +26,16 @@
 //       are present in the checkpoint but only used in TTS-direction
 //       generation. We can ignore them for ASR.
 //
-// Known follow-ups (PLAN #51):
-//   - Audio: load the mimo-tokenizer GGUF (cstr/mimo-tokenizer-GGUF)
-//     and run its encoder over PCM → 8-channel RVQ code stream.
-//   - Wire the codes through speech_embeddings → input_local_transformer
-//     → hidden_proj → LLM.embed augmentation as the prefill prompt.
-//   - LLM forward: standard Qwen2 — fully covered by
-//     core_attn::kv_self_attn + core_ffn::swiglu, same call site as
-//     qwen3-asr / gemma4-e2b.
-
 #include "mimo_asr.h"
+#include "core/mimo_prompt.h"
 
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/model_weight_usage.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "crispasr_imatrix.h"
@@ -61,6 +54,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -71,7 +65,7 @@ namespace {
 static bool mimo_asr_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MIMO_ASR_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MIMO_ASR_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -87,6 +81,36 @@ struct mimo_asr_bench_stage {
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::fprintf(stderr, "  mimo_asr_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
+// Detailed host-wall profile, separate from the coarse BENCH switch. Graph
+// compute is synchronous in ggml; input time includes host mask construction
+// and tensor uploads. These are phase timings, not CUDA kernel-only durations.
+struct mimo_asr_graph_profile {
+    bool enabled = crispasr_env::truthy("CRISPASR_MIMO_ASR_GRAPH_PROFILE");
+    const char* path;
+    int n_past;
+    std::chrono::steady_clock::time_point last;
+    mimo_asr_graph_profile(const char* route, int past) : path(route), n_past(past) {
+        if (enabled)
+            last = std::chrono::steady_clock::now();
+    }
+    void mark(const char* phase) {
+        if (!enabled)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        std::fprintf(stderr, "mimo_asr_graph: path=%s past=%d phase=%s ms=%.6f\n", path, n_past, phase, ms);
+        last = std::chrono::steady_clock::now();
+    }
+    void graph(ggml_backend_sched_t sched, ggml_cgraph* gf, bool cached) {
+        if (enabled) {
+            std::fprintf(stderr, "mimo_asr_graph: path=%s past=%d nodes=%d splits=%d pipeline_copies=%d cached=%d\n",
+                         path, n_past, ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched),
+                         ggml_backend_sched_get_n_copies(sched), cached ? 1 : 0);
+            last = std::chrono::steady_clock::now();
+        }
     }
 };
 
@@ -202,6 +226,8 @@ struct mimo_asr_context {
     ggml_tensor* kv_v = nullptr;
     int kv_max_ctx = 0;
     int kv_n_used = 0;
+    // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
+    int max_new_tokens = 256;
 
     // 51b' cached T=1 step graph. Built lazily on first decode step of a
     // transcribe call with fixed_kv_len = kv_max_ctx so the topology is
@@ -234,7 +260,8 @@ struct mimo_asr_context {
     int32_t id_eot = 151653;      // <|eot|>
     int32_t id_eostm = 151654;    // <|eostm|>
 
-    std::string ask; // custom instruction (empty = use default)
+    std::string ask;      // custom instruction (empty = use default)
+    std::string language; // en/zh bias; empty/auto = model-side detection
 
     int beam_size = 1; // 1 = greedy (default); >1 = beam search (§167f)
 };
@@ -347,13 +374,13 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     }
 
     // Backends
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "mimo_asr: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     // PLAN #115: force the whole mimo-asr pipeline to CPU until option C
     // lands. Two failure modes regress on M1 Metal otherwise:
     //   - weights on GPU (PLAN #72 commit 89111260): prefill graph
@@ -407,7 +434,8 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     if (do_split) {
         core_gguf::LayerSplitConfig cfg{"model.layers.", n_gpu_layers_env};
         if (!core_gguf::load_weights_split(path_model, ctx->backend_cpu, ctx->backend_cpu,
-                                           core_gguf::is_gpu_tensor_with_prefix, &cfg, "mimo_asr", wl)) {
+                                           core_gguf::is_gpu_tensor_with_prefix, &cfg, "mimo_asr", wl,
+                                           {core_gguf::mimo_weight_usage, nullptr})) {
             fprintf(stderr, "mimo_asr: split load failed from '%s'\n", path_model);
             delete ctx;
             return nullptr;
@@ -426,14 +454,15 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
             return !(std::strstr(n, "embed") || std::strstr(n, "audio.emb"));
         };
         if (!core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu, is_gpu_weight, nullptr,
-                                           "mimo_asr", wl)) {
+                                           "mimo_asr", wl, {core_gguf::mimo_weight_usage, nullptr})) {
             fprintf(stderr, "mimo_asr: GPU split load failed from '%s'\n", path_model);
             delete ctx;
             return nullptr;
         }
         ctx->gpu_embed_split = true;
     } else {
-        if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "mimo_asr", wl)) {
+        if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "mimo_asr", wl,
+                                     {core_gguf::mimo_weight_usage, nullptr})) {
             fprintf(stderr, "mimo_asr: failed to load weights from '%s'\n", path_model);
             delete ctx;
             return nullptr;
@@ -989,8 +1018,9 @@ static ggml_cgraph* mimo_asr_build_step_graph(mimo_asr_context* ctx, int n_past,
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Embed lookup straight from llm.embed_w (no audio fusion).
-    // This step graph is only used on the CPU path (gpu_embed_split routes
-    // decode steps through the prefill graph instead — see run_lm_step).
+    // CPU is the default user; opt-in GPU decode uses the same in-graph
+    // gather with CPU-resident Q4_K embeddings and device-resident LM weights.
+    // The working GPU prefill route remains the default (see run_lm_step).
     ggml_tensor* text_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
     ggml_set_input(text_ids);
     ggml_set_name(text_ids, "text_input_ids");
@@ -1285,6 +1315,12 @@ extern "C" int mimo_asr_set_tokenizer_path(struct mimo_asr_context* ctx, const c
     return 0;
 }
 
+// #292: forward --max-new-tokens. n <= 0 keeps the backend's 256 default.
+extern "C" void mimo_asr_set_max_new_tokens(struct mimo_asr_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
+}
+
 // ===========================================================================
 // PLAN #51 step 8 — full transcribe pipeline.
 //
@@ -1478,7 +1514,8 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
         return nullptr;
     }
 
-    if (ctx->gpu_embed_split) {
+    const bool gpu_step_graph = ctx->gpu_embed_split && crispasr_env::truthy("CRISPASR_MIMO_ASR_GPU_STEP_GRAPH");
+    if (ctx->gpu_embed_split && !gpu_step_graph) {
         // PLAN #115 option B (GPU path): reuse the prefill graph for
         // decode steps. The prefill graph handles the cross-backend embed
         // lookup correctly (scheduler routes get_rows to CPU, copies the
@@ -1509,6 +1546,9 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
     const int fixed_kv = ctx->kv_max_ctx;
     const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
 
+    mimo_asr_graph_profile profile(gpu_step_graph ? (can_skip ? "gpu_cached_step" : "gpu_new_step")
+                                                  : (can_skip ? "cpu_cached_step" : "cpu_new_step"),
+                                   n_past_groups);
     ggml_cgraph* gf;
     if (can_skip) {
         gf = ctx->step_t1_gf;
@@ -1516,11 +1556,13 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
         gf = mimo_asr_build_step_graph(ctx, /*n_past*/ 0, /*fixed_kv_len*/ fixed_kv);
         if (!gf)
             return nullptr;
+        profile.mark("graph_build");
         ggml_backend_sched_reset(ctx->sched);
         if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
             fprintf(stderr, "mimo_asr_run_lm_step: alloc_graph failed\n");
             return nullptr;
         }
+        profile.mark("allocation");
         ctx->step_t1_gf = gf;
         ctx->step_t1_fixed_kv_len = fixed_kv;
     }
@@ -1548,11 +1590,14 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
     if (!set_t("lm_causal_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t)))
         return nullptr;
 
+    profile.mark("inputs");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "mimo_asr_run_lm_step: compute failed\n");
         return nullptr;
     }
 
+    profile.mark("compute");
+    profile.graph(ctx->sched, gf, can_skip);
     ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "step_logits");
     if (!logits_t)
         return nullptr;
@@ -1560,6 +1605,7 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
     if (!out)
         return nullptr;
     ggml_backend_tensor_get(logits_t, out, 0, (size_t)vocab * sizeof(float));
+    profile.mark("readback");
     return out;
 }
 
@@ -1573,16 +1619,21 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
         return nullptr;
     const int Tg = T_total / gs;
 
+    mimo_asr_graph_profile profile(n_past == 0 ? "prefill" : "gpu_prefill_step", n_past);
     PrefillInputs pi = make_prefill_inputs(hp, input_ids_9xT, T_total, (uint32_t)ctx->id_empty);
 
+    profile.mark("host_inputs");
     // Production path: skip diag captures (~5% win + cleaner allocator,
     // PLAN #51 perf wave). Honour MIMO_ASR_DIAG=1 to keep the diag tensors
     // resident when debugging a transcribe-time regression directly.
-    const bool diag_env = std::getenv("MIMO_ASR_DIAG") != nullptr || std::getenv("MIMO_ASR_DUMP_STAGES") != nullptr;
+    const bool diag_env = crispasr_env::get("CRISPASR_MIMO_ASR_DIAG") != nullptr ||
+                          crispasr_env::get("CRISPASR_MIMO_ASR_DUMP_STAGES") != nullptr;
     ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, n_past, /*diag_captures*/ diag_env);
+    profile.mark("graph_build");
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
+    profile.mark("allocation");
 
     auto set_t = [&](const char* nm, const void* data, size_t bytes) {
         ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
@@ -1632,14 +1683,17 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
             return nullptr;
     }
 
+    profile.mark("inputs");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
         return nullptr;
+    profile.mark("compute");
+    profile.graph(ctx->sched, gf, false);
 
     // Per-stage tensor stats dump (MIMO_ASR_DUMP_STAGES=1) — mirrors funasr's
     // FUNASR_DUMP_STAGES so a CPU run and a GPU run (CRISPASR_MIMO_FORCE_GPU=1)
     // can be compared stage-by-stage to localise where the PLAN #115 GPU
     // prefill diverges (NaN / wrong / zero).
-    if (std::getenv("MIMO_ASR_DUMP_STAGES")) {
+    if (crispasr_env::get("CRISPASR_MIMO_ASR_DUMP_STAGES")) {
         static const char* dump_stages[] = {
             "prefill_audio_features", "prefill_text_embeds",       "prefill_inputs_embeds",
             "prefill_last_hidden",    "prefill_text_logits_step0",
@@ -1679,6 +1733,7 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
         }
     }
 
+    profile.mark("diagnostics");
     ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "prefill_text_logits_step0");
     if (!logits_t)
         return nullptr;
@@ -1687,7 +1742,26 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
     if (!out)
         return nullptr;
     ggml_backend_tensor_get(logits_t, out, 0, nlog * sizeof(float));
+    profile.mark("readback");
     return out;
+}
+
+// Optional diagnostic capture, outside timed runs. Full-vocabulary logits,
+// including magnitudes, allow cached and legacy decode to be compared stepwise.
+static void mimo_asr_dump_step_logits(const float* logits, size_t count, int past) {
+    const char* directory = crispasr_env::get("CRISPASR_MIMO_ASR_DUMP_STEP_LOGITS");
+    if (!directory)
+        return;
+    const std::string path = std::string(directory) + "/" + std::to_string(past) + ".f32";
+    FILE* file = fopen(path.c_str(), "wb");
+    if (!file) {
+        fprintf(stderr, "mimo_asr: step logit dump open failed: %s\n", path.c_str());
+        return;
+    }
+    const size_t written = fwrite(logits, sizeof(float), count, file);
+    const int closed = fclose(file);
+    if (written != count || closed != 0)
+        fprintf(stderr, "mimo_asr: step logit dump write failed: %s\n", path.c_str());
 }
 
 // Internal: shared implementation for `mimo_asr_transcribe` and
@@ -1751,10 +1825,10 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
     add_text("<|im_start|>user\n");
     segments.push_back(mimo_asr_build_audio_segment(ctx, codes, n_frames));
     free(codes);
-    add_text(!ctx->ask.empty() ? ctx->ask : std::string("Please transcribe this audio file"));
+    add_text(core_mimo_prompt::instruction(ctx->language, ctx->ask));
     add_text("<|im_end|>\n");
     add_text("<|im_start|>assistant\n");
-    add_text("<think>\n\n</think>\n<english>");
+    add_text(std::string("<think>\n\n</think>\n") + mimo_asr_language_tag(ctx->language.c_str()));
 
     std::vector<int> seg_lens;
     auto input_ids = mimo_asr_concat_segments(channels + 1, segments, seg_lens);
@@ -1764,7 +1838,7 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
 
     // 4. KV cache budget: prompt groups + max_new_tokens (one new group
     // per generated text token).
-    const int max_new = 256;
+    const int max_new = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 256;
     if (!mimo_asr_kv_init(ctx, T_total / gs + max_new + 16))
         return nullptr;
 
@@ -1777,7 +1851,7 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
     ctx->step_t1_fixed_kv_len = 0;
 
     // 5. Prefill.
-    const bool bench = std::getenv("MIMO_ASR_BENCH") != nullptr;
+    const bool bench = crispasr_env::get("CRISPASR_MIMO_ASR_BENCH") != nullptr;
     auto now_ms = []() {
         using namespace std::chrono;
         return duration_cast<duration<double, std::milli>>(steady_clock::now().time_since_epoch()).count();
@@ -1825,6 +1899,7 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
     if (capture_probs)
         generated_probs.reserve((size_t)max_new);
     float prob = 0.0f;
+    mimo_asr_dump_step_logits(logits, (size_t)vocab, 0);
     int next = pick(logits, (capture_probs || on_tok) ? &prob : nullptr);
     free(logits);
     generated.push_back(next);
@@ -1847,6 +1922,7 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
         float* L = mimo_asr_run_lm_step(ctx, next, n_past_groups);
         if (!L)
             return nullptr;
+        mimo_asr_dump_step_logits(L, (size_t)vocab, n_past_groups);
         next = pick(L, (capture_probs || on_tok) ? &prob : nullptr);
         free(L);
         n_past_groups++;
@@ -1919,9 +1995,9 @@ extern "C" void mimo_asr_free(struct mimo_asr_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->buf_w_cpu)
-        ggml_backend_buffer_free(ctx->buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_w_cpu);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1984,12 +2060,21 @@ extern "C" void mimo_asr_set_n_threads(struct mimo_asr_context* ctx, int n_threa
         return;
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 extern "C" void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt) {
     if (ctx)
         ctx->ask = (prompt && prompt[0]) ? prompt : "";
+}
+
+extern "C" const char* mimo_asr_language_tag(const char* language) {
+    return core_mimo_prompt::language_tag(language);
+}
+
+extern "C" void mimo_asr_set_language(struct mimo_asr_context* ctx, const char* language) {
+    if (ctx)
+        ctx->language = (language && language[0]) ? language : "";
 }
 
 extern "C" void mimo_asr_set_beam_size(struct mimo_asr_context* ctx, int beam_size) {

@@ -12,6 +12,7 @@
 #include "mini_omni2.h"
 
 #include <cstdio>
+#include <cstdlib> // [libc++ 23.1.3] free is no longer pulled in transitively
 #include <cstring>
 #include <string>
 #include <vector>
@@ -105,6 +106,8 @@ public:
         if (!ctx_)
             return out;
 
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        mini_omni2_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
         char* text = mini_omni2_transcribe(ctx_, samples, n_samples);
         if (!text)
             return out;

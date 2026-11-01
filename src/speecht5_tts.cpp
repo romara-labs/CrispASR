@@ -26,6 +26,7 @@
 #include "core/gguf_loader.h"
 #include "core/hifigan.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -42,6 +43,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `SPEECHT5_TTS_BENCH=1` for per-stage timings.
@@ -50,7 +52,7 @@
 static bool speecht5_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("SPEECHT5_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_SPEECHT5_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -231,6 +233,11 @@ struct speecht5_tts_context {
     std::vector<ggml_tensor*> ups_w_perm;
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
+
+    // FASTCONV: baked F32 copies of the vocoder's F16 conv kernels, so the
+    // fork's per-graph F16→F32 cast becomes a no-op (docs/perf-sweep/PLAN.md).
+    // Gated CRISPASR_SPEECHT5_FASTCONV; disabled → legacy path unchanged.
+    core_dac::fastconv_cache voc_fc;
 
     // §202 Cross-attention K/V pre-computed from encoder output (constant per utterance).
     // Shape: [decoder_layers] tensors, each (hidden_size, T_enc) on device.
@@ -1046,7 +1053,7 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
 
     // ── SPEECHT5_DUMP_DIR: per-step intermediate dumps ──
     {
-        static const char* dump_dir = getenv("SPEECHT5_DUMP_DIR");
+        static const char* dump_dir = crispasr_env::get("CRISPASR_SPEECHT5_DUMP_DIR");
         if (dump_dir) {
             auto dump_f32 = [&](const char* tag, const float* data, size_t n) {
                 std::string path = std::string(dump_dir) + "/step" + std::to_string(dec_step) + "_" + tag + ".f32";
@@ -1251,7 +1258,7 @@ static std::vector<float> run_vocoder(speecht5_tts_context* ctx,
     ggml_set_input(mel_in);
 
     // Run HiFi-GAN — input is (T, C_in) = (T_mel, mel_dim)
-    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp, ctx->ups_w_perm);
+    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp, ctx->ups_w_perm, &ctx->voc_fc);
 
     ggml_set_name(waveform, "waveform");
 
@@ -1307,19 +1314,19 @@ struct speecht5_tts_context* speecht5_tts_init(const char* path, struct speecht5
     // Backend — prefer GPU (CUDA/Metal/Vulkan) when available + requested
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
     if (!ctx->backend) {
         fprintf(stderr, "speecht5: failed to init any backend\n");
         delete ctx;
         return nullptr;
     }
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads);
     }
 
     // Create backend scheduler
@@ -1419,6 +1426,19 @@ struct speecht5_tts_context* speecht5_tts_init(const char* path, struct speecht5
         }
         core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
                                                   &ctx->buf_perm);
+    }
+
+    // FASTCONV: bake one F32 copy of each F16 vocoder conv kernel (default on;
+    // set CRISPASR_SPEECHT5_FASTCONV=0 for the legacy A/B arm).
+    {
+        const char* e = std::getenv("CRISPASR_SPEECHT5_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        auto convs = core_hifigan::collect_fastconv_kernels(ctx->tensors(), "voc", ctx->voc_hp);
+        ctx->voc_fc.bake(ctx->backend, convs, on);
+        if (std::getenv("CRISPASR_SPEECHT5_FASTCONV_DEBUG")) {
+            fprintf(stderr, "speecht5: FASTCONV %s — baked %zu F32 kernels from %zu voc convs\n",
+                    ctx->voc_fc.enabled ? "ON" : "OFF", ctx->voc_fc.f32.size(), convs.size());
+        }
     }
 
     if (params.verbosity > 0) {
@@ -1580,6 +1600,7 @@ void speecht5_tts_pcm_free(float* pcm) {
 
 void speecht5_tts_free(struct speecht5_tts_context* ctx) {
     if (ctx) {
+        ctx->voc_fc.free();
         if (ctx->buf_perm)
             ggml_backend_buffer_free(ctx->buf_perm);
         if (ctx->ctx_perm)

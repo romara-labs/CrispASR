@@ -17,6 +17,7 @@
 #include "core/conv.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -33,6 +34,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `AUDIOSEAL_BENCH=1` for per-stage timings.
@@ -41,7 +43,7 @@
 static bool audioseal_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("AUDIOSEAL_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_AUDIOSEAL_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -251,6 +253,7 @@ struct audioseal_ctx {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
+    size_t sched_capacity = 0;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
@@ -316,7 +319,7 @@ struct audioseal_ctx {
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -469,16 +472,16 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
                                     const audioseal_lstm_layer lstm[2], const audioseal_conv& enc_out,
                                     const uint32_t ratios[4]) {
     // Input conv
-    if (std::getenv("AUDIOSEAL_DEBUG"))
+    if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
         fprintf(stderr, "  enc_in: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     if (enc_in.w) {
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  enc_in.w ne=[%lld,%lld,%lld]\n", (long long)enc_in.w->ne[0], (long long)enc_in.w->ne[1],
                     (long long)enc_in.w->ne[2]);
         x = conv1d(ctx, x, enc_in.w, enc_in.b, 1, 3, 1);
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after enc_in: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
-        if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
             ggml_set_name(x, "stage_enc_0");
             ggml_set_output(x);
         }
@@ -486,16 +489,16 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
 
     // 4 blocks: resblock → ELU → downsample
     for (int i = 0; i < 4; i++) {
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  resblock %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         x = build_resblock(ctx, x, res[i]);
-        if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
             char nm[32];
             snprintf(nm, sizeof(nm), "stage_enc_res%d", i);
             ggml_set_name(x, nm);
             ggml_set_output(x);
         }
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after resblock %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         x = elu(ctx, x);
         if (down[i].w) {
@@ -508,18 +511,18 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
             // ggml_conv_1d only supports symmetric padding.
             // NOTE: ggml_pad_ext convention may swap left/right — test both
             x = ggml_pad_ext(ctx, x, pad_right, pad_left, 0, 0, 0, 0, 0, 0);
-            if (std::getenv("AUDIOSEAL_DEBUG"))
+            if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
                 fprintf(stderr, "  down %d: ratio=%d K=%d pad_l=%d pad_r=%d w ne=[%lld,%lld,%lld]\n", i, ratio, K,
                         pad_left, pad_right, (long long)down[i].w->ne[0], (long long)down[i].w->ne[1],
                         (long long)down[i].w->ne[2]);
             x = conv1d(ctx, x, down[i].w, down[i].b, ratio, 0, 1); // pad=0 (done externally)
-            if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+            if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
                 char nm[32];
                 snprintf(nm, sizeof(nm), "stage_enc_down%d", i);
                 ggml_set_name(x, nm);
                 ggml_set_output(x);
             }
-            if (std::getenv("AUDIOSEAL_DEBUG"))
+            if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
                 fprintf(stderr, "  after down %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         }
     }
@@ -529,41 +532,41 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
     {
         ggml_tensor* lstm_in = x;
         int hidden = (int)x->ne[1]; // x is (T, D) in ggml, ne[0]=T, ne[1]=D
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM: x ne=[%lld,%lld] hidden=%d\n", (long long)x->ne[0], (long long)x->ne[1], hidden);
         // Transpose to (D, T) for LSTM
         x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (D, T)
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM after transpose: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
         for (int i = 0; i < 2; i++) {
             if (lstm[i].weight_ih)
                 x = lstm_layer_forward(ctx, x, lstm[i], hidden);
         }
         // Transpose back to (T, D)
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM output (before transpose back): x ne=[%lld,%lld]\n", (long long)x->ne[0],
                     (long long)x->ne[1]);
         x = ggml_cont(ctx, ggml_transpose(ctx, x));
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM output (after transpose back): x ne=[%lld,%lld]\n", (long long)x->ne[0],
                     (long long)x->ne[1]);
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  lstm_in: ne=[%lld,%lld]\n", (long long)lstm_in->ne[0], (long long)lstm_in->ne[1]);
         x = ggml_add(ctx, x, lstm_in); // skip connection
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after skip add: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     }
 
     // ELU + output conv
     x = elu(ctx, x);
-    if (std::getenv("AUDIOSEAL_DEBUG"))
+    if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
         fprintf(stderr, "  enc_out conv: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     if (enc_out.w) {
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  enc_out.w ne=[%lld,%lld,%lld]\n", (long long)enc_out.w->ne[0],
                     (long long)enc_out.w->ne[1], (long long)enc_out.w->ne[2]);
         x = conv1d(ctx, x, enc_out.w, enc_out.b, 1, 3, 1);
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after enc_out: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     }
 
@@ -665,9 +668,9 @@ struct audioseal_ctx* audioseal_init_from_file(const char* path, struct audiosea
         c->backend = crispasr_init_gpu_backend();
     }
     if (!c->backend) {
-        c->backend = ggml_backend_cpu_init();
+        c->backend = core_cpu_backend::init();
     }
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
 
     // Pass 2: weights
     core_gguf::WeightLoad wl;
@@ -697,9 +700,6 @@ struct audioseal_ctx* audioseal_init_from_file(const char* path, struct audiosea
         core_convt::permute_convt1d_weights_batch(srcs, dsts, n, c->backend, &c->ctx_perm, &c->buf_perm);
     }
 
-    // Allocate compute scratch (generous for ~5M param model)
-    c->compute_meta.resize(256 * 1024 * 1024); // 256 MB
-
     if (params.verbosity > 0) {
         fprintf(stderr,
                 "audioseal: loaded from '%s' — generator=%s detector=%s "
@@ -728,18 +728,52 @@ uint32_t audioseal_nbits(const struct audioseal_ctx* ctx) {
     return ctx ? ctx->hp.nbits : 16;
 }
 
+// Each unrolled LSTM layer creates at most 32 tensors per latent frame
+// (including views/reshapes and output concatenation). Embedding has four
+// layers; detection has two. Reserve another 1024 tensors for convolutions,
+// weights/inputs, message branches and debug outputs. The frame ceiling also
+// covers encoder rounding without depending on a fixed audio duration.
+static size_t prepare_graph(audioseal_ctx* ctx, int n_samples, size_t lstm_layers) {
+    if (ctx->sched)
+        ggml_backend_sched_reset(ctx->sched);
+    const size_t hop = std::max<size_t>(ctx->hp.hop_length, 1);
+    const size_t frames = ((size_t)n_samples + hop - 1) / hop;
+    const size_t capacity = 1024 + 32 * lstm_layers * frames;
+    ctx->compute_meta.resize(capacity * ggml_tensor_overhead() + ggml_graph_overhead_custom(capacity, false));
+    return capacity;
+}
+
+// The scheduler hash table covers both nodes AND leaves. It is shared by
+// embed/detect, so grow it whenever a later call builds a larger graph.
+static bool prepare_scheduler(audioseal_ctx* ctx, ggml_cgraph* gf) {
+    // All leaves are model weights, the four pre-permuted decoder weights,
+    // and the audio/message inputs. Counting all loaded weights is an upper
+    // bound even when only the generator or detector is used.
+    const size_t required = (size_t)ggml_graph_n_nodes(gf) + ctx->tensors.size() + 16;
+    if (!ctx->sched || ctx->sched_capacity < required) {
+        if (ctx->sched)
+            ggml_backend_sched_free(ctx->sched);
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        const int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched_capacity = required + 128;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, ctx->sched_capacity, false, false);
+    }
+    return ctx->sched && ggml_backend_sched_alloc_graph(ctx->sched, gf);
+}
+
 float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_samples, const uint8_t* message) {
     if (!ctx || !pcm || n_samples <= 0 || !ctx->has_generator)
         return nullptr;
     audioseal_bench_stage _bs_total("embed_total");
 
     // Build compute graph
+    const size_t graph_capacity = prepare_graph(ctx, n_samples, 4);
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0)
         return nullptr;
 
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, graph_capacity, false);
 
     // Input tensor: (T, 1) mono audio in (T, C) layout
     ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_samples, 1);
@@ -793,13 +827,7 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
     ggml_build_forward_expand(gf, output);
 
     // Allocate + compute
-    if (!ctx->sched) {
-        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
-        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
-    }
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    if (!prepare_scheduler(ctx, gf)) {
         fprintf(stderr, "audioseal: sched alloc graph failed\n");
         ggml_free(ctx0);
         return nullptr;
@@ -827,7 +855,7 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
     }
 
     // Dump intermediate stages for debug/diff comparison
-    if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+    if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
         const char* stage_names[] = {
             "stage_enc_0",    "stage_enc_res0",  "stage_enc_down0", "stage_enc_res1",  "stage_enc_down1",
             "stage_enc_res2", "stage_enc_down2", "stage_enc_res3",  "stage_enc_down3", "enc_output",
@@ -870,12 +898,13 @@ float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_sampl
         return nullptr;
     audioseal_bench_stage _bs_total("detect_total");
 
+    const size_t graph_capacity = prepare_graph(ctx, n_samples, 2);
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0)
         return nullptr;
 
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, graph_capacity, false);
 
     // Input
     ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_samples, 1);
@@ -939,13 +968,7 @@ float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_sampl
     }
 
     // Allocate + compute
-    if (!ctx->sched) {
-        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
-        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
-    }
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    if (!prepare_scheduler(ctx, gf)) {
         fprintf(stderr, "audioseal: sched alloc detect graph failed\n");
         ggml_free(ctx0);
         return nullptr;

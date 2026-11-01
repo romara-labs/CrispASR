@@ -12,6 +12,11 @@ rows by hand and the table drifted from reality (PLAN #61, #63, #71
 all spent effort closing exactly that drift). Regenerating from
 `--list-backends-json` makes drift impossible.
 
+Both files are ALWAYS written into <repo-root>/docs/ — the location is
+resolved from this script's own path, NOT from the current working
+directory (#407). Running from inside tools/ therefore writes to
+../docs/; the "wrote" lines print the absolute paths.
+
 Usage:
     python tools/gen-feature-matrix.py
     python tools/gen-feature-matrix.py --crispasr ./build/bin/crispasr
@@ -29,30 +34,72 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_DIR = REPO_ROOT / "docs"
 
-# Pretty labels for the cap slugs the binary reports. Order is the
-# display order in both outputs. Caps not listed here are appended in
-# JSON order with a fallback "Title Case" label so adding a cap to the
-# C++ side automatically shows up in both outputs.
-CAP_LABELS: list[tuple[str, str]] = [
-    ("transcribe", "Transcribe"),
-    ("tts", "TTS"),
-    ("voice-cloning", "Voice cloning"),
-    ("translate", "Translate"),
-    ("src-tgt-language", "Src/Tgt language"),
-    ("language-detect", "Language detect"),
-    ("auto-download", "Auto-download"),
-    ("timestamps-native", "Timestamps (native)"),
-    ("timestamps-ctc", "Timestamps (CTC)"),
-    ("word-timestamps", "Word timestamps"),
-    ("token-confidence", "Token confidence"),
-    ("temperature", "Temperature"),
-    ("beam-search", "Beam search"),
-    ("punctuation-toggle", "Punctuation toggle"),
-    ("flash-attn", "Flash attention"),
-    ("diarize", "Diarize"),
-    ("grammar", "GBNF grammar"),
-    ("vad-internal", "VAD (internal)"),
-    ("parallel-processors", "Parallel processors"),
+# Pretty labels + one-line meanings (<=80 chars, #407) for the cap slugs
+# the binary reports. Order is the display order in both outputs. Caps
+# not listed here are appended in sorted order with a fallback "Title
+# Case" label and no description, so adding a cap to the C++ side
+# automatically shows up in both outputs.
+CAP_LABELS: list[tuple[str, str, str]] = [
+    ("transcribe", "Transcribe",
+     "Speech-to-text transcription (the base ASR path)."),
+    ("tts", "TTS",
+     "Text-to-speech synthesis (--tts)."),
+    ("voice-cloning", "Voice cloning",
+     "TTS clones a target voice from a short reference sample (--voice ref.wav)."),
+    ("translate", "Translate",
+     "Translates speech into another language during transcription."),
+    ("src-tgt-language", "Src/Tgt language",
+     "Takes an explicit source/target language pair for translation."),
+    ("language-detect", "Language detect",
+     "Detects the spoken language automatically."),
+    ("auto-download", "Auto-download",
+     "`-m auto` downloads the model from the HF registry on first use."),
+    ("timestamps-native", "Timestamps (native)",
+     "Model produces segment timestamps natively."),
+    ("timestamps-ctc", "Timestamps (CTC)",
+     "Timestamps recovered by CTC alignment, not predicted by the model."),
+    ("word-timestamps", "Word timestamps",
+     "Per-word start/end timestamps."),
+    ("token-confidence", "Token confidence",
+     "Per-token probability/confidence scores."),
+    ("temperature", "Temperature",
+     "Sampling temperature control for decoding."),
+    ("beam-search", "Beam search",
+     "Beam-search decoding (-bs N)."),
+    ("punctuation-toggle", "Punctuation toggle",
+     "Punctuation can be enabled/disabled at runtime."),
+    ("flash-attn", "Flash attention",
+     "Flash-attention toggle for faster, lower-memory inference."),
+    ("diarize", "Diarize",
+     "Speaker diarization: labels who spoke when."),
+    ("grammar", "GBNF grammar",
+     "Output constrained to a GBNF grammar."),
+    ("vad-internal", "VAD (internal)",
+     "Backend runs voice-activity detection internally."),
+    ("parallel-processors", "Parallel processors",
+     "Whisper-style parallel processors (-p N) over audio slices."),
+    ("beats", "Beats",
+     "Beat / downbeat tracking (--beats)."),
+    ("chords", "Chords",
+     "Chord-recognition timeline (--chords)."),
+    ("piano", "Piano",
+     "Polyphonic piano-note transcription (--piano)."),
+    ("pitch", "Pitch",
+     "Monophonic F0 / pitch-track estimation (--pitch)."),
+    ("punctuation-native", "Punctuation Native",
+     "Model already emits punctuation; no post-processing needed."),
+    ("s2s", "S2S",
+     "Speech-to-speech: audio in, spoken response out."),
+    ("separate", "Separate",
+     "Source separation into stems, e.g. vocals vs. instruments (--separate)."),
+    ("streaming", "Streaming",
+     "True token-level streaming output."),
+    ("tab", "Tab",
+     "Guitar tablature: per-frame per-string fret scores (--tab)."),
+    ("tts-speed", "TTS Speed",
+     "Scales speaking rate natively in the acoustic model (--tts-speed). The "
+     "server skips its post-synthesis linear resampler for these backends, so "
+     "pitch is not shifted and the rate is not applied twice."),
 ]
 
 
@@ -78,20 +125,43 @@ def load_backend_data(crispasr: Path) -> tuple[list[dict], list[tuple[str, str]]
         sys.exit(1)
     raw = json.loads(r.stdout)
     backends = raw.get("backends", [])
+
+    # If the binary was built without optional ONNX runtime, preserve the known
+    # ONNX backends (defined in src/core/backend_caps_table.h and registered in
+    # examples/cli/crispasr_backend.cpp when CRISPASR_HAS_ONNX=1) so feature matrix
+    # regeneration on standard CPU builds does not strip them (#407, #515).
+    backend_names = {b.get("name") for b in backends}
+    if "moonshine-onnx" not in backend_names:
+        onnx_entries = [
+            {"name": "moonshine-onnx", "caps_bitmask": 270336, "caps": ["auto-download", "punctuation-native"]},
+            {"name": "moonshine-streaming-small-de-onnx", "caps_bitmask": 270336, "caps": ["auto-download", "punctuation-native"]},
+            {"name": "moonshine-streaming-tiny-de-onnx", "caps_bitmask": 270336, "caps": ["auto-download", "punctuation-native"]},
+            {"name": "moonshine-tiny-de-phreak87-onnx", "caps_bitmask": 270336, "caps": ["auto-download", "punctuation-native"]},
+        ]
+        idx = -1
+        for i, b in enumerate(backends):
+            if b.get("name") == "moonshine-streaming":
+                idx = i + 1
+                break
+        if idx != -1:
+            for offset, entry in enumerate(onnx_entries):
+                backends.insert(idx + offset, entry)
+        else:
+            backends.extend(onnx_entries)
     # All caps that appear anywhere, in CAP_LABELS order, then fallback.
     seen: set[str] = set()
     for b in backends:
         for c in b.get("caps", []):
             seen.add(c)
-    ordered: list[tuple[str, str]] = []
+    ordered: list[tuple[str, str, str]] = []
     used: set[str] = set()
-    for slug, label in CAP_LABELS:
+    for slug, label, desc in CAP_LABELS:
         if slug in seen:
-            ordered.append((slug, label))
+            ordered.append((slug, label, desc))
             used.add(slug)
     for c in sorted(seen):
         if c not in used:
-            ordered.append((c, c.replace("-", " ").title()))
+            ordered.append((c, c.replace("-", " ").title(), ""))
     return backends, ordered
 
 
@@ -110,15 +180,23 @@ def write_markdown(backends: list[dict],
                  f"[`feature-matrix.html`](https://htmlpreview.github.io/?https://github.com/CrispStrobe/CrispASR/blob/main/docs/feature-matrix.html).")
     lines.append("")
     # Header
-    headers = ["Backend"] + [label for _, label in caps]
+    headers = ["Backend"] + [label for _, label, _ in caps]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join(["---"] + [":-:" for _ in caps]) + "|")
     for b in backends:
         bc = set(b.get("caps", []))
         row = [f"`{b['name']}`"]
-        for slug, _ in caps:
+        for slug, _, _ in caps:
             row.append("✓" if slug in bc else "")
         lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+    lines.append("## What each capability means")
+    lines.append("")
+    lines.append("| Capability | Meaning |")
+    lines.append("|---|---|")
+    for _, label, desc in caps:
+        if desc:
+            lines.append(f"| {label} | {desc} |")
     lines.append("")
     lines.append("Regenerate with `python tools/gen-feature-matrix.py`.")
     lines.append("")
@@ -135,7 +213,7 @@ def write_html(backends: list[dict],
         bc = set(b.get("caps", []))
         rows.append({
             "name": b["name"],
-            "caps": {slug: (slug in bc) for slug, _ in caps},
+            "caps": {slug: (slug in bc) for slug, _, _ in caps},
         })
     payload = json.dumps({"caps": [list(c) for c in caps], "rows": rows},
                          separators=(",", ":"))
@@ -221,6 +299,9 @@ def write_html(backends: list[dict],
   <table id="matrix"><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table>
 </div>
 <div class="meta">
+  <details><summary>What each capability means</summary>
+    <table id="legend" style="margin-top:8px; font-size:12px;"></table>
+  </details>
   Regenerate via <code>python tools/gen-feature-matrix.py</code>. Single source of truth: the C++ binary's
   <code>--list-backends-json</code> output (capability bits in <code>examples/cli/crispasr_backend.h</code>).
   Drift between the matrix and the binary is impossible by construction.
@@ -240,11 +321,11 @@ function render() {{
   th0.onclick = () => clickSort("name");
   if (sortKey === "name") th0.innerHTML += " <span class='arrow'>" + (sortDesc ? "▼" : "▲") + "</span>";
   head.appendChild(th0);
-  for (const [slug, label] of DATA.caps) {{
+  for (const [slug, label, desc] of DATA.caps) {{
     const th = document.createElement("th");
     th.textContent = label;
     th.dataset.key = slug;
-    th.title = slug;
+    th.title = desc || slug;
     th.onclick = () => clickSort(slug);
     if (sortKey === slug) th.innerHTML += " <span class='arrow'>" + (sortDesc ? "▼" : "▲") + "</span>";
     head.appendChild(th);
@@ -276,7 +357,7 @@ function render() {{
     code.textContent = r.name;
     td0.appendChild(code);
     tr.appendChild(td0);
-    for (const [slug, _] of DATA.caps) {{
+    for (const [slug] of DATA.caps) {{
       const td = document.createElement("td");
       if (r.caps[slug]) {{ td.className = "y"; td.textContent = "✓"; }}
       tr.appendChild(td);
@@ -295,11 +376,11 @@ function clickSort(key) {{
 function renderPills() {{
   const c = $("pills");
   c.innerHTML = "";
-  for (const [slug, label] of DATA.caps) {{
+  for (const [slug, label, desc] of DATA.caps) {{
     const p = document.createElement("span");
     p.className = "pill" + (requiredCaps.has(slug) ? " active" : "");
     p.textContent = label;
-    p.title = "require " + slug;
+    p.title = (desc ? desc + " — " : "") + "click to require " + slug;
     p.onclick = () => {{
       if (requiredCaps.has(slug)) requiredCaps.delete(slug);
       else requiredCaps.add(slug);
@@ -310,35 +391,213 @@ function renderPills() {{
   }}
 }}
 
+function renderLegend() {{
+  const t = $("legend");
+  for (const [slug, label, desc] of DATA.caps) {{
+    if (!desc) continue;
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td");
+    td1.style.paddingRight = "12px";
+    td1.textContent = label;
+    const td2 = document.createElement("td");
+    td2.textContent = desc;
+    tr.appendChild(td1); tr.appendChild(td2);
+    t.appendChild(tr);
+  }}
+}}
+
 $("filter").addEventListener("input", render);
 renderPills();
+renderLegend();
 render();
 </script>
 </body>
 </html>
 """
-    out.write_text(html)
+    out.write_text(html, encoding="utf-8")
+
+
+def sync_markdown_counts(backends: list[dict], check: bool = False) -> bool:
+    """Synchronize backend counts across README.md and documentation files.
+
+    If check=True, returns False if any file is out of date without modifying it.
+    If check=False, writes the updated content and returns True.
+    """
+    import re
+    total = len(backends)
+    tts = sum(1 for b in backends if "tts" in b.get("caps", []))
+    asr = sum(
+        1 for b in backends
+        if "tts" not in b.get("caps", [])
+        and "separate" not in b.get("caps", [])
+        and "s2s" not in b.get("caps", [])
+        and not any(k in b.get("caps", []) for k in ["beats", "chords", "piano", "pitch", "tab"])
+    )
+
+    targets = [
+        (
+            REPO_ROOT / "README.md",
+            [
+                (
+                    r"(\*\*One C\+\+ binary, )\d+( backends — )\d+( of them TTS engines —)",
+                    rf"\g<1>{total}\g<2>{tts}\g<3>",
+                ),
+                (
+                    r"(\|\s*\*\*\[CrispASR\]\([^\)]+\)\*\*\s*\|\s*This repo — C\+\+ speech engine\.\s*)\d+(\s*backends\s*\()\d+(\s*TTS\))",
+                    rf"\g<1>{total}\g<2>{tts}\g<3>",
+                ),
+                (
+                    r"(CrispASR ships \*\*)\d+(\s*backends\*\*)",
+                    rf"\g<1>{total}\g<2>",
+                ),
+                (
+                    r"(\*\*)\d+(\s*TTS engines\*\* for synthesis)",
+                    rf"\g<1>{tts}\g<2>",
+                ),
+            ],
+        ),
+        (
+            DOCS_DIR / "getting-started.md",
+            [
+                (
+                    r"(reference catalogue — )\d+( backends\.)",
+                    rf"\g<1>{total}\g<2>",
+                ),
+            ],
+        ),
+        (
+            REPO_ROOT / "flutter" / "crispasr" / "README.md",
+            [
+                (
+                    r"(The native project currently ships )\d+(?: ASR)?( backends, )\d+( TTS engines)",
+                    rf"\g<1>{total}\g<2>{tts}\g<3>",
+                ),
+            ],
+        ),
+        (
+            DOCS_DIR / "eu-ai-act.md",
+            [
+                (
+                    r"(\|\s*ASR transcription \()\d+(\s*backends\)\s*\|)",
+                    rf"\g<1>{asr}\g<2>",
+                ),
+                (
+                    r"(\|\s*TTS synthesis \()\d+(\s*engines\)\s*\|)",
+                    rf"\g<1>{tts}\g<2>",
+                ),
+            ],
+        ),
+        (
+            REPO_ROOT / "COMPARISON.md",
+            [
+                (
+                    r"(\*\*CrispASR:\s*)(?:\d+\+?|\~\d+)(?: ASR)?(\s*backend(?:s| families)\*\* \(all native, single GGUF per model;\s*plus\s*)(?:\d+\+?|\~\d+)(\s*TTS backends)",
+                    rf"\g<1>{asr} ASR\g<2>{tts}\g<3>",
+                ),
+            ],
+        ),
+    ]
+
+    all_in_sync = True
+    for path, subs in targets:
+        if not path.is_file():
+            continue
+        original = path.read_text(encoding="utf-8")
+        current = original
+        for pattern, replacement in subs:
+            current = re.sub(pattern, replacement, current)
+        if current != original:
+            all_in_sync = False
+            if check:
+                print(f"gen-feature-matrix: {path.relative_to(REPO_ROOT)} counts are STALE. "
+                      f"Run `python tools/gen-feature-matrix.py`.", file=sys.stderr)
+            else:
+                path.write_text(current, encoding="utf-8")
+                print(f"synced backend counts in {path.relative_to(REPO_ROOT)} "
+                      f"({total} backends, {tts} TTS, {asr} ASR)")
+
+    return all_in_sync
+
+
+def load_backends_from_matrix(md_path: Path) -> list[dict]:
+    """Reconstruct backend capability dicts from docs/feature-matrix.md without needing the binary."""
+    if not md_path.is_file():
+        return []
+    import re
+    text = md_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    header_lines = [l for l in lines if l.startswith("| Backend |")]
+    if not header_lines:
+        return []
+    headers = [c.strip() for c in header_lines[0].split("|")[1:-1]]
+    label_to_slug = {label: slug for slug, label, _ in CAP_LABELS}
+
+    backends = []
+    for line in lines:
+        if not line.startswith("| `"):
+            continue
+        cols = [c.strip() for c in line.split("|")[1:-1]]
+        name = cols[0].strip("`")
+        caps = []
+        for i, col in enumerate(cols[1:], 1):
+            if col == "✓" and i < len(headers):
+                h = headers[i]
+                slug = label_to_slug.get(h, h.lower().replace(" ", "-"))
+                caps.append(slug)
+        backends.append({"name": name, "caps": caps})
+    return backends
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--crispasr", type=Path, default=None,
-                    help="Path to the crispasr binary (default: build-ninja-compile/bin/crispasr)")
+                    help="Path to the crispasr binary (default: first of "
+                         "build-ninja-compile/bin, build/bin, build-test/bin "
+                         "under the repo root)")
+    ap.add_argument("--check", action="store_true",
+                    help="Check whether feature matrix or documentation counts are stale")
     args = ap.parse_args()
     crispasr = args.crispasr or find_crispasr()
+
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    md = DOCS_DIR / "feature-matrix.md"
+    html = DOCS_DIR / "feature-matrix.html"
+
+    if args.check:
+        if not crispasr or not crispasr.is_file():
+            # In check mode without a binary, verify documentation counts match the existing feature matrix
+            backends = load_backends_from_matrix(md)
+            if not backends:
+                print("gen-feature-matrix: crispasr binary not found and feature-matrix.md empty",
+                      file=sys.stderr)
+                return 1
+            if not sync_markdown_counts(backends, check=True):
+                return 1
+            print(f"feature matrix and documentation counts up to date ({len(backends)} backends)")
+            return 0
+
+        backends, caps = load_backend_data(crispasr)
+        if not sync_markdown_counts(backends, check=True):
+            return 1
+        print(f"feature matrix and documentation counts up to date ({len(backends)} backends)")
+        return 0
+
     if not crispasr or not crispasr.is_file():
         print("error: crispasr binary not found. Build first or pass --crispasr.",
               file=sys.stderr)
         return 1
+
     backends, caps = load_backend_data(crispasr)
-    DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    md = DOCS_DIR / "feature-matrix.md"
-    html = DOCS_DIR / "feature-matrix.html"
     write_markdown(backends, caps, md)
     write_html(backends, caps, html)
-    print(f"wrote {md.relative_to(REPO_ROOT)}  ({md.stat().st_size:,} bytes)")
-    print(f"wrote {html.relative_to(REPO_ROOT)} ({html.stat().st_size:,} bytes)")
+    # Absolute paths: the files land in <repo>/docs/ regardless of cwd,
+    # and a bare "docs\..." reads as cwd-relative on Windows (#407).
+    print(f"wrote {md.resolve()}  ({md.stat().st_size:,} bytes)")
+    print(f"wrote {html.resolve()} ({html.stat().st_size:,} bytes)")
     print(f"  {len(backends)} backends · {len(caps)} caps")
+    sync_markdown_counts(backends, check=False)
     return 0
 
 

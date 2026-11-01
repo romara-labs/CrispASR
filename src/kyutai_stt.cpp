@@ -20,6 +20,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/rvq.h"              // §176l: shared Euclidean RVQ encode
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `KYUTAI_STT_BENCH=1` for per-stage timings.
@@ -43,7 +45,7 @@
 static bool kyutai_stt_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("KYUTAI_STT_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_KYUTAI_STT_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -126,6 +128,9 @@ struct kyutai_hparams {
     int existing_text_padding_id = 3;
     float audio_delay_seconds = 0.5f;
     float audio_silence_prefix_seconds = 0.0f; // prepended silence before Mimi encode (1.0s for 2.6B)
+    // Languages the checkpoint was trained on (#366). Empty for GGUFs converted
+    // before kyutai.languages was written; see the fallback in the loader.
+    std::vector<std::string> languages;
 
     // Mimi encoder
     int mimi_dim = 512;
@@ -240,6 +245,7 @@ struct kyutai_model {
 struct kyutai_stt_context {
     kyutai_stt_context_params params;
     kyutai_model model;
+    std::string languages_joined; // lazily built by kyutai_stt_languages()
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -266,7 +272,9 @@ struct kyutai_stt_context {
 // ===========================================================================
 
 extern "C" struct kyutai_stt_context_params kyutai_stt_context_default_params(void) {
-    return {/*n_threads=*/4, /*verbosity=*/1, /*use_gpu=*/true, /*temperature=*/0.0f, /*beam_size=*/1};
+    return {/*n_threads=*/4,        /*verbosity=*/1, /*use_gpu=*/true,
+            /*temperature=*/0.0f,   /*beam_size=*/1,
+            /*input_sample_rate=*/0};
 }
 
 // --- Helpers ---
@@ -338,13 +346,13 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
     sctx->params = params;
     sctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    sctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    sctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!sctx->backend)
-        sctx->backend = ggml_backend_cpu_init();
-    sctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(sctx->backend_cpu, sctx->n_threads);
-    if (ggml_backend_is_cpu(sctx->backend))
-        ggml_backend_cpu_set_n_threads(sctx->backend, sctx->n_threads);
+        sctx->backend = core_cpu_backend::init();
+    sctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(sctx->backend_cpu, sctx->n_threads);
+    if (core_cpu_backend::is_cpu(sctx->backend))
+        core_cpu_backend::set_n_threads(sctx->backend, sctx->n_threads);
 
     auto& m = sctx->model;
     auto& hp = m.hp;
@@ -354,7 +362,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "kyutai_stt: failed to open '%s'\n", path_model);
-            delete sctx;
+            kyutai_stt_free(sctx); // frees the backends this ctx already owns
             return nullptr;
         }
         // LM hparams
@@ -372,6 +380,18 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
         hp.audio_delay_seconds = core_gguf::kv_f32(gctx, "kyutai.stt.audio_delay_seconds", hp.audio_delay_seconds);
         hp.audio_silence_prefix_seconds =
             core_gguf::kv_f32(gctx, "kyutai.stt.audio_silence_prefix_seconds", hp.audio_silence_prefix_seconds);
+
+        hp.languages = core_gguf::kv_str_array(gctx, "kyutai.languages");
+        if (hp.languages.empty()) {
+            // GGUFs converted before kyutai.languages existed — which is every
+            // one currently published. The two shipped checkpoints differ
+            // architecturally, so the layer count identifies them: stt-1b-en_fr
+            // is 16 layers and does support French, stt-2.6b-en is 48 and does
+            // not. Getting this wrong is what #366 reported: the warning fired
+            // for the DEFAULT model, which is the multilingual one.
+            hp.languages =
+                (hp.num_layers >= 48) ? std::vector<std::string>{"en"} : std::vector<std::string>{"en", "fr"};
+        }
 
         // Mimi hparams
         hp.mimi_dim = core_gguf::kv_u32(gctx, "kyutai.mimi.encoder_dim", hp.mimi_dim);
@@ -416,7 +436,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, sctx->backend, "kyutai_stt", wl)) {
         fprintf(stderr, "kyutai_stt: failed to load weights from '%s'\n", path_model);
-        delete sctx;
+        kyutai_stt_free(sctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;
@@ -573,7 +593,7 @@ extern "C" void kyutai_stt_free(struct kyutai_stt_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -821,7 +841,7 @@ static void rvq_encode_group(kyutai_stt_context* sctx, ggml_tensor* x_projected,
             sizes[q] = num_codes;
         }
         if (uniform && core_rvq::encode_euclidean_per_stage(residual.data(), T, cdim, embeds.data(), sizes.data(),
-                                                            n_codebooks, out_codes)) {
+                                                            n_codebooks, out_codes, sctx->n_threads)) {
             return;
         }
         out_codes.clear(); // partial fill on fallthrough — scalar path repopulates
@@ -1192,15 +1212,23 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
     auto& hp = ctx->model.hp;
     auto& m = ctx->model;
 
-    // Step 1: Resample 16 kHz → 24 kHz
+    // Step 1: Resample to 24 kHz if the input is not already at that rate.
+    // When the caller loads audio via crispasr_audio_load_at_rate(path, 24000, …)
+    // the PCM is already at 24 kHz and the resample is a no-op, avoiding the
+    // quality-degrading 16k→24k round-trip (issue #263).
+    const int input_rate = ctx->params.input_sample_rate > 0 ? ctx->params.input_sample_rate : 16000;
     std::vector<float> pcm_24k;
-    {
+    if (input_rate == (int)ctx->model.hp.sample_rate) {
+        // Already at model rate — just copy.
+        pcm_24k.assign(samples, samples + n_samples);
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "kyutai_stt: input already at %d Hz, no resample\n", input_rate);
+    } else {
         kyutai_stt_bench_stage _b("resample");
         resample_16k_to_24k(samples, n_samples, pcm_24k);
-    }
-
-    if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "kyutai_stt: resampled %d → %d samples (16k → 24k)\n", n_samples, (int)pcm_24k.size());
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "kyutai_stt: resampled %d → %d samples (%dk → 24k)\n", n_samples, (int)pcm_24k.size(),
+                    input_rate / 1000);
     }
 
     // Step 1b: Prepend silence prefix (required by some models, e.g. stt-2.6b-en uses 1.0s)
@@ -1408,6 +1436,11 @@ extern "C" void kyutai_stt_set_beam_size(struct kyutai_stt_context* ctx, int bea
         ctx->params.beam_size = (beam_size > 0) ? beam_size : 1;
 }
 
+extern "C" void kyutai_stt_set_input_sample_rate(struct kyutai_stt_context* ctx, int rate) {
+    if (ctx)
+        ctx->params.input_sample_rate = (rate > 0) ? rate : 0;
+}
+
 extern "C" void kyutai_stt_result_free(struct kyutai_stt_result* r) {
     if (!r)
         return;
@@ -1421,6 +1454,34 @@ extern "C" const char* kyutai_stt_token_text(struct kyutai_stt_context* ctx, int
     if (!ctx || id < 0 || id >= (int)ctx->model.vocab.size())
         return nullptr;
     return ctx->model.vocab[id].c_str();
+}
+
+// Does this checkpoint support `lang` (ISO-639-1, lowercase)? An empty or
+// "auto" language always matches. Used to decide whether the CLI should warn
+// that a requested language will be ignored (#366).
+extern "C" int kyutai_stt_supports_language(struct kyutai_stt_context* ctx, const char* lang) {
+    if (!ctx || !lang || !*lang)
+        return 1;
+    std::string want(lang);
+    for (auto& c : want)
+        c = (char)tolower((unsigned char)c);
+    if (want == "auto")
+        return 1;
+    for (const auto& l : ctx->model.hp.languages)
+        if (l == want)
+            return 1;
+    return 0;
+}
+
+// Comma-separated list of the languages this checkpoint supports, for
+// diagnostics. Owned by the context; valid until kyutai_stt_free.
+extern "C" const char* kyutai_stt_languages(struct kyutai_stt_context* ctx) {
+    if (!ctx)
+        return "";
+    if (ctx->languages_joined.empty())
+        for (const auto& l : ctx->model.hp.languages)
+            ctx->languages_joined += (ctx->languages_joined.empty() ? "" : ", ") + l;
+    return ctx->languages_joined.c_str();
 }
 
 extern "C" float kyutai_stt_total_lookahead_seconds(struct kyutai_stt_context* ctx) {

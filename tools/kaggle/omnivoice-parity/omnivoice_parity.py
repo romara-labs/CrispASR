@@ -36,6 +36,11 @@ try:
 
     try:
         import kaggle_harness as kh
+        # Full harness regime: authenticate HF pulls from the attached token
+        # dataset (anon pulls get rate-limited); hf_transfer wedges multi-GB
+        # Kaggle downloads, so keep the plain resumable downloader.
+        kh.resolve_hf_token()
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         kh.init_progress()
         HAS_KH = True
     except Exception as e:
@@ -66,7 +71,7 @@ try:
     hf_token = None
     for path in [
         "/kaggle/input/crispasr-hf-token/hf_token.txt",
-        "/kaggle/input/datasets/chr1str/crispasr-hf-token/hf_token.txt",
+        "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt",
     ]:
         if os.path.exists(path):
             hf_token = open(path).read().strip()

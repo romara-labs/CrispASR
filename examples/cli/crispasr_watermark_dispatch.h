@@ -9,7 +9,7 @@
 #pragma once
 
 #include "audioseal.h"
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,8 +39,34 @@ inline void set_disabled(bool value) {
     disabled_flag() = value;
 }
 
-// True if watermarking has been turned off via the CLI flag or the env var.
-inline bool is_disabled() {
+// Watertight override. When set, is_disabled() always returns false — even
+// against --no-watermark / CRISPASR_NO_WATERMARK. The CLI sets this for outputs
+// that cannot carry a C2PA manifest (raw ADTS .aac / Ogg .opus, and the raw PCM
+// --tts-stream), where the audio watermark is the ONLY robust machine-readable
+// AI mark. This guarantees no CLI path can ever emit a fully unmarked AI file:
+// the watermark opt-out is honored only when C2PA still marks the output.
+inline bool& forced_flag() {
+    static bool forced = false;
+    return forced;
+}
+
+// Force watermarking on for this process regardless of the opt-out.
+inline void set_forced(bool value) {
+    forced_flag() = value;
+}
+
+// True if watermarking has been turned off via the CLI flag or the env var,
+// UNLESS a watertight override forces it on.
+//
+// `force` is the per-call equivalent of set_forced(), for callers that decide
+// per output rather than per process. The server needs that: its response
+// format is chosen per request, so which outputs can carry a C2PA manifest —
+// and therefore which ones the watermark is the ONLY mark on — varies request
+// to request, and mutating the process-global flag would race across
+// --server-workers threads.
+inline bool is_disabled(bool force = false) {
+    if (force || forced_flag())
+        return false;
     return disabled_flag() || std::getenv("CRISPASR_NO_WATERMARK") != nullptr;
 }
 
@@ -81,8 +107,13 @@ inline void shutdown() {
 // regulatory background, incl. EU AI Act Art. 50, which we intentionally do NOT
 // name at runtime — the obligation is jurisdiction-specific and the operator,
 // not this binary, is the party bound by it).
-inline void embed(float* pcm, int n_samples, int sample_rate = 24000) {
-    if (is_disabled()) {
+//
+// Pass force=true when this particular output cannot carry a C2PA manifest, so
+// stripping the watermark would leave it with no machine-readable AI mark at
+// all. That is the watertight floor; see crispasr_enforce_cli_watermark_floor()
+// for the CLI's process-wide equivalent.
+inline void embed(float* pcm, int n_samples, int sample_rate = 24000, bool force = false) {
+    if (is_disabled(force)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -175,8 +206,9 @@ inline float detect(const float* pcm, int n_samples, int sample_rate = 24000) {
         if (probs)
             std::free(probs);
     }
-    // Fallback: spread-spectrum
-    return crispasr_watermark_detect_impl(pcm, n_samples);
+    // Fallback: spread-spectrum. Goes through the selector so this surface and
+    // the session C-ABI cannot end up on different statistics.
+    return crispasr_watermark_detect_select(pcm, n_samples);
 }
 
 } // namespace crispasr_wm_dispatch

@@ -1,0 +1,52 @@
+{
+  "project": {
+    "name": "CrispASR",
+    "version": "0.8.4",
+    "license": "MIT",
+    "type": "library",
+    "primary_language": "C++17",
+    "stack": ["C++17", "Python", "Rust", "Go", "Java", "JavaScript/WASM", "Ruby", "Dart/Flutter", "CMake", "ggml", "CUDA", "Metal", "Vulkan", "OpenCL", "SYCL", "ROCm/HIP", "CoreML", "OpenVINO", "WebGPU", "Docker", "GitHub Actions"],
+    "entry_points": ["examples/cli/cli.cpp", "examples/server/server.cpp", "include/crispasr.h", "python/crispasr/__init__.py", "crispasr/src/lib.rs"],
+    "description": "Production-grade on-device speech AI framework: 22+ ASR models, 23+ TTS models, LID, VAD, diarization, alignment, punctuation, truecasing, watermarking, translation"
+  },
+  "structure": {
+    "top_level_directories": ["src/", "ggml/", "examples/", "tests/", "tools/", "bindings/", "include/", "python/", "crispasr/", "crispasr-sys/", "flutter/", "hf-space/", "docs/", "scripts/", "crisp_audio/", "crisp_lid/", "crisp_punc/", "crisp_truecase/", "samples/", "grammars/", "ref/"],
+    "total_files": "~1000+",
+    "total_dirs": "~120+"
+  },
+  "contributors": [
+    { "name": "crispasr integration", "commits": 1851, "primary_areas": ["src/", "examples/", "ggml/", "bindings/"] },
+    { "name": "CrispStrobe", "commits": 1665, "primary_areas": ["src/", "examples/", "docs/", "tools/"] },
+    { "name": "CKHO", "commits": 13 },
+    { "name": "Shuai Zhang", "commits": 5 },
+    { "name": "Christian Ströbele", "commits": 4 },
+    { "name": "Vikram Chauhan", "commits": 3 },
+    { "name": "metalmon", "commits": 3 },
+    { "name": "Bergmann Atmet", "commits": 2 },
+    { "name": "SegFaultZero", "commits": 2 },
+    { "name": "grider-transwithai", "commits": 2 }
+  ],
+  "primary_developer": {
+    "name": "crispasr integration / CrispStrobe",
+    "confidence": "confirmed"
+  },
+  "commit_patterns": {
+    "total_commits": 3555,
+    "frequency": "burst",
+    "message_style": "mixed"
+  },
+  "signals": {
+    "formatting": "enforced-by-tool",
+    "ci_cd": "present",
+    "ci_complexity": "complex",
+    "documentation_quality": "high",
+    "gitignore_thoroughness": "thorough",
+    "test_coverage_ratio": "~60% file coverage (161 test files / 269 src files)",
+    "todos": 338,
+    "bus_factor_risk": "high (2 contributors = ~99% commits)"
+  },
+  "metadata": {
+    "analyzed_at": "2026-06-25T00:00:00Z",
+    "analyzer": "kiyotaka-observer"
+  }
+}

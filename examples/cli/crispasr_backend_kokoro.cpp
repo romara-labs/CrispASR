@@ -55,6 +55,16 @@ std::string kokoro_resolve_fallback_voice(const std::string& lang, const std::st
     return path;
 }
 
+bool file_exists(const std::string& path) {
+    if (path.empty())
+        return false;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    fclose(f);
+    return true;
+}
+
 class KokoroBackend : public CrispasrBackend {
 public:
     KokoroBackend() = default;
@@ -62,7 +72,7 @@ public:
 
     const char* name() const override { return "kokoro"; }
 
-    uint32_t capabilities() const override { return CAP_TTS | CAP_AUTO_DOWNLOAD; }
+    uint32_t capabilities() const override { return CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TTS_SPEED; }
 
     std::vector<crispasr_segment> transcribe(const float* /*samples*/, int /*n_samples*/, int64_t /*t_offset_cs*/,
                                              const whisper_params& /*params*/) override {
@@ -80,6 +90,9 @@ public:
         if (!p.language.empty() && p.language != "auto") {
             std::strncpy(cp.espeak_lang, p.language.c_str(), sizeof(cp.espeak_lang) - 1);
             cp.espeak_lang[sizeof(cp.espeak_lang) - 1] = '\0';
+            init_espeak_lang_ = p.language;
+        } else {
+            init_espeak_lang_ = "en-us";
         }
         std::string resolved_model = kokoro_resolve_model(p.language, p.model);
         is_german_backbone_ = (resolved_model != p.model);
@@ -95,13 +108,35 @@ public:
         if (!ctx_ || text.empty())
             return {};
 
-        // Voice pack: load once on first call. Required — without it, synthesis
-        // returns nullptr (predictor needs a (style_pred, style_dec) reference).
-        // Resolution order: --voice (explicit) → ff_siwis fallback for non-native
-        // languages → sibling kokoro-voice-af_heart.gguf (auto-download default
-        // companion) → empty (synthesis will fail with a clear error).
-        std::string voice_path = params.tts_voice;
-        if (voice_path.empty() && !params.language.empty() && params.language != "auto" &&
+        // Voice source: newer full GGUFs embed many `voices.<id>.style`
+        // tensors; older GGUFs still use a separate `kokoro-voice-*.gguf`.
+        // Resolution order:
+        //   --voice existing path → separate voice pack
+        //   --voice non-path      → embedded voice id
+        //   no --voice + embedded → runtime default embedded voice
+        //   old fallback paths    → separate voice pack
+        std::string voice_path;
+        embedded_voice_selected_ = false;
+        const int embedded_count = kokoro_embedded_voice_count(ctx_);
+        if (!params.tts_voice.empty()) {
+            if (file_exists(params.tts_voice)) {
+                voice_path = params.tts_voice;
+            } else if (embedded_count > 0) {
+                if (kokoro_select_embedded_voice(ctx_, params.tts_voice.c_str()) != 0) {
+                    fprintf(stderr, "crispasr[kokoro]: embedded voice id '%s' not found in full GGUF\n",
+                            params.tts_voice.c_str());
+                    return {};
+                }
+                voice_loaded_ = false;
+                embedded_voice_selected_ = true;
+            } else {
+                voice_path = params.tts_voice;
+            }
+        } else if (embedded_count > 0) {
+            embedded_voice_selected_ = true;
+        }
+
+        if (voice_path.empty() && !embedded_voice_selected_ && !params.language.empty() && params.language != "auto" &&
             !crispasr_kokoro_lang_has_native_voice(params.language.c_str())) {
             std::string picked;
             voice_path = kokoro_resolve_fallback_voice(params.language, params.model, &picked);
@@ -138,7 +173,7 @@ public:
                         params.language.c_str());
             }
         }
-        if (voice_path.empty()) {
+        if (voice_path.empty() && !embedded_voice_selected_) {
             // Last-resort UX fallback for `-m auto` / native-voice languages
             // (en, ja, zh, ...) where the user passed no `--voice` but the
             // registry's auto-download companion sat `kokoro-voice-af_heart.gguf`
@@ -148,13 +183,11 @@ public:
             auto slash = mp.find_last_of("/\\");
             std::string dir = (slash == std::string::npos) ? "." : mp.substr(0, slash);
             std::string candidate = dir + "/kokoro-voice-af_heart.gguf";
-            FILE* tf = fopen(candidate.c_str(), "rb");
-            if (tf) {
-                fclose(tf);
+            if (file_exists(candidate)) {
                 voice_path = std::move(candidate);
             }
         }
-        if (!voice_loaded_ && !voice_path.empty()) {
+        if (!embedded_voice_selected_ && !voice_loaded_ && !voice_path.empty()) {
             if (kokoro_load_voice_pack(ctx_, voice_path.c_str()) != 0) {
                 fprintf(stderr, "crispasr[kokoro]: failed to load voice pack '%s'\n", voice_path.c_str());
                 return {};
@@ -162,8 +195,29 @@ public:
             voice_loaded_ = true;
         }
 
+        // Apply per-request speaking rate / duration scaling. Explicitly reset
+        // to 1.0f when tts_speed <= 0.0f or default to prevent state leakage
+        // across consecutive requests on the shared context.
+        const float length_scale = (params.tts_speed > 0.0f) ? (1.0f / params.tts_speed) : 1.0f;
+        kokoro_set_length_scale(ctx_, length_scale);
+
+        // Apply per-request G2P language with the same anti-leakage rule.
+        // The server forwards the request's "language" field in rp.language;
+        // without this the espeak voice stayed fixed at whatever --language
+        // the process started with, so a pt request on an en-us process came
+        // out phonemized as English. Empty/"auto" resets to the init
+        // language so consecutive requests never inherit each other's voice.
+        const std::string request_lang =
+            (!params.language.empty() && params.language != "auto") ? params.language : init_espeak_lang_;
+        kokoro_set_language(ctx_, request_lang.c_str());
+
+        // #316: --tts-phonemes drives the acoustic model directly, skipping the
+        // G2P. This is the seam a pronunciation bug lives on — feeding another
+        // implementation's phoneme string through our model separates "our G2P
+        // is wrong" from "our model is wrong" in one run.
         int n = 0;
-        float* pcm = kokoro_synthesize(ctx_, text.c_str(), &n);
+        float* pcm = params.tts_phonemes.empty() ? kokoro_synthesize(ctx_, text.c_str(), &n)
+                                                 : kokoro_synthesize_phonemes(ctx_, params.tts_phonemes.c_str(), &n);
         if (!pcm || n <= 0)
             return {};
         std::vector<float> out(pcm, pcm + n);
@@ -177,12 +231,15 @@ public:
             ctx_ = nullptr;
         }
         voice_loaded_ = false;
+        embedded_voice_selected_ = false;
     }
 
 private:
     kokoro_context* ctx_ = nullptr;
     bool voice_loaded_ = false;
+    bool embedded_voice_selected_ = false;
     bool is_german_backbone_ = false;
+    std::string init_espeak_lang_ = "en-us";
 };
 
 } // namespace

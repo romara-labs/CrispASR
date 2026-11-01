@@ -8,6 +8,9 @@
 #include "crispasr_aligner.h"
 #include "align.h"
 #include "canary_ctc.h"
+#include "core/align_labels.h"
+#include "core/ctc_windows.h"
+#include "core/align_sentinel.h" // §W3 collapse detection
 #include "core/uroman.h"
 #include "gguf.h"
 #include "qwen3_asr.h"
@@ -20,6 +23,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <memory>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -83,6 +88,29 @@ static bool is_cjk_codepoint(uint32_t cp) {
            || (cp >= 0xFF00 && cp <= 0xFFEF); // Fullwidth Forms
 }
 
+// Qwen's Python aligner removes punctuation before it creates timestamp
+// slots.  Keep apostrophes (the blueprint explicitly does), and treat the
+// common Unicode punctuation blocks as separators rather than alignment
+// units.  Non-ASCII letters remain intact for the CTC backends.
+static bool is_alignment_punctuation(uint32_t cp) {
+    if (cp == '\'')
+        return false;
+    if (cp < 0x80)
+        return !std::isalnum((unsigned char)cp) && !std::isspace((unsigned char)cp);
+    return (cp >= 0x2000 && cp <= 0x206F) || // General Punctuation
+           (cp >= 0x3000 && cp <= 0x303F) || // CJK Symbols and Punctuation
+           (cp >= 0xFE10 && cp <= 0xFE1F) || // Vertical Forms
+           (cp >= 0xFE30 && cp <= 0xFE4F) || // CJK Compatibility Forms
+           (cp >= 0xFF00 && cp <= 0xFF65);   // Fullwidth punctuation
+}
+
+static bool is_opening_punctuation(uint32_t cp) {
+    return cp == '(' || cp == '[' || cp == '{' || cp == 0x2018 || cp == 0x201C || // ‘ “
+           cp == 0x3008 || cp == 0x300A || cp == 0x300C || cp == 0x300E ||        // 〈《「『
+           cp == 0x3010 || cp == 0x3014 || cp == 0x3016 || cp == 0x3018 ||        // 【〔〖〘
+           cp == 0x301A || cp == 0xFF08 || cp == 0xFF3B || cp == 0xFF5B;          // 〚（［｛
+}
+
 // Decode one UTF-8 codepoint from pos, return (codepoint, byte_length).
 static std::pair<uint32_t, int> decode_utf8(const std::string& s, size_t pos) {
     unsigned char b = (unsigned char)s[pos];
@@ -111,6 +139,11 @@ std::vector<std::string> tokenise_words(const std::string& text) {
                 out.push_back(cur);
                 cur.clear();
             }
+        } else if (is_alignment_punctuation(cp)) {
+            if (!cur.empty()) {
+                out.push_back(cur);
+                cur.clear();
+            }
         } else if (is_cjk_codepoint(cp)) {
             // Flush any accumulated non-CJK text
             if (!cur.empty()) {
@@ -126,6 +159,63 @@ std::vector<std::string> tokenise_words(const std::string& text) {
     }
     if (!cur.empty())
         out.push_back(cur);
+    return out;
+}
+
+// Build the same number of units as tokenise_words(), but preserve punctuation
+// on the unit next to it. The aligner labels remain punctuation-free; this form
+// is only restored after inference so --split-on-punct can use measured word
+// timestamps. Without it, crispasr_make_disp_segments treats otherwise-useful
+// CJK character timings as unusable and interpolates every sentence across the
+// enclosing VAD segment (#444's v0.8.34 timing-accuracy regression).
+//
+// #465: a per-character unit (CJK / Hangul) that follows whitespace in the text
+// keeps it as a LEADING SPACE - the convention whisper's own words use (" 오전에").
+// Hangul is split into syllables for alignment, and without this marker every
+// site that rebuilds text from words (the >= 0xE0 "no inter-word space" rule)
+// glued 내일 오전에 into 내일오전에. Latin words need no marker: the rebuild
+// sites already put a space between them.
+std::vector<std::string> tokenise_display_words(const std::string& text) {
+    std::vector<std::string> out;
+    std::string current;
+    std::string prefix;
+    bool space_before = false; // whitespace seen since the last emitted unit
+    const auto flush = [&]() {
+        if (current.empty())
+            return;
+        out.push_back(prefix + current);
+        prefix.clear();
+        current.clear();
+        space_before = false;
+    };
+
+    for (size_t i = 0; i < text.size();) {
+        const auto [cp, len] = decode_utf8(text, i);
+        const std::string bytes = text.substr(i, len);
+        if (cp == ' ' || cp == '\n' || cp == '\t' || cp == '\r') {
+            flush();
+            space_before = !out.empty() || !prefix.empty();
+        } else if (is_alignment_punctuation(cp)) {
+            flush();
+            if (is_opening_punctuation(cp))
+                prefix += bytes;
+            else if (!out.empty())
+                out.back() += bytes;
+            else
+                prefix += bytes;
+        } else if (is_cjk_codepoint(cp)) {
+            flush();
+            out.push_back((space_before && !out.empty() ? " " : "") + prefix + bytes);
+            prefix.clear();
+            space_before = false;
+        } else {
+            current += bytes;
+        }
+        i += len;
+    }
+    flush();
+    if (!prefix.empty() && !out.empty())
+        out.back() += prefix;
     return out;
 }
 
@@ -350,7 +440,11 @@ std::vector<CrispasrAlignedWord> align_wav2vec2_ctc(const std::string& model_pat
 
     const int V = (int)model->hparams.vocab_size;
     const int T = (int)(logits.size() / V);
-    auto aligned = ctc_forced_align(logits.data(), T, V, words, model->vocab, (int)model->hparams.pad_token_id,
+    const char* no_rom = std::getenv("CRISPASR_ALIGN_NO_ROMANIZE");
+    std::vector<std::string> labels;
+    for (const auto& word : words)
+        labels.push_back(core_align_labels::for_vocab(word, model->vocab, !(no_rom && no_rom[0] == '1')));
+    auto aligned = ctc_forced_align(logits.data(), T, V, labels, model->vocab, (int)model->hparams.pad_token_id,
                                     wav2vec2_frame_dur(*model));
     if (aligned.empty()) {
         fprintf(stderr, "crispasr[aligner-wav2vec2]: align_words failed\n");
@@ -363,6 +457,12 @@ std::vector<CrispasrAlignedWord> align_wav2vec2_ctc(const std::string& model_pat
         cw.text = w.word;
         cw.t0_cs = t_offset_cs + (int64_t)std::llround((double)w.t0 * 100.0);
         cw.t1_cs = t_offset_cs + (int64_t)std::llround((double)w.t1 * 100.0);
+        const size_t wi = out.size();
+        if (labels[wi] == words[wi]) {
+            for (const auto& ch : w.characters)
+                cw.characters.push_back({ch.character, t_offset_cs + (int64_t)std::llround((double)ch.t0 * 100.0),
+                                         t_offset_cs + (int64_t)std::llround((double)ch.t1 * 100.0)});
+        }
         out.push_back(std::move(cw));
     }
     return out;
@@ -372,6 +472,10 @@ std::vector<CrispasrAlignedWord> align_wav2vec2_ctc(const std::string& model_pat
 
 std::vector<std::string> crispasr_tokenise_align_words(const std::string& text) {
     return tokenise_words(text);
+}
+
+std::vector<std::string> crispasr_tokenise_align_display_words(const std::string& text) {
+    return tokenise_display_words(text);
 }
 
 std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw) {
@@ -415,6 +519,92 @@ std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw) {
     return cues;
 }
 
+// #317: extract segment texts from CrispASR JSON output. Handles two shapes:
+//   1. Full output:  {"transcription": [{"text": "...", ...}, ...]}
+//   2. Align output: [{"text": "...", "start": N, "end": N}, ...]
+// No nlohmann dependency — the structure is simple enough for string scanning.
+// Extracts every JSON string value whose key is "text" at one level of nesting
+// inside an array. Robust against whitespace/newline variations.
+std::vector<std::string> crispasr_parse_json_segments(const std::string& raw) {
+    std::vector<std::string> segs;
+
+    // Find the array to scan: either "transcription": [...] or a top-level [...].
+    size_t arr_start = std::string::npos;
+    const size_t tkey = raw.find("\"transcription\"");
+    if (tkey != std::string::npos) {
+        arr_start = raw.find('[', tkey);
+    } else {
+        // Top-level array (align-only JSON output).
+        for (size_t i = 0; i < raw.size(); i++) {
+            if (raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\n' || raw[i] == '\r')
+                continue;
+            if (raw[i] == '[') {
+                arr_start = i;
+            }
+            break;
+        }
+    }
+    if (arr_start == std::string::npos)
+        return segs;
+
+    // Scan for "text": "..." pairs inside the array.
+    size_t pos = arr_start;
+    while (pos < raw.size()) {
+        size_t tk = raw.find("\"text\"", pos);
+        if (tk == std::string::npos)
+            break;
+        // Skip past the colon.
+        size_t colon = raw.find(':', tk + 6);
+        if (colon == std::string::npos)
+            break;
+        // Find the opening quote of the value.
+        size_t q1 = raw.find('"', colon + 1);
+        if (q1 == std::string::npos)
+            break;
+        // Parse the JSON string value (handle escapes).
+        std::string val;
+        size_t i = q1 + 1;
+        while (i < raw.size() && raw[i] != '"') {
+            if (raw[i] == '\\' && i + 1 < raw.size()) {
+                i++;
+                switch (raw[i]) {
+                case '"':
+                    val += '"';
+                    break;
+                case '\\':
+                    val += '\\';
+                    break;
+                case 'n':
+                    val += '\n';
+                    break;
+                case 't':
+                    val += '\t';
+                    break;
+                case 'r':
+                    val += '\r';
+                    break;
+                default:
+                    val += raw[i];
+                    break;
+                }
+            } else {
+                val += raw[i];
+            }
+            i++;
+        }
+        pos = (i < raw.size()) ? i + 1 : raw.size();
+
+        // Trim and emit non-empty texts.
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t'))
+            val.erase(val.begin());
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t'))
+            val.pop_back();
+        if (!val.empty())
+            segs.push_back(std::move(val));
+    }
+    return segs;
+}
+
 std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::vector<std::string>& segment_texts,
                                                                     const std::vector<CrispasrAlignedWord>& words) {
     std::vector<CrispasrAlignedSegment> out;
@@ -442,38 +632,148 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
     return out;
 }
 
+// PLAN.md §W3: forced-alignment collapse check.
+//
+// Installed at the ONE join every aligner backend funnels through, rather than
+// in each of the three branches below — the multi-surface trap is that a check
+// added to one path silently misses the CLI, the session ABI, the bindings or
+// the server. `crispasr_align_words` is what all of them call.
+//
+// Default is DETECT + WARN. `assess()` is a new heuristic against a failure we
+// have never measured in the field, so it does not get to silently rewrite
+// timestamps; a wrong auto-repair would be just as invisible as the collapse.
+// Opt in to repair with CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE=1, or turn the
+// whole check off with CRISPASR_ALIGN_SENTINEL=0.
+static void align_sentinel_check(std::vector<CrispasrAlignedWord>& words, int n_samples, int64_t t_offset_cs) {
+    if (words.empty())
+        return;
+    {
+        const char* off = std::getenv("CRISPASR_ALIGN_SENTINEL");
+        if (off && off[0] == '0')
+            return;
+    }
+
+    // Assess in CLIP-RELATIVE seconds. The offset must come back out first:
+    // align.cpp's silent-zero words are (0,0) before `t_offset_cs` is added,
+    // and a chunk at offset 30 s would otherwise present them as (30.0, 30.0)
+    // — a plausible-looking position, and the signal would never fire.
+    std::vector<core_align_sentinel::Word> probe;
+    probe.reserve(words.size());
+    for (const auto& w : words)
+        probe.push_back({w.text, (float)((double)(w.t0_cs - t_offset_cs) / 100.0),
+                         (float)((double)(w.t1_cs - t_offset_cs) / 100.0)});
+
+    const float audio_sec = n_samples > 0 ? (float)n_samples / 16000.0f : -1.0f;
+    const auto a = core_align_sentinel::assess(probe, audio_sec);
+    if (!a.collapsed)
+        return;
+
+    fprintf(stderr, "crispasr[aligner]: WARNING: %s\n", core_align_sentinel::describe(a).c_str());
+
+    const char* fix = std::getenv("CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE");
+    if (!(fix && fix[0] == '1'))
+        return;
+    if (audio_sec <= 0.0f)
+        return;
+
+    const auto spread = core_align_sentinel::redistribute(probe, 0.0f, audio_sec);
+    for (size_t i = 0; i < words.size() && i < spread.size(); i++) {
+        words[i].t0_cs = t_offset_cs + (int64_t)std::llround((double)spread[i].t0 * 100.0);
+        words[i].t1_cs = t_offset_cs + (int64_t)std::llround((double)spread[i].t1 * 100.0);
+        words[i].characters.clear(); // redistributed word times are not measured CTC spans
+    }
+    fprintf(stderr, "crispasr[aligner]: redistributed %zu words across %.2fs\n", words.size(), (double)audio_sec);
+}
+
+static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& aligner_model,
+                                                         const std::string& transcript, const float* samples,
+                                                         int n_samples, int64_t t_offset_cs, int n_threads,
+                                                         bool* out_load_failed, int chunk_seconds);
+
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads) {
-    std::vector<CrispasrAlignedWord> out;
-    if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0)
-        return out;
+                                                      int n_threads, bool* out_load_failed, int chunk_seconds) {
+    std::vector<CrispasrAlignedWord> out = align_words_impl(aligner_model, transcript, samples, n_samples, t_offset_cs,
+                                                            n_threads, out_load_failed, chunk_seconds);
+    align_sentinel_check(out, n_samples, t_offset_cs);
+    return out;
+}
 
-    // #252: auto-romanize non-Latin reference text for CTC aligners with Latin vocab.
-    // Disable with CRISPASR_ALIGN_NO_ROMANIZE=1 to pass raw script through.
-    std::string eff_transcript = transcript;
-    {
-        const char* no_rom = std::getenv("CRISPASR_ALIGN_NO_ROMANIZE");
-        if (!(no_rom && no_rom[0] == '1') && core_uroman::needs_romanization(transcript)) {
-            eff_transcript = core_uroman::romanize(transcript);
-            const char* dbg = std::getenv("CRISPASR_ALIGN_DEBUG");
-            if (dbg && dbg[0] == '1')
-                fprintf(stderr, "crispasr[aligner]: romanized → \"%s\"\n", eff_transcript.c_str());
-        }
-    }
+static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& aligner_model,
+                                                         const std::string& transcript, const float* samples,
+                                                         int n_samples, int64_t t_offset_cs, int n_threads,
+                                                         bool* out_load_failed, int chunk_seconds) {
+    std::vector<CrispasrAlignedWord> out;
+    if (out_load_failed)
+        *out_load_failed = false;
+    if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0 || chunk_seconds < 0)
+        return out;
 
     const bool is_qwen3_fa = path_contains_ci(aligner_model, "forced-aligner") ||
                              path_contains_ci(aligner_model, "qwen3-fa") ||
                              path_contains_ci(aligner_model, "qwen3-forced");
+
+    const bool is_wav2vec2 = !is_qwen3_fa && is_wav2vec2_aligner_model(aligner_model, gguf_architecture(aligner_model));
+
+    // #252: auto-romanize non-Latin reference text for CTC aligners with Latin
+    // vocab. #419: romanization is an ALIGNMENT KEY, never a display
+    // transform. It used to romanize the whole transcript and let the
+    // romanized strings flow back out as the aligned words' text — so every
+    // output path that rebuilds display text from words (-sp/-sow/srt/vtt/
+    // karaoke, i.e. exactly what subtitle tools request) silently replaced
+    // Cyrillic/CJK transcripts with their transliteration ("викинги" came
+    // back "vikingi"). Now: tokenise the ORIGINAL transcript first, romanize
+    // per word (1:1 by construction) for the aligner's labels, and map the
+    // original words back onto the aligned timings before returning.
+    // Disable the romanized labels with CRISPASR_ALIGN_NO_ROMANIZE=1.
+    const auto orig_words = tokenise_words(transcript);
+    const auto display_words = tokenise_display_words(transcript);
+    std::vector<std::string> label_words = orig_words;
+    {
+        const char* no_rom = std::getenv("CRISPASR_ALIGN_NO_ROMANIZE");
+        // Qwen3-ForcedAligner is multilingual and its blueprint feeds the
+        // original script. Romanizing Chinese here changed every prompt token
+        // and was the primary #444 divergence.
+        if (!is_qwen3_fa && !is_wav2vec2 && !(no_rom && no_rom[0] == '1') &&
+            core_uroman::needs_romanization(transcript)) {
+            for (auto& w : label_words) {
+                if (core_uroman::needs_romanization(w))
+                    w = core_uroman::romanize(w);
+            }
+            const char* dbg = std::getenv("CRISPASR_ALIGN_DEBUG");
+            if (dbg && dbg[0] == '1') {
+                std::string joined;
+                for (const auto& w : label_words) {
+                    if (!joined.empty())
+                        joined += ' ';
+                    joined += w;
+                }
+                fprintf(stderr, "crispasr[aligner]: romanized labels → \"%s\"\n", joined.c_str());
+            }
+        }
+    }
+    // Restore the original-script text onto the aligned words. Every arm
+    // aligns label_words 1:1, so a size match is the expected case; on a
+    // mismatch (an arm dropped words) keep the arm's text rather than guess.
+    auto restore_text = [&](std::vector<CrispasrAlignedWord> v) {
+        if (v.size() == orig_words.size() && display_words.size() == orig_words.size()) {
+            for (size_t i = 0; i < v.size(); i++)
+                v[i].text = display_words[i];
+        } else if (!v.empty()) {
+            fprintf(stderr,
+                    "crispasr[aligner]: aligned %zu words for %zu inputs — keeping the aligner's "
+                    "own labels for this segment\n",
+                    v.size(), orig_words.size());
+        }
+        return v;
+    };
+
     if (is_qwen3_fa) {
-        const auto words = tokenise_words(eff_transcript);
-        return align_qwen3_fa(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
+        return restore_text(align_qwen3_fa(aligner_model, label_words, samples, n_samples, t_offset_cs, n_threads));
     }
 
-    const std::string arch = gguf_architecture(aligner_model);
-    if (is_wav2vec2_aligner_model(aligner_model, arch)) {
-        const auto words = tokenise_words(eff_transcript);
-        return align_wav2vec2_ctc(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
+    if (is_wav2vec2) {
+        return restore_text(align_wav2vec2_ctc(aligner_model, orig_words, samples, n_samples, t_offset_cs, n_threads));
     }
 
     // §176e: reuse cached canary-ctc context if same model path.
@@ -487,6 +787,8 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
         actx = canary_ctc_init_from_file(aligner_model.c_str(), acp);
         if (!actx) {
             fprintf(stderr, "crispasr[aligner]: failed to load '%s'\n", aligner_model.c_str());
+            if (out_load_failed)
+                *out_load_failed = true;
             return out;
         }
         g_aligner_cache_ctx = actx;
@@ -496,25 +798,52 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
 
     float* ctc_logits = nullptr;
     int T_ctc = 0, V_ctc = 0;
-    int rc = canary_ctc_compute_logits(actx, samples, n_samples, &ctc_logits, &T_ctc, &V_ctc);
+    std::vector<float> window_logits;
+    int rc = 0;
+    const int frame_cs = canary_ctc_frame_dur_cs(actx);
+    const int64_t core_frames = frame_cs > 0 ? int64_t(chunk_seconds) * 100 / frame_cs : 0;
+    const bool windowed = chunk_seconds > 0 && int64_t(n_samples) > int64_t(chunk_seconds) * 16000;
+    if (windowed) {
+        if (frame_cs <= 0 || frame_cs > 1000 || core_frames <= 0 || core_frames > std::numeric_limits<int>::max())
+            return out;
+        fprintf(stderr, "crispasr[aligner]: bounded CTC encoder: %ds cores + 2s context; global transcript alignment\n",
+                chunk_seconds);
+        rc = core_ctc_windows::compute(
+            samples, n_samples, frame_cs * 160, int(core_frames), std::max(1, 200 / frame_cs),
+            [&](const float* pcm, int count, std::vector<float>& rows, int& t, int& v) {
+                float* raw = nullptr;
+                const int status = canary_ctc_compute_logits(actx, pcm, count, &raw, &t, &v);
+                std::unique_ptr<float, decltype(&free)> owned(raw, &free);
+                if (status != 0)
+                    return status;
+                if (!raw || t <= 0 || v <= 0 || size_t(t) > rows.max_size() / size_t(v))
+                    return -1;
+                rows.assign(raw, raw + size_t(t) * size_t(v));
+                return 0;
+            },
+            window_logits, T_ctc, V_ctc);
+        ctc_logits = window_logits.data();
+    } else {
+        rc = canary_ctc_compute_logits(actx, samples, n_samples, &ctc_logits, &T_ctc, &V_ctc);
+    }
+    // Windowed logits are vector-owned; the unchanged short path is malloc-owned.
+    std::unique_ptr<float, decltype(&free)> owned_logits(windowed ? nullptr : ctc_logits, &free);
     if (rc != 0) {
         fprintf(stderr, "crispasr[aligner]: compute_logits failed (rc=%d)\n", rc);
         return out;
     }
 
-    const auto words = tokenise_words(eff_transcript);
-    if (words.empty()) {
-        free(ctc_logits);
+    if (label_words.empty()) {
         return out;
     }
 
-    std::vector<canary_ctc_word> aligned(words.size());
-    std::vector<const char*> word_ptrs(words.size());
-    for (size_t i = 0; i < words.size(); i++)
-        word_ptrs[i] = words[i].c_str();
+    std::vector<canary_ctc_word> aligned(label_words.size());
+    std::vector<const char*> word_ptrs(label_words.size());
+    for (size_t i = 0; i < label_words.size(); i++)
+        word_ptrs[i] = label_words[i].c_str();
 
-    rc = canary_ctc_align_words(actx, ctc_logits, T_ctc, V_ctc, word_ptrs.data(), (int)words.size(), aligned.data());
-    free(ctc_logits);
+    rc = canary_ctc_align_words(actx, ctc_logits, T_ctc, V_ctc, word_ptrs.data(), (int)label_words.size(),
+                                aligned.data());
     // Do NOT free actx — it's cached (§176e).
 
     if (rc != 0) {
@@ -530,5 +859,24 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
         cw.t1_cs = t_offset_cs + w.t1;
         out.push_back(std::move(cw));
     }
+    return restore_text(std::move(out));
+}
+// Convert a segment's absolute centisecond timestamps to a sample interval and
+// clamp it to the audio slice that produced the segment.  Use integer math so
+// adjacent segments get stable boundaries on every platform; round the end up
+// to avoid dropping a partial centisecond of speech.
+CrispasrAlignmentAudioRange crispasr_alignment_audio_range(int64_t segment_t0_cs, int64_t segment_t1_cs,
+                                                           int slice_start, int slice_end, int sample_rate) {
+    CrispasrAlignmentAudioRange out;
+    if (sample_rate <= 0 || slice_end <= slice_start || segment_t1_cs <= segment_t0_cs)
+        return out;
+
+    const int64_t raw_start = segment_t0_cs * sample_rate / 100;
+    const int64_t raw_end = (segment_t1_cs * sample_rate + 99) / 100;
+    out.start = (int)std::clamp<int64_t>(raw_start, slice_start, slice_end);
+    out.end = (int)std::clamp<int64_t>(raw_end, slice_start, slice_end);
+    if (!out.valid())
+        return {};
+    out.offset_cs = (int64_t)out.start * 100 / sample_rate;
     return out;
 }

@@ -1,0 +1,15 @@
+{
+  "id": "project_evolution",
+  "label": "Project Evolution",
+  "description": "Document current code, build clean code and architecture plans, add regression guards, and plan the next evolution cycle.",
+  "output_folder": "_kiyotaka_project",
+  "required_agents": [
+    "kiyotaka",
+    "kiyotaka-observer",
+    "kiyotaka-excavator",
+    "kiyotaka-architect-reader",
+    "kiyotaka-recorder",
+    "kiyotaka-verifier"
+  ],
+  "installed_at": "2026-06-24T00:00:00.000Z"
+}

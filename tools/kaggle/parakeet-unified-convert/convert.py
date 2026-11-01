@@ -33,7 +33,7 @@ def main():
 
     # HF token
     for p in ["/kaggle/input/crispasr-hf-token/hf_token.txt",
-              "/kaggle/input/datasets/chr1s4/crispasr-hf-token/hf_token.txt"]:
+              "/kaggle/input/datasets/${KAGGLE_ACCOUNT}/crispasr-hf-token/hf_token.txt"]:
         if os.path.exists(p):
             tok = open(p).read().strip()
             os.environ["HF_TOKEN"] = tok
@@ -55,7 +55,7 @@ def main():
                    shell=True, capture_output=True)
     bdir = cdir / "build"
     subprocess.check_call(["cmake", "-G", "Ninja", "-B", str(bdir),
-                          "-DCMAKE_BUILD_TYPE=Release"], cwd=str(cdir))
+                          "-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON"], cwd=str(cdir))
     subprocess.check_call(["cmake", "--build", str(bdir), "-j2"], cwd=str(cdir))
     log("Build OK")
 

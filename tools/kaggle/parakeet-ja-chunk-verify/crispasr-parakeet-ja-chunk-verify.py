@@ -8,7 +8,7 @@ Expected: with the fix, auto-chunk fires at 10s (not 30s), recovering
 all 3 repetitions of the keyword. Without the fix, the 30s chunk window
 loses content because the encoder collapses *inside* each 30s chunk.
 
-Uses chr1s4 account on Kaggle T4/P100.
+Uses $KAGGLE_ACCOUNT account on Kaggle T4/P100.
 """
 
 import os
@@ -47,7 +47,7 @@ build_dir.mkdir(exist_ok=True)
 with kh.build_heartbeat("cmake configure"):
     subprocess.check_call([
         "cmake", "-G", "Ninja", "-B", str(build_dir),
-        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON",
         "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
         "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
     ], cwd=str(_CRISPASR_DIR), env={**os.environ, "CCACHE_DIR": str(WORK / ".ccache")})

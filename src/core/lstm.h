@@ -39,8 +39,28 @@
 #include "ggml.h"
 
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace core_lstm {
+
+static inline bool lstm_env_bool(const char* k) {
+    const char* v = std::getenv(k);
+    return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
+}
+
+static inline ggml_tensor* lstm_debug_mul_mat(ggml_context* ctx, const char* name, ggml_tensor* w, ggml_tensor* x) {
+    if (lstm_env_bool("KOKORO_DEBUG_SHAPES")) {
+        const bool can = (w->ne[0] == x->ne[0]) && (x->ne[2] % w->ne[2] == 0) && (x->ne[3] % w->ne[3] == 0);
+        std::fprintf(stderr,
+                     "kokoro shapes: %s can=%d w=(%lld,%lld,%lld,%lld) x=(%lld,%lld,%lld,%lld)\n", name,
+                     can ? 1 : 0, (long long)w->ne[0], (long long)w->ne[1], (long long)w->ne[2],
+                     (long long)w->ne[3], (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2],
+                     (long long)x->ne[3]);
+    }
+    return ggml_mul_mat(ctx, w, x);
+}
 
 // Single-direction LSTM forward over T timesteps.
 //
@@ -63,7 +83,7 @@ static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_cgraph* gf, ggml_
 
     // Input projection over all T timesteps at once.
     // proj_x ne = (4H, T)
-    ggml_tensor* proj_x = ggml_mul_mat(ctx, W_ih, X);
+    ggml_tensor* proj_x = lstm_debug_mul_mat(ctx, "lstm.W_ih", W_ih, X);
     proj_x = ggml_add(ctx, proj_x, b_ih);
 
     // Pre-allocated output container (H, T) F32.
@@ -87,7 +107,7 @@ static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_cgraph* gf, ggml_
         // pre = px + (W_hh @ h + b_hh) — at step 0 the W_hh@0 term vanishes.
         ggml_tensor* pre;
         if (h) {
-            ggml_tensor* ph = ggml_mul_mat(ctx, W_hh, h); // (4H, 1)
+            ggml_tensor* ph = lstm_debug_mul_mat(ctx, "lstm.W_hh", W_hh, h); // (4H, 1)
             ph = ggml_add(ctx, ph, b_hh);
             pre = ggml_add(ctx, px, ph);
         } else {

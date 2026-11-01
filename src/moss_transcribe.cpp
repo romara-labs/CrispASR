@@ -27,6 +27,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,8 @@
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (issue #218)
+#include "core/crispasr_env.h"
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -57,7 +60,7 @@
 static bool moss_transcribe_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOSS_TRANSCRIBE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOSS_TRANSCRIBE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -232,6 +235,8 @@ struct moss_transcribe_context {
     int n_threads = 4;
     std::string model_path;
     int beam_size = 1;
+    // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
+    int max_new_tokens = 512;
 
     // Encoder attention path. flash_attn_ext is fast on CPU/Metal/CUDA but
     // segfaults on Vulkan during graph/command-pool cleanup (issue #215, both
@@ -573,7 +578,7 @@ extern "C" float* moss_transcribe_compute_mel(struct moss_transcribe_context* ct
 
     float* result = (float*)malloc(mel_out.size() * sizeof(float));
     memcpy(result, mel_out.data(), mel_out.size() * sizeof(float));
-    if (const char* dp = std::getenv("MOSS_TRANSCRIBE_MEL_DUMP")) {
+    if (const char* dp = crispasr_env::get("CRISPASR_MOSS_TRANSCRIBE_MEL_DUMP")) {
         FILE* f = fopen(dp, "wb");
         if (f) {
             fwrite(result, sizeof(float), mel_out.size(), f);
@@ -869,7 +874,7 @@ extern "C" float* moss_transcribe_run_encoder(struct moss_transcribe_context* ct
     ggml_tensor* eo = ggml_graph_get_tensor(gf, "encoder_output"); // (out_dim, T_enc)
     float* result = (float*)malloc((size_t)out_dim * T_enc * sizeof(float));
     ggml_backend_tensor_get(eo, result, 0, (size_t)out_dim * T_enc * sizeof(float));
-    if (const char* dp = std::getenv("MOSS_TRANSCRIBE_L0_DUMP")) {
+    if (const char* dp = crispasr_env::get("CRISPASR_MOSS_TRANSCRIBE_L0_DUMP")) {
         ggml_tensor* l0 = ggml_graph_get_tensor(gf, "enc_layer_0");
         if (l0) {
             std::vector<float> b((size_t)d * T_enc);
@@ -882,7 +887,7 @@ extern "C" float* moss_transcribe_run_encoder(struct moss_transcribe_context* ct
             }
         }
     }
-    if (const char* dp = std::getenv("MOSS_TRANSCRIBE_ENC_DUMP")) {
+    if (const char* dp = crispasr_env::get("CRISPASR_MOSS_TRANSCRIBE_ENC_DUMP")) {
         FILE* f = fopen(dp, "wb");
         if (f) {
             fwrite(result, sizeof(float), (size_t)out_dim * T_enc, f);
@@ -1379,7 +1384,8 @@ static char* moss_transcribe_impl(struct moss_transcribe_context* ctx, const flo
     free(audio_embeds);
 
     // 6. KV cache + prefill
-    int max_ctx = n_prompt + 512;
+    const int max_new = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 512;
+    int max_ctx = n_prompt + max_new;
     if (ctx->kv_k) {
         if (ctx->kv_max_ctx < max_ctx) {
             if (ctx->kv_buf)
@@ -1404,9 +1410,8 @@ static char* moss_transcribe_impl(struct moss_transcribe_context* ctx, const flo
     if (!logits)
         return nullptr;
 
-    // 7. Decode
+    // 7. Decode  (max_new computed above, honors --max-new-tokens, #292)
     std::vector<int32_t> generated;
-    const int max_new = 512;
     if (ctx->beam_size > 1) {
         auto replay = [&vocab](moss_transcribe_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
             float* emb = moss_transcribe_embed_tokens(c, toks, n);
@@ -1430,18 +1435,27 @@ static char* moss_transcribe_impl(struct moss_transcribe_context* ctx, const flo
             generated.pop_back();
     } else {
         for (int step = 0; step < max_new; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < vocab; i++)
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see canary_qwen note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < vocab; i++)
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            if (best_id < 0) {
+                free(logits);
+                logits = nullptr;
+                fprintf(stderr, "moss_transcribe: non-finite logits at step %d — aborting decode\n", step);
+                break;
+            }
             float tok_prob = 0.0f;
             if (on_tok && best_id != (int)hp.eos_token_id) {
                 float s = 0.0f;
                 for (int i = 0; i < vocab; i++)
-                    s += expf(logits[i] - best_val);
+                    if (std::isfinite(logits[i]))
+                        s += expf(logits[i] - best_val);
                 tok_prob = (s > 0.0f) ? (1.0f / s) : 0.0f;
             }
             free(logits);
@@ -1530,12 +1544,12 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     // #215 resolved: the native-Vulkan (RADV/NVIDIA) segfault was a use-after-free
     // in run_encoder's conv-stem graph cached across encoder invocations (see the
@@ -1546,8 +1560,8 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
         if (force_cpu && force_cpu[0] == '1')
             ctx->backend = ctx->backend_cpu;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
     // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /
@@ -1600,7 +1614,7 @@ extern "C" void moss_transcribe_free(struct moss_transcribe_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -1613,4 +1627,12 @@ extern "C" void moss_transcribe_free(struct moss_transcribe_context* ctx) {
 extern "C" void moss_transcribe_set_beam_size(struct moss_transcribe_context* ctx, int beam_size) {
     if (ctx)
         ctx->beam_size = beam_size > 0 ? beam_size : 1;
+}
+
+// #292: forward the user's --max-new-tokens. Pass <= 0 to keep the 512 default
+// (the caller decides "explicit" — see the CLI adapter's max_new_tokens_explicit
+// gate, so an unset CLI default does not silently change this backend).
+extern "C" void moss_transcribe_set_max_new_tokens(struct moss_transcribe_context* ctx, int max_new_tokens) {
+    if (ctx && max_new_tokens > 0)
+        ctx->max_new_tokens = max_new_tokens;
 }

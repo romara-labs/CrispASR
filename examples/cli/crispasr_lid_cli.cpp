@@ -5,8 +5,11 @@
 // auto-download here where the CLI's cache / UX policy lives.
 
 #include "crispasr_lid_cli.h"
+#include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_lid.h" // shared library header (src/)
+#include "core/lid_recording.h"
+#include "crispasr_subprocess.h"
 #include "whisper_params.h"
 
 #include <algorithm>
@@ -14,7 +17,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -27,8 +29,6 @@
 #include <sys/stat.h>
 #define close _close
 #define mkdir(d, m) _mkdir(d)
-#define popen _popen
-#define pclose _pclose
 static int mkstemps(char* t, int s) {
     (void)s;
     return _mktemp_s(t, strlen(t) + 1) == 0 ? _open(t, _O_CREAT | _O_WRONLY, 0600) : -1;
@@ -70,7 +70,12 @@ std::string scratch_dir() {
 constexpr const char* kEcapaLidDefaultFile = "ecapa-lid-107.gguf";
 
 std::string resolve_whisper_lid_model(const whisper_params& p) {
-    if (!p.lid_model.empty())
+    // --lid-model belongs to the selected provider. A Silero GGUF (or
+    // another provider's checkpoint) must never be reused by Whisper when
+    // that provider declines a window and we take the default fallback.
+    const bool selected_whisper =
+        p.lid_backend.empty() || p.lid_backend == "whisper" || p.lid_backend == "whisper-tiny";
+    if (selected_whisper && !p.lid_model.empty() && p.lid_model != "auto")
         return expand_home(p.lid_model);
     return crispasr_cache::ensure_cached_file(kWhisperLidDefaultFile, kWhisperLidDefaultUrl, p.no_prints,
                                               "crispasr[lid]", p.cache_dir);
@@ -175,22 +180,36 @@ bool detect_with_sherpa(const float* samples, int n_samples, const whisper_param
     fwrite(pcm.data(), sizeof(int16_t), pcm.size(), f);
     fclose(f);
 
-    std::ostringstream cmd;
-    cmd << bin << " --whisper-model='" << p.lid_model << "' '" << wav_path << "' 2>&1";
+    const std::vector<std::string> args = {
+        bin,
+        "--whisper-model=" + p.lid_model,
+        wav_path,
+    };
     if (!p.no_prints)
-        fprintf(stderr, "crispasr[lid]: %s\n", cmd.str().c_str());
+        fprintf(stderr, "crispasr[lid]: %s\n", crispasr_cli_process::join_cmdline(args).c_str());
 
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd.str().c_str(), "r"), pclose);
-    if (!pipe) {
+    const int timeout_sec =
+        crispasr_cli_process::timeout_from_audio_samples("CRISPASR_SHERPA_LID_TIMEOUT_SEC", n_samples);
+    const auto run = crispasr_cli_process::run_capture_stdout(args, timeout_sec, true);
+    if (run.timed_out) {
+        fprintf(stderr, "crispasr[lid]: sherpa subprocess timed out after %d s\n", timeout_sec);
+        std::remove(wav_path.c_str());
+        return false;
+    }
+    if (run.spawn_failed) {
         fprintf(stderr, "crispasr[lid]: failed to spawn sherpa LID subprocess\n");
         std::remove(wav_path.c_str());
         return false;
     }
+    if (run.exit_code != 0) {
+        fprintf(stderr, "crispasr[lid]: sherpa subprocess exited with code %d\n", run.exit_code);
+        std::remove(wav_path.c_str());
+        return false;
+    }
 
-    char linebuf[512];
     std::string detected;
-    while (fgets(linebuf, sizeof(linebuf), pipe.get())) {
-        std::string line = linebuf;
+    std::istringstream lines(run.output);
+    for (std::string line; std::getline(lines, line);) {
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
             line.pop_back();
         auto pos = line.find("Detected language:");
@@ -220,8 +239,67 @@ bool detect_with_sherpa(const float* samples, int n_samples, const whisper_param
 
 } // namespace
 
-bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
-                                  crispasr_lid_result& out) {
+bool crispasr_backend_probe_language(CrispasrBackend& backend, const float* samples, int n_samples,
+                                     const whisper_params& params, crispasr_lid_result& out) {
+    out = {};
+    if (!samples || n_samples <= 0)
+        return false;
+
+    // An explicitly named external backend wins — the probe is only the
+    // default when the user expressed no preference (or asked for it).
+    const std::string& be = params.lid_backend;
+    if (!be.empty() && be != "probe" && be != "self")
+        return false;
+
+    if (params.lid_full_recording) {
+        core_lid::WindowResult result;
+        const bool ok = core_lid::detect_recording(
+            samples, n_samples,
+            [&](const float* window, int count, core_lid::WindowResult& vote) {
+                if (!backend.detect_language(window, count, params, vote.lang_code, vote.confidence))
+                    return false;
+                vote.source = std::string(backend.name()) + "-probe";
+                return true;
+            },
+            result);
+        if (!ok)
+            return false;
+        out.lang_code = result.lang_code;
+        out.confidence = result.confidence;
+        out.source = result.source;
+        return true;
+    }
+    std::string lang;
+    float confidence = 0.0f;
+    if (!backend.detect_language(samples, n_samples, params, lang, confidence) || lang.empty())
+        return false;
+    out.lang_code = lang;
+    out.confidence = confidence;
+    out.source = std::string(backend.name()) + "-probe";
+    return true;
+}
+
+static bool detect_whisper_cli(const float* samples, int n_samples, const whisper_params& params,
+                               crispasr_lid_result& out) {
+    CrispasrLidOptions opts;
+    opts.method = CrispasrLidMethod::Whisper;
+    opts.model_path = resolve_whisper_lid_model(params);
+    opts.n_threads = params.n_threads;
+    opts.use_gpu = params.use_gpu;
+    opts.gpu_device = params.gpu_device;
+    opts.flash_attn = params.flash_attn;
+    opts.verbose = !params.no_prints;
+    CrispasrLidResult r;
+    if (!crispasr_detect_language(samples, n_samples, opts, r))
+        return false;
+    out.lang_code = r.lang_code;
+    out.confidence = r.confidence;
+    out.source = r.source;
+    return true;
+}
+
+static bool crispasr_detect_language_cli_window(const float* samples, int n_samples, const whisper_params& params,
+                                                crispasr_lid_result& out) {
     out = {};
     if (!samples || n_samples <= 0)
         return false;
@@ -229,24 +307,17 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
     std::string be = params.lid_backend;
     if (be.empty())
         be = "whisper";
-
-    if (be == "whisper" || be == "whisper-tiny") {
-        CrispasrLidOptions opts;
-        opts.method = CrispasrLidMethod::Whisper;
-        opts.model_path = resolve_whisper_lid_model(params);
-        opts.n_threads = params.n_threads;
-        opts.use_gpu = params.use_gpu;
-        opts.gpu_device = params.gpu_device;
-        opts.flash_attn = params.flash_attn;
-        opts.verbose = !params.no_prints;
-        CrispasrLidResult r;
-        if (!crispasr_detect_language(samples, n_samples, opts, r))
-            return false;
-        out.lang_code = r.lang_code;
-        out.confidence = r.confidence;
-        out.source = r.source;
-        return true;
+    if (be == "probe" || be == "self") {
+        // Reached only when the backend's own probe declined or failed —
+        // crispasr_backend_probe_language() already had its turn. Fall back to
+        // the external default rather than erroring on a valid flag value.
+        fprintf(stderr, "crispasr[lid]: this backend has no self-probe (or it returned nothing) — "
+                        "falling back to whisper-tiny LID\n");
+        be = "whisper";
     }
+
+    if (be == "whisper" || be == "whisper-tiny")
+        return detect_whisper_cli(samples, n_samples, params, out);
 
     if (be == "silero") {
         const std::string model_path = resolve_silero_lid_model(params);
@@ -265,11 +336,19 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
                 out.source = r.source;
                 return true;
             }
-            fprintf(stderr, "crispasr[lid]: silero-native returned null — "
-                            "falling back to sherpa subprocess\n");
+            // #409: inconclusive (confidence-gated) or failed. Sherpa would
+            // re-run the SAME model and reach the same non-answer, so go
+            // straight to the robust default instead of returning garbage.
+            fprintf(stderr, "crispasr[lid]: silero LID inconclusive or failed — "
+                            "falling back to whisper-tiny LID\n");
+            return detect_whisper_cli(samples, n_samples, params, out);
         }
         // Sherpa-ONNX subprocess fallback (for ONNX models).
-        return detect_with_sherpa(samples, n_samples, params, out);
+        if (detect_with_sherpa(samples, n_samples, params, out))
+            return true;
+        fprintf(stderr, "crispasr[lid]: silero (sherpa) LID failed — "
+                        "falling back to whisper-tiny LID\n");
+        return detect_whisper_cli(samples, n_samples, params, out);
     }
 
     if (be == "firered") {
@@ -315,4 +394,30 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
     fprintf(stderr, "crispasr[lid]: unknown --lid-backend '%s' (expected 'whisper', 'silero', 'firered', or 'ecapa')\n",
             be.c_str());
     return false;
+}
+
+bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
+                                  crispasr_lid_result& out) {
+    if (!params.lid_full_recording)
+        return crispasr_detect_language_cli_window(samples, n_samples, params, out);
+
+    core_lid::WindowResult result;
+    const bool ok = core_lid::detect_recording(
+        samples, n_samples,
+        [&](const float* window, int count, core_lid::WindowResult& vote) {
+            crispasr_lid_result one;
+            if (!crispasr_detect_language_cli_window(window, count, params, one))
+                return false;
+            vote.lang_code = one.lang_code;
+            vote.confidence = one.confidence;
+            vote.source = one.source;
+            return true;
+        },
+        result);
+    if (!ok)
+        return false;
+    out.lang_code = result.lang_code;
+    out.confidence = result.confidence;
+    out.source = result.source;
+    return true;
 }

@@ -12,7 +12,10 @@
 #include "crispasr_model_registry.h"
 #include "whisper_params.h"
 
+#include "core/tts_voice_policy.h"
+#include "core/gguf_loader.h"
 #include "qwen3_tts.h"
+#include "qwen3_tts_voice_pack.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +72,20 @@ static std::string discover_codec(const std::string& model_path) {
 // as an extra companion when the user runs --model auto --backend qwen3-tts).
 static std::string discover_default_voice(const std::string& model_path) {
     const std::string dir = dir_of(model_path);
+    // Read the model contract, including for renamed files. The native loader
+    // uses 1024 when this key is absent; a present unknown width has no default.
+    auto* metadata = core_gguf::open_metadata(model_path.c_str());
+    if (!metadata)
+        return "";
+    const auto dimension = core_gguf::kv_u32(metadata, "qwen3tts.talker.d_model", 1024);
+    core_gguf::free_metadata(metadata);
+    if (const char* filename = qwen3_tts_voice_pack::default_filename(dimension)) {
+        const std::string path = dir + "/" + filename;
+        if (file_exists(path))
+            return path;
+    }
+    // Preserve existing locally installed packs; the runtime validates their
+    // actual speaker width before any tensor read.
     static const char* candidates[] = {
         "qwen3-tts-voice-default.gguf",
         "qwen3-tts-voice-default-q8_0.gguf",
@@ -90,7 +107,13 @@ public:
     const char* name() const override { return "qwen3-tts"; }
 
     uint32_t capabilities() const override {
-        uint32_t caps = CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_STREAMING;
+        // #329: CAP_SRC_TGT_LANGUAGE — the talker's prefill carries an explicit
+        // codec_language_id, so `-tl`/`--target-lang` picks the OUTPUT language
+        // (including when cloning a reference in another language). Without the
+        // bit the CLI warned "--target-lang ignored by this backend" and dropped
+        // it on the floor, which is how #329 came to read as "no such option".
+        uint32_t caps =
+            CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_STREAMING | CAP_SRC_TGT_LANGUAGE;
         if (is_base_)
             caps |= CAP_VOICE_CLONING;
         return caps;
@@ -161,8 +184,14 @@ public:
         // qwen3tts.codec_language_names is keyed by ("German", "Chinese",
         // …). "auto"/empty leaves the model's default ("nothink") path so
         // behaviour is unchanged when the user doesn't ask for a language.
-        if (!params.language.empty() && params.language != "auto") {
-            const std::string lang_name = crispasr_iso_to_english_lang(params.language);
+        //
+        // #329: prefer -tl/--target-lang over -l, matching cosyvoice3. For a TTS
+        // backend the two mean the same thing — the language to SPEAK — but a
+        // dubbing caller naturally reaches for "target", and it used to be
+        // silently discarded here while `-l` worked.
+        const std::string out_lang = !params.target_lang.empty() ? params.target_lang : params.language;
+        if (!out_lang.empty() && out_lang != "auto") {
+            const std::string lang_name = crispasr_iso_to_english_lang(out_lang);
             if (qwen3_tts_set_language_by_name(ctx_, lang_name.c_str()) != 0 && !params.no_prints)
                 fprintf(stderr,
                         "crispasr[qwen3-tts]: language '%s' not in the model's codec_language table; using auto\n",
@@ -234,7 +263,7 @@ public:
             // Include instruct in key so a style change triggers a re-load.
             voice_key = "cv:" + params.tts_voice + "\x01" + params.tts_instruct;
         } else {
-            voice_key = "base:" + resolved_voice + "\x01" + resolved_ref_text;
+            voice_key = "base:" + core_tts_voice::reference_key(resolved_voice, resolved_ref_text);
         }
         if (voice_key != last_voice_key_) {
             if (qwen3_tts_is_voice_design(ctx_)) {

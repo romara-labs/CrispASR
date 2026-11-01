@@ -16,6 +16,7 @@
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "moonshine-tokenizer.h"
 
 #include "ggml.h"
@@ -32,6 +33,8 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
+#include "core/sched_prof.h"
 
 // ===========================================================================
 // Bench instrumentation — `MOONSHINE_STREAM_BENCH=1` for per-stage timings.
@@ -40,7 +43,7 @@
 static bool moonshine_stream_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOONSHINE_STREAM_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOONSHINE_STREAM_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -202,6 +205,7 @@ struct moonshine_streaming_context {
     ggml_cgraph* cached_enc_gf = nullptr;
     ggml_context* cached_enc_ctx = nullptr;
     int cached_enc_T = 0;
+    std::vector<std::vector<ggml_fp16_t>> cached_masks;
 };
 
 // ── GGUF helpers ────────────────────────────────────────────────────────────
@@ -291,13 +295,13 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     }
 
     // ── Allocate weight buffer ─────────────────────────────────��────────
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "moonshine_streaming: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -307,7 +311,7 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     // Load weights via core_gguf (mmap, backend buffer). §232: on GPU, split
     // encoder->GPU / decoder->CPU (opt out with MOONSHINE_ALL_GPU=1).
     core_gguf::WeightLoad wl;
-    const char* all_gpu_env = std::getenv("MOONSHINE_ALL_GPU");
+    const char* all_gpu_env = crispasr_env::get("CRISPASR_MOONSHINE_ALL_GPU");
     const bool all_gpu = all_gpu_env && all_gpu_env[0] == '1';
     bool loaded;
     if (ctx->use_gpu && !all_gpu) {
@@ -427,9 +431,21 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     }
 
     // ── Load tokenizer ─────────────────────────────────────��────────────
-    std::string tok_path = dir_of(path_model) + "/tokenizer.bin";
+    std::string tok_path = std::string(path_model) + ".tokenizer.bin";
+    FILE* specific = fopen(tok_path.c_str(), "rb");
+    if (specific)
+        fclose(specific);
+    else
+        tok_path = dir_of(path_model) + "/tokenizer.bin";
     if (!ctx->tokenizer.load(tok_path.c_str())) {
         fprintf(stderr, "moonshine_streaming: failed to load tokenizer from '%s'\n", tok_path.c_str());
+        delete ctx;
+        return nullptr;
+    }
+
+    if (ctx->tokenizer.vocab_size() != hp.vocab_size) {
+        fprintf(stderr, "moonshine_streaming: tokenizer/model vocabulary mismatch (%zu != %u)\n",
+                ctx->tokenizer.vocab_size(), hp.vocab_size);
         delete ctx;
         return nullptr;
     }
@@ -599,7 +615,7 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     int head_dim = (int)hp.enc_head_dim;
     int kv_heads = (int)hp.enc_kv_heads;
     float ln_eps = 1e-5f;
-    bool verbose = ctx->verbosity >= 2 || getenv("MOONSHINE_STREAMING_BENCH");
+    bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_BENCH");
 
     // #215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers).
     if (ctx->cached_enc_ctx) {
@@ -703,25 +719,61 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_input"), frontend_out, 0, (size_t)T_enc * d * sizeof(float));
 
     // Set masks
+    static const int mask_cache_gate = []() {
+        const char* e = getenv("CRISPASR_MOONSHINE_MASK_CACHE");
+        return e ? atoi(e) : 1;
+    }();
+
+    const bool use_cache = (mask_cache_gate != 0);
+    if (use_cache && ctx->cached_enc_T != T_enc) {
+        ctx->cached_masks.resize(hp.enc_n_layers);
+        const size_t mask_sz = (size_t)T_enc * T_enc;
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        for (uint32_t li = 0; li < hp.enc_n_layers; li++) {
+            if (!masks[li]) {
+                ctx->cached_masks[li].clear();
+                continue;
+            }
+            auto [wl, wr] = hp.sliding_windows[li];
+            ctx->cached_masks[li].assign(mask_sz, neg_inf);
+            auto& mdata = ctx->cached_masks[li];
+            for (int tq = 0; tq < T_enc; tq++) {
+                const int k_lo = std::max(0, tq - (int)wl);
+                const int k_hi = std::min(T_enc - 1, tq + (int)wr);
+                if (k_lo <= k_hi) {
+                    std::fill(mdata.begin() + (size_t)tq * T_enc + k_lo, mdata.begin() + (size_t)tq * T_enc + k_hi + 1,
+                              zero);
+                }
+            }
+        }
+    }
+
     for (uint32_t li = 0; li < hp.enc_n_layers; li++) {
         if (!masks[li])
             continue;
-        auto [wl, wr] = hp.sliding_windows[li];
         size_t mask_sz = (size_t)T_enc * T_enc;
-        std::vector<ggml_fp16_t> mask_data(mask_sz);
-        for (int tq = 0; tq < T_enc; tq++)
-            for (int tk = 0; tk < T_enc; tk++) {
-                bool ok = (tk >= tq - (int)wl) && (tk <= tq + (int)wr);
-                mask_data[(size_t)tq * T_enc + tk] = ggml_fp32_to_fp16(ok ? 0.0f : -INFINITY);
-            }
         char name[32];
         snprintf(name, sizeof(name), "mask_%u", li);
         ggml_tensor* mt = ggml_graph_get_tensor(gf, name);
-        if (mt)
+        if (!mt)
+            continue;
+
+        if (use_cache && (int)ctx->cached_masks.size() > (int)li && !ctx->cached_masks[li].empty()) {
+            ggml_backend_tensor_set(mt, ctx->cached_masks[li].data(), 0, mask_sz * sizeof(ggml_fp16_t));
+        } else {
+            auto [wl, wr] = hp.sliding_windows[li];
+            std::vector<ggml_fp16_t> mask_data(mask_sz);
+            for (int tq = 0; tq < T_enc; tq++)
+                for (int tk = 0; tk < T_enc; tk++) {
+                    bool ok = (tk >= tq - (int)wl) && (tk <= tq + (int)wr);
+                    mask_data[(size_t)tq * T_enc + tk] = ggml_fp32_to_fp16(ok ? 0.0f : -INFINITY);
+                }
             ggml_backend_tensor_set(mt, mask_data.data(), 0, mask_sz * sizeof(ggml_fp16_t));
+        }
     }
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (core_sched_prof::compute(ctx->sched, gf, "moonshine-streaming") != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "moonshine_streaming: encoder compute failed\n");
         ggml_free(ctx0);
         return -1;
@@ -841,7 +893,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
         kv[i].cross_k = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F32, dec_head_dim, T_enc, dec_kv_heads);
         kv[i].cross_v = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F32, dec_head_dim, T_enc, dec_kv_heads);
     }
-    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, core_cpu_backend::buffer_type());
     if (!kv_buf) {
         ggml_free(kv_ctx);
         return nullptr;
@@ -926,7 +978,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
                 ggml_backend_tensor_set(pt, pos_data.data(), 0, T_enc * sizeof(int32_t));
         }
 
-        ggml_backend_sched_graph_compute(ctx->sched, xgf);
+        core_sched_prof::compute(ctx->sched, xgf, "moonshine-streaming");
 
         size_t kv_bytes = (size_t)dec_head_dim * T_enc * dec_kv_heads * sizeof(float);
         for (int i = 0; i < dec_layers; i++) {
@@ -1032,7 +1084,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
         int32_t pos_val = pos;
         ggml_backend_tensor_set(ggml_graph_get_tensor(dgf, "pos"), &pos_val, 0, sizeof(int32_t));
 
-        if (ggml_backend_sched_graph_compute(ctx->sched, dgf) != GGML_STATUS_SUCCESS) {
+        if (core_sched_prof::compute(ctx->sched, dgf, "moonshine-streaming") != GGML_STATUS_SUCCESS) {
             ggml_free(dctx);
             return {};
         }
@@ -1168,9 +1220,9 @@ extern "C" void moonshine_streaming_free(struct moonshine_streaming_context* ctx
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
-        ggml_backend_buffer_free(ctx->model.buf_w);
+        core_gguf::release_weight_buffer(ctx->model.buf_w);
     if (ctx->model.buf_w_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1184,7 +1236,7 @@ extern "C" void moonshine_streaming_set_n_threads(struct moonshine_streaming_con
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
         if (ctx->backend_cpu)
-            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+            core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

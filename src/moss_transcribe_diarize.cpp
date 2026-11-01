@@ -8,6 +8,7 @@
 // See moss_transcribe_diarize.h for the architecture summary.
 
 #include "moss_transcribe_diarize.h"
+#include "core/moss_diarize_segments.h"
 #include "core/win_compat.h"
 
 #include "core/beam_decode.h"
@@ -24,6 +25,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +43,8 @@
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h"
 #include "core/ngram_loop_fix.h"
+#include "core/crispasr_env.h"
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -53,7 +57,7 @@
 static bool moss_diarize_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOSS_DIARIZE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOSS_DIARIZE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -213,6 +217,11 @@ struct moss_diarize_context {
     int n_threads = 4;
     std::string model_path;
     int beam_size = 1;
+    // Decode cap. Diarize output is long (speaker tags + timestamps + text), so
+    // the default is 1024 rather than the global 512 — a single-pass 300 s file
+    // otherwise truncated (#292). The CLI/session forwards --max-new-tokens here
+    // when the user set it explicitly; unset keeps this 1024 default.
+    int max_new_tokens = 1024;
     std::string hotwords;
     std::string ask_override; // custom system instruction (set_ask)
     std::string language;     // language hint
@@ -1277,32 +1286,6 @@ static std::vector<int32_t> moss_diarize_build_prompt(moss_diarize_context* ctx,
 // Output parser: [timestamp][Sxx]text[timestamp]
 // ===========================================================================
 
-static std::vector<moss_diarize_segment> moss_diarize_parse_output(const std::string& text) {
-    std::vector<moss_diarize_segment> segs;
-    // Pattern: [start_time][Sxx]text[end_time]
-    std::regex seg_re(R"(\[(\d+\.?\d*)\]\[S(\d+)\](.*?)\[(\d+\.?\d*)\])");
-    auto it = std::sregex_iterator(text.begin(), text.end(), seg_re);
-    auto end = std::sregex_iterator();
-
-    for (; it != end; ++it) {
-        const std::smatch& m = *it;
-        moss_diarize_segment seg;
-        seg.t0_cs = (int64_t)(std::stof(m[1].str()) * 100.0f + 0.5f);
-        seg.t1_cs = (int64_t)(std::stof(m[4].str()) * 100.0f + 0.5f);
-        seg.speaker_id = std::stoi(m[2].str());
-        std::string seg_text = m[3].str();
-        // Trim whitespace
-        size_t s = seg_text.find_first_not_of(" \t\n");
-        size_t e = seg_text.find_last_not_of(" \t\n");
-        if (s != std::string::npos && e != std::string::npos)
-            seg_text = seg_text.substr(s, e - s + 1);
-        size_t copy_len = std::min(seg_text.size(), sizeof(seg.text) - 1);
-        memcpy(seg.text, seg_text.c_str(), copy_len);
-        seg.text[copy_len] = '\0';
-        segs.push_back(seg);
-    }
-    return segs;
-}
 
 // ===========================================================================
 // High-level transcribe
@@ -1390,7 +1373,8 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
     free(audio_embeds);
 
     // 6. KV cache + prefill
-    int max_ctx = n_prompt + 1024;
+    const int max_new = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 1024;
+    int max_ctx = n_prompt + max_new;
     if (ctx->kv_k) {
         if (ctx->kv_max_ctx < max_ctx) {
             if (ctx->kv_buf)
@@ -1415,9 +1399,8 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
     if (!logits)
         return nullptr;
 
-    // 7. Decode
+    // 7. Decode  (max_new computed above, honors --max-new-tokens, #292)
     std::vector<int32_t> generated;
-    const int max_new = 1024; // diarize output can be longer
     if (ctx->beam_size > 1) {
         auto replay = [&vocab](moss_diarize_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
             float* emb = moss_diarize_embed_tokens(c, toks, n);
@@ -1441,13 +1424,21 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
             generated.pop_back();
     } else {
         for (int step = 0; step < max_new; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < vocab; i++)
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see canary_qwen note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < vocab; i++)
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            if (best_id < 0) {
+                free(logits);
+                logits = nullptr;
+                fprintf(stderr, "moss_diarize: non-finite logits at step %d — aborting decode\n", step);
+                break;
+            }
             free(logits);
             logits = nullptr;
             if (ctx->params.verbosity >= 2 && step < 10)
@@ -1476,7 +1467,11 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
             result += core_bpe::token_bytes_to_utf8(t);
     }
     if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "moss_diarize: %zu tokens: \"%s\"\n", generated.size(), result.substr(0, 200).c_str());
+        // #318: print the FULL tagged transcript, not the first 200 chars — this
+        // `[t][Sxx] …[t]` line (speaker tags + per-phrase timings) is the only
+        // place the rich structure surfaces during streaming (the partial JSONs
+        // carry text only), and users rely on it. One line, printed once per call.
+        fprintf(stderr, "moss_diarize: %zu tokens: \"%s\"\n", generated.size(), result.c_str());
 
     // n-gram loop fix
     {
@@ -1529,6 +1524,14 @@ extern "C" void moss_diarize_set_beam_size(struct moss_diarize_context* ctx, int
         ctx->beam_size = beam_size > 0 ? beam_size : 1;
 }
 
+// #292: forward the user's --max-new-tokens. Pass <= 0 to keep the 1024 default
+// (the caller decides "explicit" — see the CLI adapter's max_new_tokens_explicit
+// gate, so an unset CLI default of 512 does not silently shrink this backend).
+extern "C" void moss_diarize_set_max_new_tokens(struct moss_diarize_context* ctx, int max_new_tokens) {
+    if (ctx && max_new_tokens > 0)
+        ctx->max_new_tokens = max_new_tokens;
+}
+
 extern "C" void moss_diarize_set_ask(struct moss_diarize_context* ctx, const char* instruction) {
     if (!ctx)
         return;
@@ -1561,20 +1564,20 @@ extern "C" struct moss_diarize_context* moss_diarize_init_from_file(const char* 
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     {
         const char* force_cpu = std::getenv("CRISPASR_MOSS_DIARIZE_FORCE_CPU");
         if (force_cpu && force_cpu[0] == '1')
             ctx->backend = ctx->backend_cpu;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Encoder attention path — flash by default, manual on Vulkan
     {
@@ -1615,7 +1618,7 @@ extern "C" void moss_diarize_free(struct moss_diarize_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

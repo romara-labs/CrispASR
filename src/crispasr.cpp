@@ -1,3 +1,4 @@
+#include <chrono>
 #include "crispasr.h"
 #include "crispasr-arch.h"
 
@@ -8,6 +9,8 @@
 #include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/silero_context.h"
+#include "core/whisper_special_tokens.h" // serialized-vs-legacy special ids (#322)
 
 #ifdef CRISPASR_USE_COREML
 #include "coreml/whisper-encoder.h"
@@ -30,6 +33,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <random>
 #include <regex>
 #include <set>
@@ -203,6 +207,7 @@ static bool ggml_graph_compute_helper(struct ggml_cgraph* graph, int n_threads, 
 // instances (e.g. Ruby bindings) don't race on shared threadpool fields.
 #include <mutex>
 #include <unordered_map>
+#include "core/ggml_cpu_backend.h"
 struct cpu_pool_entry {
     ggml_threadpool_t pool = nullptr;
     int n_threads = 0;
@@ -214,24 +219,23 @@ static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_thre
     std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-        if (!ggml_backend_is_cpu(backend))
+        if (!core_cpu_backend::is_cpu(backend))
             continue;
 
         auto& entry = g_cpu_pools[backend];
         if (entry.pool && entry.n_threads >= n_threads) {
-            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            core_cpu_backend::set_threadpool(backend, entry.pool);
             continue;
         }
         // (Re)create with the requested size.
         if (entry.pool) {
-            ggml_backend_cpu_set_threadpool(backend, nullptr);
-            ggml_threadpool_free(entry.pool);
+            core_cpu_backend::set_threadpool(backend, nullptr);
+            core_cpu_backend::threadpool_free(entry.pool);
         }
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
-        entry.pool = ggml_threadpool_new(&tpp);
+        entry.pool = core_cpu_backend::threadpool_new(n_threads);
         entry.n_threads = entry.pool ? n_threads : 0;
         if (entry.pool) {
-            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            core_cpu_backend::set_threadpool(backend, entry.pool);
         }
     }
 }
@@ -246,8 +250,8 @@ static void whisper_release_cpu_threadpool(ggml_backend_t backend) {
     if (it == g_cpu_pools.end())
         return;
     if (it->second.pool) {
-        ggml_backend_cpu_set_threadpool(backend, nullptr);
-        ggml_threadpool_free(it->second.pool);
+        core_cpu_backend::set_threadpool(backend, nullptr);
+        core_cpu_backend::threadpool_free(it->second.pool);
     }
     g_cpu_pools.erase(it);
 }
@@ -924,9 +928,24 @@ struct whisper_vocab {
     bool multilingual = false;
     int n_lang = 0;
 
+    // Tiron (multi-speaker meeting ASR): <|speaker1|>..<|speakerN|> live
+    // contiguously ABOVE the timestamp block. When present, those ids are
+    // emittable special tokens, NOT timestamps — the stock Whisper decode
+    // treats every id >= token_beg as a timestamp, which would suppress /
+    // mis-handle them, so the loader records the boundary here.
+    id token_speaker_beg = 0; // 0 = no speaker tokens
+    int n_speakers = 0;
+    bool has_speakers = false;
+
     bool is_multilingual() const { return multilingual; }
 
     int num_languages() const { return n_lang; }
+
+    // exclusive upper bound of the timestamp band: n_vocab normally, or the
+    // first speaker token for a Tiron model.
+    id timestamp_end() const { return has_speakers ? token_speaker_beg : (id)n_vocab; }
+    bool is_timestamp(id t) const { return t >= token_beg && t < timestamp_end(); }
+    bool is_speaker(id t) const { return has_speakers && t >= token_speaker_beg && t < token_speaker_beg + n_speakers; }
 };
 
 struct whisper_segment {
@@ -1767,6 +1786,23 @@ static size_t aheads_masks_nbytes(struct whisper_aheads_masks& aheads_masks) {
     return size;
 }
 
+// Shared GPU-device pref matcher for the vendored whisper stack. The wrapper
+// builds its own backend list AND its own weight-buffer-type list; both MUST
+// apply the same filter or weights land on a device the sched doesn't carry
+// (ggml_backend_sched_backend_id_from_cur abort — hit via `--gpu-backend cpu`
+// and `--gpu-backend metal` on -l auto's LID whisper). Empty pref matches
+// every device; "cpu" matches none; "metal" is aliased to ggml's "MTL"
+// device naming, same as crispasr_init_gpu_backend().
+static bool whisper_dev_matches_gpu_pref(const char* dev_name, std::string pref) {
+    if (pref.empty())
+        return true;
+    if (pref.size() <= 3 && ci_starts_with("cpu", pref.c_str()))
+        return false;
+    if (pref.size() >= 3 && ci_starts_with("metal", pref.c_str()))
+        pref = "mtl";
+    return ci_starts_with(dev_name, pref.c_str());
+}
+
 static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params& params) {
     ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
 
@@ -1785,7 +1821,7 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params& par
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 // If a gpu_backend preference is set, skip devices that
                 // don't match (e.g. skip CUDA devices when vulkan is wanted).
-                if (!pref.empty() && !ci_starts_with(dev_name, pref.c_str())) {
+                if (!whisper_dev_matches_gpu_pref(dev_name, pref)) {
                     CRISPASR_LOG_INFO("%s: skipping %s (--gpu-backend %s)\n", __func__, dev_name, pref.c_str());
                     continue;
                 }
@@ -1854,13 +1890,19 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     // Prio order: GPU -> CPU Extra -> CPU
     buft_list_t buft_list;
 
-    // GPU
+    // GPU — same pref filter as whisper_backend_init_gpu, or the weights get
+    // buffer types for a device the sched doesn't carry (see the matcher's
+    // comment).
     if (params.use_gpu) {
+        const std::string pref = crispasr_get_gpu_backend_pref();
         int cnt = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                 ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                if (!whisper_dev_matches_gpu_pref(ggml_backend_dev_name(dev), pref)) {
+                    continue;
+                }
                 if (cnt == params.gpu_device) {
                     auto* buft = ggml_backend_dev_buffer_type(dev);
                     if (buft) {
@@ -1876,7 +1918,17 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU Extra
+    //
+    // Issue #405: under GGML_BACKEND_DL the registry can have NO CPU device
+    // (every shipped libggml-cpu variant refused by ggml_backend_score() on a
+    // host below their ISA floor). ggml_backend_dev_backend_reg(nullptr)
+    // aborts the process (GGML_ASSERT(device), ggml-backend.cpp:595 — the LID
+    // crash in the report), so return the GPU-only list and let the caller
+    // fail the model load with a real error message.
     auto* cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        return buft_list;
+    }
     auto* cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
         cpu_reg, "ggml_backend_dev_get_extra_bufts");
@@ -1889,7 +1941,7 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU
-    buft_list.emplace_back(cpu_dev, ggml_backend_cpu_buffer_type());
+    buft_list.emplace_back(cpu_dev, core_cpu_backend::buffer_type());
 
     return buft_list;
 }
@@ -1900,7 +1952,7 @@ static bool weight_buft_supported(const whisper_hparams& hparams, ggml_tensor* w
 
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == ggml_backend_cpu_buffer_type())) {
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == core_cpu_backend::buffer_type())) {
         // GPU and default CPU backend support all operators
         op_supported = true;
     } else {
@@ -2126,10 +2178,28 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
             return false;
         };
 
-        const bool has_serialized_specials =
-            set_token_id(vocab.token_eot, "<|endoftext|>") && set_token_id(vocab.token_sot, "<|startoftranscript|>");
+        auto find_token = [&](const char* token) {
+            const auto it = vocab.token_to_id.find(token);
+            return it == vocab.token_to_id.end() ? core_whisper_specials::kAbsent : (int)it->second;
+        };
+
+        // Look the ids up, then DECIDE — the decision is a pure function over plain
+        // ints (core/whisper_special_tokens.h), so it has nothing to mutate. #322 was
+        // a probe that assigned its destination and then reported "not found", leaving
+        // token_eot resolved while the flag said legacy; the fixup below then
+        // incremented an already-correct id. Separating lookup from decision makes
+        // that class of bug unrepresentable rather than merely fixed.
+        core_whisper_specials::Serialized ser;
+        ser.eot = find_token("<|endoftext|>");
+        ser.sot = find_token("<|startoftranscript|>");
+        ser.beg = find_token("<|0.00|>");
+        const bool has_serialized_specials = core_whisper_specials::use_serialized(ser);
 
         if (has_serialized_specials) {
+            // Guaranteed present by use_serialized(), including <|0.00|> -> token_beg.
+            vocab.token_eot = ser.eot;
+            vocab.token_sot = ser.sot;
+            vocab.token_beg = ser.beg;
             set_token_id(vocab.token_translate, "<|translate|>");
             set_token_id(vocab.token_transcribe, "<|transcribe|>");
             set_token_id(vocab.token_solm, "<|startoflm|>");
@@ -2138,7 +2208,31 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
                 set_token_id(vocab.token_nosp, "<|nocaptions|>");
             }
             set_token_id(vocab.token_not, "<|notimestamps|>");
-            set_token_id(vocab.token_beg, "<|0.00|>");
+
+            // Tiron: detect a contiguous run of <|speaker1|>, <|speaker2|>, ...
+            // starting above the timestamp block.
+            {
+                whisper_vocab::id sp_beg = 0;
+                int sp_n = 0;
+                for (int s = 1;; ++s) {
+                    const auto it = vocab.token_to_id.find("<|speaker" + std::to_string(s) + "|>");
+                    if (it == vocab.token_to_id.end()) {
+                        break;
+                    }
+                    if (s == 1) {
+                        sp_beg = it->second;
+                    } else if (it->second != sp_beg + (s - 1)) {
+                        break; // require contiguity from speaker1
+                    }
+                    sp_n = s;
+                }
+                if (sp_n > 0 && sp_beg > vocab.token_beg) {
+                    vocab.token_speaker_beg = sp_beg;
+                    vocab.n_speakers = sp_n;
+                    vocab.has_speakers = true;
+                    CRISPASR_LOG_INFO("%s: Tiron speaker tokens = %d (first id %d)\n", __func__, sp_n, sp_beg);
+                }
+            }
 
             if (vocab.token_translate > vocab.token_sot) {
                 vocab.n_lang = vocab.token_translate - vocab.token_sot - 1;
@@ -2245,6 +2339,14 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
 
     // Create a list of available bufts, in priority order
     buft_list_t buft_list = make_buft_list(wctx.params);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place model weights. "
+                           "If this is a packaged (dynamic-backend) build, the shipped libggml-cpu modules "
+                           "may all require CPU features this host lacks; use the crispasr-*-cpu-legacy "
+                           "artifact or build from source on this machine.\n",
+                           __func__);
+        return false;
+    }
 
     auto create_tensor = [&](asr_tensor type, asr_system system, ggml_tensor* meta, int layer = 0) -> ggml_tensor* {
         ggml_op op = ASR_TENSOR_INFO.at(type);
@@ -3377,9 +3479,19 @@ static bool whisper_decode_internal(whisper_context& wctx, whisper_state& wstate
 
         {
             struct ggml_tensor* position = ggml_graph_get_tensor(gf, "position");
-            for (int i = 0; i < n_tokens; ++i) {
-                const int32_t val = batch.pos[i];
-                ggml_backend_tensor_set(position, &val, i * sizeof(int32_t), sizeof(int32_t));
+            static const int contiguous_pos_gate = []() {
+                const char* e = getenv("CRISPASR_WHISPER_CONTIGUOUS_POS");
+                return e ? atoi(e) : 1;
+            }();
+            if (contiguous_pos_gate == 0) {
+                // Working path (pre-571cfa031): individual per-token driver calls
+                for (int i = 0; i < n_tokens; ++i) {
+                    const int32_t val = batch.pos[i];
+                    ggml_backend_tensor_set(position, &val, i * sizeof(int32_t), sizeof(int32_t));
+                }
+            } else {
+                // New path (571cfa031): single contiguous block copy
+                ggml_backend_tensor_set(position, batch.pos, 0, n_tokens * sizeof(whisper_pos));
             }
         }
 
@@ -3652,6 +3764,7 @@ static bool log_mel_spectrogram(whisper_state& wstate, const float* samples, con
     const int64_t t_start_us = ggml_time_us();
 
     // Hann window
+    // cppcheck-suppress incorrectStringBooleanError
     CRISPASR_ASSERT(frame_size == CRISPASR_N_FFT && "Unsupported frame_size");
     const float* hann = global_cache.hann_window;
 
@@ -4643,6 +4756,12 @@ int whisper_is_multilingual(struct whisper_context* ctx) {
     return ctx->vocab.is_multilingual() ? 1 : 0;
 }
 
+// Tiron (#295): 1 if the model exposes <|speakerN|> tokens (the tiron decode
+// grammar + fixed-window/onset-pad path are active for it).
+int whisper_has_speaker_tokens(struct whisper_context* ctx) {
+    return ctx->vocab.has_speakers ? 1 : 0;
+}
+
 float* whisper_get_logits(struct whisper_context* ctx) {
     return ctx->state->logits.data();
 }
@@ -4870,6 +4989,7 @@ struct whisper_vad_context {
     int n_window;
     int n_context;
     int n_threads;
+    bool source_context = false;
 
     std::vector<ggml_backend_t> backends;
     ggml_backend_buffer_t buffer = nullptr;
@@ -4886,6 +5006,13 @@ struct whisper_vad_context {
     std::vector<uint8_t> work_buf;          // pre-allocated ggml_cplan work buffer (#132)
     ggml_threadpool_t threadpool = nullptr; // persistent 1-thread pool for inner loop (#132)
 };
+
+bool crispasr_silero_enable_context(struct whisper_vad_context* ctx) {
+    if (!ctx || ctx->n_window != 512 || ctx->n_context != 64)
+        return false;
+    ctx->source_context = true;
+    return true;
+}
 
 struct whisper_vad_context_params whisper_vad_default_context_params(void) {
     whisper_vad_context_params result = {
@@ -4923,7 +5050,7 @@ static bool weight_buft_supported(const whisper_vad_hparams& hparams, ggml_tenso
 
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == ggml_backend_cpu_buffer_type())) {
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == core_cpu_backend::buffer_type())) {
         // GPU and default CPU backend support all operators
         op_supported = true;
     } else {
@@ -4979,9 +5106,10 @@ static ggml_backend_buffer_type_t select_weight_buft(const whisper_vad_hparams& 
     return nullptr;
 }
 
-static ggml_tensor* whisper_vad_build_stft_layer(ggml_context* ctx0, const whisper_vad_model& model, ggml_tensor* cur) {
+static ggml_tensor* whisper_vad_build_stft_layer(ggml_context* ctx0, const whisper_vad_model& model, ggml_tensor* cur,
+                                                 bool source_context) {
     // Apply reflective padding to the input tensor
-    ggml_tensor* padded = ggml_pad_reflect_1d(ctx0, cur, 64, 64);
+    ggml_tensor* padded = ggml_pad_reflect_1d(ctx0, cur, source_context ? 0 : 64, 64);
 
     struct ggml_tensor* stft =
         ggml_conv_1d(ctx0, model.stft_forward_basis, padded, model.hparams.lstm_input_size, 0, 1);
@@ -5032,7 +5160,15 @@ static ggml_tensor* whisper_vad_build_lstm_layer(ggml_context* ctx0, const whisp
     const whisper_vad_model& model = vctx.model;
     const int hdim = model.hparams.lstm_hidden_size;
 
-    struct ggml_tensor* x_t = ggml_transpose(ctx0, cur);
+    // ggml_transpose returns a NON-CONTIGUOUS view: it swaps nb[0]/nb[1], so the
+    // row stride of x_t becomes sizeof(float) and llamafile_sgemm's `ldb` collapses
+    // to 1 while k is lstm_hidden_size (128) — tripping its `ldb >= k` precondition
+    // (ggml-cpu/llamafile/sgemm.cpp). Release defines NDEBUG, so that assert is
+    // compiled out and the matmul RAN ANYWAY with a violated precondition; only a
+    // Debug build aborted, and the Debug leg had never run because CI executed 1 of
+    // 162 unit tests until 2026-07-29. ggml_cont materialises the transpose, which
+    // is the idiom the rest of this codebase already uses (src/audioseal.cpp, 5x).
+    struct ggml_tensor* x_t = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
 
     // Create operations using the input-to-hidden weights.
     struct ggml_tensor* inp_gate = ggml_mul_mat(ctx0, model.lstm_ih_weight, x_t);
@@ -5083,13 +5219,14 @@ static struct ggml_cgraph* whisper_vad_build_graph(whisper_vad_context& vctx) {
 
     ggml_cgraph* gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor* frame = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vctx.n_window, 1);
+    struct ggml_tensor* frame =
+        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vctx.n_window + (vctx.source_context ? vctx.n_context : 0), 1);
     ggml_set_name(frame, "frame");
     ggml_set_input(frame);
 
     struct ggml_tensor* cur = nullptr;
     {
-        cur = whisper_vad_build_stft_layer(ctx0, model, frame);
+        cur = whisper_vad_build_stft_layer(ctx0, model, frame, vctx.source_context);
 
         cur = whisper_vad_build_encoder_layer(ctx0, model, cur);
 
@@ -5173,10 +5310,7 @@ static bool whisper_vad_init_context(whisper_vad_context* vctx) {
     // This avoids creating/destroying a disposable threadpool on every
     // chunk (~250 per 8 s audio).  After many server requests the
     // accumulated malloc/free fragmentation degrades performance (#132).
-    {
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
-        vctx->threadpool = ggml_threadpool_new(&tpp);
-    }
+    { vctx->threadpool = core_cpu_backend::threadpool_new(1); }
 
     return true;
 }
@@ -5238,6 +5372,10 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
 
     whisper_vad_context* vctx = new whisper_vad_context;
     vctx->n_threads = params.n_threads;
+    // The VAD scheduler currently runs on CPU (whisper_vad_init_context).
+    // Place its weights on the same backend even when the caller enables
+    // GPU inference for ASR; CUDA weights in a CPU-only scheduler abort.
+    params.use_gpu = false;
     vctx->params.use_gpu = params.use_gpu;
     vctx->params.gpu_device = params.gpu_device;
 
@@ -5329,6 +5467,12 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
     wparams.use_gpu = params.use_gpu;
     wparams.gpu_device = params.gpu_device;
     buft_list_t buft_list = make_buft_list(wparams);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place VAD weights (see the "
+                           "cpu-legacy note in the ASR loader error above / issue #405).\n",
+                           __func__);
+        return nullptr;
+    }
 
     auto create_tensor = [&](vad_tensor type, ggml_tensor* meta) -> ggml_tensor* {
         ggml_op op = VAD_TENSOR_OPS.at(type);
@@ -5527,7 +5671,8 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
     return vctx;
 }
 
-bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* samples, int n_samples) {
+static bool whisper_vad_detect_speech_impl(struct whisper_vad_context* vctx, const float* samples, int n_samples,
+                                           bool reset) {
     int n_chunks = n_samples / vctx->n_window;
     if (n_samples % vctx->n_window != 0) {
         n_chunks += 1; // Add one more chunk for remaining samples.
@@ -5536,18 +5681,24 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     CRISPASR_LOG_INFO("%s: detecting speech in %d samples\n", __func__, n_samples);
     CRISPASR_LOG_INFO("%s: n_chunks: %d\n", __func__, n_chunks);
 
-    // Reset LSTM hidden/cell states
-    ggml_backend_buffer_clear(vctx->buffer, 0);
+    // Reset LSTM hidden/cell states (a continuation keeps them: the stream
+    // VAD scores each new frame once, in order).
+    if (reset)
+        ggml_backend_buffer_clear(vctx->buffer, 0);
 
     vctx->probs.resize(n_chunks);
     CRISPASR_LOG_INFO("%s: props size: %u\n", __func__, n_chunks);
 
     // Use pre-allocated window buffer to avoid per-call heap allocation
     // that fragments memory across repeated server requests (#132).
-    if ((int)vctx->window_buf.size() != vctx->n_window) {
-        vctx->window_buf.resize(vctx->n_window, 0.0f);
+    const int carry = vctx->source_context ? vctx->n_context : 0;
+    if ((int)vctx->window_buf.size() != vctx->n_window + carry) {
+        vctx->window_buf.resize(vctx->n_window + carry, 0.0f);
     }
     auto& window = vctx->window_buf;
+    // The released wrapper resets waveform context along with LSTM state.
+    if (reset)
+        std::fill(window.begin(), window.begin() + carry, 0.0f);
 
     auto& sched = vctx->sched.sched;
 
@@ -5578,7 +5729,7 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     // ggml_graph_compute directly per chunk.  This bypasses the scheduler
     // overhead and all threadpool creation entirely.
 
-    struct ggml_cplan cplan = ggml_graph_plan(gf, /*n_threads=*/1, vctx->threadpool);
+    struct ggml_cplan cplan = core_cpu_backend::plan(gf, /*n_threads=*/1, vctx->threadpool);
 
     // Persistent work buffer — reused across calls via vctx member.
     if (vctx->work_buf.size() < cplan.work_size) {
@@ -5597,24 +5748,26 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
         if (chunk_len < vctx->n_window) {
             CRISPASR_LOG_INFO("%s: chunk_len: %d < n_window: %d\n", __func__, chunk_len, vctx->n_window);
             // Zero-pad the last partial chunk directly into window.
-            std::copy(samples + idx_start, samples + idx_end, window.begin());
-            std::fill(window.begin() + chunk_len, window.end(), 0.0f);
+            std::copy(samples + idx_start, samples + idx_end, window.begin() + carry);
+            std::fill(window.begin() + carry + chunk_len, window.end(), 0.0f);
         } else {
             // Copy current frame samples to the window.
-            std::copy(samples + idx_start, samples + idx_start + vctx->n_window, window.begin());
+            std::copy(samples + idx_start, samples + idx_start + vctx->n_window, window.begin() + carry);
         }
 
         // Set the frame tensor data with the samples.
         ggml_backend_tensor_set(frame, window.data(), 0, ggml_nelements(frame) * sizeof(float));
 
         // Direct graph compute — no scheduler, no threadpool churn.
-        if (ggml_graph_compute(gf, &cplan) != GGML_STATUS_SUCCESS) {
+        if (core_cpu_backend::compute_planned(gf, &cplan, 1) != GGML_STATUS_SUCCESS) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD graph\n", __func__);
             break;
         }
 
         // Get the probability for this chunk.
         ggml_backend_tensor_get(prob, &vctx->probs[i], 0, sizeof(float));
+        if (carry)
+            std::copy(window.end() - carry, window.end(), window.begin());
 
         //CRISPASR_LOG_DEBUG("chunk %d: p = %7.3f\n", i, probs[i]);
     }
@@ -5626,6 +5779,18 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     ggml_backend_sched_reset(sched);
 
     return true;
+}
+
+bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* samples, int n_samples) {
+    return whisper_vad_detect_speech_impl(vctx, samples, n_samples, /*reset=*/true);
+}
+
+bool whisper_vad_detect_speech_continue(struct whisper_vad_context* vctx, const float* samples, int n_samples) {
+    return whisper_vad_detect_speech_impl(vctx, samples, n_samples, /*reset=*/false);
+}
+
+void whisper_vad_set_probs(struct whisper_vad_context* vctx, const float* probs, int n_probs) {
+    vctx->probs.assign(probs, probs + std::max(0, n_probs));
 }
 
 int whisper_vad_segments_n_segments(struct whisper_vad_segments* segments) {
@@ -5911,7 +6076,7 @@ void whisper_vad_free(whisper_vad_context* ctx) {
         }
 
         if (ctx->threadpool) {
-            ggml_threadpool_free(ctx->threadpool);
+            core_cpu_backend::threadpool_free(ctx->threadpool);
         }
 
         delete[] ctx->model.hparams.encoder_in_channels;
@@ -6303,6 +6468,20 @@ static void whisper_suppress_invalid_grammar(whisper_context& ctx, const whisper
     //if (!allow_eot) {
     //    logits[eot] -= params.grammar_penalty;
     //}
+    // Opt-in (grammar_strict): the check above, enabled. End-of-text is only
+    // allowed once some parse of the grammar has been completed.
+    if (params.grammar_strict) {
+        bool allow_eot = false;
+        for (const auto& stack : grammar.stacks) {
+            if (stack.empty()) {
+                allow_eot = true;
+                break;
+            }
+        }
+        if (!allow_eot) {
+            logits[eot] -= params.grammar_penalty;
+        }
+    }
     //fprintf(stderr, "Allowed: (%zu tokens)\n", size - rejects.size());
 }
 
@@ -6369,6 +6548,268 @@ struct whisper_context* whisper_init_from_file_with_params_by_ref(const char* pa
 struct whisper_context* whisper_init_from_file_with_params_no_state_by_ref(const char* path_model,
                                                                            struct whisper_context_params* params) {
     return whisper_init_from_file_with_params_no_state(path_model, *params);
+}
+
+int whisper_score_texts(struct whisper_context* ctx, const float* samples, int n_samples, const char* language,
+                        const char* initial_prompt, const char** texts, int n_texts, float* out_logprobs,
+                        int* out_n_tokens, int n_threads) {
+    if (!ctx || !samples || n_samples <= 0 || !texts || n_texts <= 0 || !out_logprobs) {
+        return -1;
+    }
+    // CRISPASR_WHISPER_SCORE_PROFILE=1 prints where the time goes.
+    const bool prof = getenv("CRISPASR_WHISPER_SCORE_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t_start = now();
+    whisper_state* state = whisper_init_state(ctx);
+    const auto t_init = now();
+    if (!state) {
+        return -2;
+    }
+    struct state_guard {
+        whisper_state* s;
+        ~state_guard() { whisper_free_state(s); }
+    } guard{state};
+
+    if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, n_threads) != 0) {
+        return -3;
+    }
+    const auto t_mel = now();
+    if (whisper_encode_with_state(ctx, state, 0, n_threads) != 0) {
+        return -4;
+    }
+    const auto t_enc = now();
+
+    const int n_vocab = whisper_n_vocab(ctx);
+    const int n_ctx = whisper_n_text_ctx(ctx);
+
+    // The prompt whisper_full uses for a plain transcription without
+    // timestamps, optionally preceded by previous text (initial_prompt, as in
+    // whisper_full_params.initial_prompt) to prime the vocabulary.
+    std::vector<whisper_token> prompt;
+    if (initial_prompt && initial_prompt[0]) {
+        std::vector<whisper_token> prev(n_ctx);
+        const std::string text = std::string(" ") + initial_prompt;
+        const int n_prev = whisper_tokenize(ctx, text.c_str(), prev.data(), (int)prev.size());
+        if (n_prev > 0) {
+            prompt.push_back(whisper_token_prev(ctx));
+            // Keep the most recent tokens, as whisper_full does (n_text_ctx / 2).
+            const int keep = std::min(n_prev, n_ctx / 2 - 1);
+            prompt.insert(prompt.end(), prev.begin() + (n_prev - keep), prev.begin() + n_prev);
+        }
+    }
+    prompt.push_back(whisper_token_sot(ctx));
+    if (whisper_is_multilingual(ctx)) {
+        const int lang_id = whisper_lang_id(language && language[0] ? language : "en");
+        if (lang_id < 0) {
+            return -5;
+        }
+        prompt.push_back(whisper_token_lang(ctx, lang_id));
+        prompt.push_back(whisper_token_transcribe(ctx));
+    }
+    prompt.push_back(whisper_token_not(ctx));
+    const int n_prompt = (int)prompt.size();
+    const whisper_token eot = whisper_token_eot(ctx);
+
+    auto log_softmax_at = [n_vocab](const float* row, whisper_token target) {
+        float mx = row[0];
+        for (int v = 1; v < n_vocab; ++v) {
+            mx = std::max(mx, row[v]);
+        }
+        double sum = 0.0;
+        for (int v = 0; v < n_vocab; ++v) {
+            sum += std::exp((double)(row[v] - mx));
+        }
+        return (double)(row[target] - mx) - std::log(sum);
+    };
+
+    // Decode the shared prompt once; its cache is kept and every candidate
+    // continues from it.
+    whisper_batch_prep_legacy(state->batch, prompt.data(), n_prompt, 0, 0);
+    whisper_kv_cache_seq_rm(state->kv_self, 0, 0, -1);
+    if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, false, nullptr, nullptr)) {
+        return -6;
+    }
+    const auto t_prompt = now();
+    int n_steps = 0;
+    double t_dec = 0.0, t_sm = 0.0;
+    const std::vector<float> prompt_logits(state->logits.begin() + (size_t)(n_prompt - 1) * n_vocab,
+                                           state->logits.begin() + (size_t)n_prompt * n_vocab);
+
+    // Tokenize every candidate, then visit them in token order so that
+    // neighbours share prefixes ("knight", "knight to ..."): the cache and
+    // the per-position log-probabilities of the shared part are kept and
+    // only the rest is decoded. Tokens are fed one at a time, like
+    // whisper_full's own decoding, so the decoder graph keeps its shape
+    // instead of being re-planned for every candidate length.
+    std::vector<std::vector<whisper_token>> seqs(n_texts);
+    std::vector<whisper_token> buf(n_ctx);
+    for (int t = 0; t < n_texts; ++t) {
+        out_logprobs[t] = -INFINITY;
+        if (out_n_tokens) {
+            out_n_tokens[t] = 0;
+        }
+        const std::string text = std::string(" ") + (texts[t] ? texts[t] : ""); // leading space, as Whisper emits
+        const int n = whisper_tokenize(ctx, text.c_str(), buf.data(), (int)buf.size());
+        if (n > 0 && n_prompt + n < n_ctx) {
+            seqs[t].assign(buf.begin(), buf.begin() + n);
+        }
+    }
+    std::vector<int> order(n_texts);
+    for (int t = 0; t < n_texts; ++t) {
+        order[t] = t;
+    }
+    std::sort(order.begin(), order.end(), [&](int x, int y) { return seqs[x] < seqs[y]; });
+
+    // Batched path (default; CRISPASR_WHISPER_SCORE_SEQUENTIAL=1 restores the
+    // one-token-per-call path below): the candidates' tokens form a prefix
+    // tree, and every node of it is decoded in ONE batch. Tree attention comes
+    // from sequence ids: candidate t is sequence t + 1, a node's cell carries
+    // every candidate that passes through it, and a token attends with one of
+    // its own candidates - so it sees exactly the prompt and its ancestors (a
+    // cell off its path shares no candidate with it). A/B on 30 Piper/Kokoro
+    // utterances, whisper tiny: same best candidate 30/30, 1.8x faster overall;
+    // log-probabilities differ by batched-matmul rounding (a single phrase with
+    // no tree already moves 0.03-0.09).
+    const char* sequential_env = getenv("CRISPASR_WHISPER_SCORE_SEQUENTIAL");
+    if (!(sequential_env && sequential_env[0] == '1')) {
+        struct tree_node {
+            whisper_token tok;
+            int depth;
+        };
+        std::vector<tree_node> nodes;
+        std::map<std::pair<int, whisper_token>, int> child_of;
+        std::vector<std::vector<int>> node_path(n_texts);
+        for (int t = 0; t < n_texts; ++t) {
+            int parent = -1;
+            for (size_t i = 0; i < seqs[t].size(); ++i) {
+                const auto key = std::make_pair(parent, seqs[t][i]);
+                auto it = child_of.find(key);
+                if (it == child_of.end()) {
+                    it = child_of.emplace(key, (int)nodes.size()).first;
+                    nodes.push_back({seqs[t][i], (int)i});
+                }
+                node_path[t].push_back(it->second);
+                parent = it->second;
+            }
+        }
+        const int n_nodes = (int)nodes.size();
+        if (n_nodes > 0 && n_nodes <= n_ctx && n_prompt + n_nodes <= (int)state->kv_self.size) {
+            std::vector<std::vector<whisper_seq_id>> members(n_nodes);
+            for (int t = 0; t < n_texts; ++t) {
+                for (int id : node_path[t]) {
+                    members[id].push_back(t + 1);
+                }
+                whisper_kv_cache_seq_cp(state->kv_self, 0, t + 1, -1, -1); // the prompt, for every candidate
+            }
+            whisper_batch tree = whisper_batch_init(n_nodes, n_texts);
+            tree.n_tokens = n_nodes;
+            for (int i = 0; i < n_nodes; ++i) { // parents precede children: creation order
+                tree.token[i] = nodes[i].tok;
+                tree.pos[i] = n_prompt + nodes[i].depth;
+                tree.n_seq_id[i] = (int32_t)members[i].size();
+                std::copy(members[i].begin(), members[i].end(), tree.seq_id[i]);
+                tree.logits[i] = 1;
+            }
+            const auto t0 = now();
+            const bool ok = whisper_decode_internal(*ctx, *state, tree, n_threads, false, nullptr, nullptr);
+            whisper_batch_free(tree);
+            for (int t = 0; t < n_texts; ++t) {
+                whisper_kv_cache_seq_rm(state->kv_self, t + 1, -1, -1);
+            }
+            if (!ok) {
+                return -6;
+            }
+            t_dec += ms(t0, now());
+            n_steps = 1;
+            const auto t1 = now();
+            // log-softmax(x)[v] = x[v] - logsumexp(x): one logsumexp per node.
+            std::vector<double> lse(n_nodes);
+            for (int i = 0; i < n_nodes; ++i) {
+                const float* row = state->logits.data() + (size_t)i * n_vocab;
+                const float mx = *std::max_element(row, row + n_vocab);
+                double sum = 0.0;
+                for (int v = 0; v < n_vocab; ++v) {
+                    sum += std::exp((double)(row[v] - mx));
+                }
+                lse[i] = mx + std::log(sum);
+            }
+            for (int t = 0; t < n_texts; ++t) {
+                const auto& seq = seqs[t];
+                if (seq.empty()) {
+                    continue;
+                }
+                double logprob = log_softmax_at(prompt_logits.data(), seq[0]);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    const int id = node_path[t][i];
+                    const whisper_token target = i + 1 < seq.size() ? seq[i + 1] : eot;
+                    logprob += state->logits[(size_t)id * n_vocab + target] - lse[id];
+                }
+                out_logprobs[t] = (float)logprob;
+                if (out_n_tokens) {
+                    out_n_tokens[t] = (int)seq.size() + 1;
+                }
+            }
+            t_sm += ms(t1, now());
+            if (prof) {
+                fprintf(stderr,
+                        "score_texts (batched): %d texts, %d tree nodes, encode %.0f ms, prompt(%d) %.0f ms, "
+                        "decode %.0f ms, softmax %.0f ms, total %.0f ms\n",
+                        n_texts, n_nodes, ms(t_mel, t_enc), n_prompt, ms(t_enc, t_prompt), t_dec, t_sm,
+                        ms(t_start, now()));
+            }
+            return 0;
+        }
+        // Too many nodes for one batch or the cache: score one token at a time.
+    }
+
+    // path[i] = token i of the candidate whose tokens are in the cache;
+    // lp_after[i] = log-probabilities (full row) after path[0..i].
+    std::vector<whisper_token> path;
+    std::vector<std::vector<float>> logits_after;
+    for (int t : order) {
+        const auto& seq = seqs[t];
+        if (seq.empty()) {
+            continue;
+        }
+        size_t common = 0;
+        while (common < path.size() && common < seq.size() && path[common] == seq[common]) {
+            ++common;
+        }
+        path.resize(common);
+        logits_after.resize(common);
+        whisper_kv_cache_seq_rm(state->kv_self, 0, n_prompt + (int)common, -1);
+        for (size_t i = common; i < seq.size(); ++i) {
+            whisper_batch_prep_legacy(state->batch, &seq[i], 1, n_prompt + (int)i, 0);
+            const auto t0 = now();
+            if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, false, nullptr, nullptr)) {
+                return -6;
+            }
+            t_dec += ms(t0, now());
+            ++n_steps;
+            path.push_back(seq[i]);
+            logits_after.emplace_back(state->logits.begin(), state->logits.begin() + n_vocab);
+        }
+        const auto t1 = now();
+        double logprob = log_softmax_at(prompt_logits.data(), seq[0]);
+        for (size_t i = 0; i < seq.size(); ++i) {
+            const whisper_token target = i + 1 < seq.size() ? seq[i + 1] : eot;
+            logprob += log_softmax_at(logits_after[i].data(), target);
+        }
+        t_sm += ms(t1, now());
+        out_logprobs[t] = (float)logprob;
+        if (out_n_tokens) {
+            out_n_tokens[t] = (int)seq.size() + 1; // text tokens and end-of-text
+        }
+    }
+    if (prof) {
+        fprintf(stderr,
+                "score_texts: %d texts, init %.0f ms, mel %.0f ms, encode %.0f ms, prompt(%d) %.0f ms, "
+                "%d decode steps %.0f ms (%.1f ms/step), softmax %.0f ms, total %.0f ms\n",
+                n_texts, ms(t_start, t_init), ms(t_init, t_mel), ms(t_mel, t_enc), n_prompt, ms(t_enc, t_prompt),
+                n_steps, t_dec, n_steps ? t_dec / n_steps : 0.0, t_sm, ms(t_start, now()));
+    }
+    return 0;
 }
 
 int whisper_full_by_ref(struct whisper_context* ctx, struct whisper_full_params* params, const float* samples,
@@ -6466,6 +6907,8 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /* vad_params =*/whisper_vad_default_params(),
 
         /*.alt_n =*/0,
+
+        /*.grammar_strict =*/false,
     };
 
     switch (strategy) {
@@ -6613,6 +7056,189 @@ static void whisper_compute_probs(const std::vector<float>& logits, const int n_
     }
 }
 
+// Tiron (#295) constrained-decoding grammar options.
+struct whisper_tiron_opts {
+    bool allow_initial_nospeech = true; // <|nospeech|> legal only as the first generated token
+    int max_speakers = 0;               // 0 = use the full <|speakerN|> pool
+    int no_repeat_ngram_size = 15;      // block any next token recreating a present n-gram (HF parity)
+    int max_init_ts_index = 1500;       // cap on the row's very first timestamp (<=30 s)
+};
+
+// Port of tiron/constraints.py TironConstraintLogitsProcessor._apply_row
+// (speaker_blocks mode; the public 30 s Tiron has no <|window|> token). Masks
+// `logits` in place given the GENERATED token suffix `out_ids` (== whisper's
+// decoder.sequence.tokens ids — the [sot,lang,transcribe] prompt is not part of
+// it, matching the harness's input_ids[prompt_len:]). Plain greedy loses ~5
+// cpWER vs this grammar, so this is what the port must enforce.
+static void whisper_tiron_apply_grammar(const whisper_vocab& vocab, const std::vector<whisper_token>& out_ids,
+                                        std::vector<float>& logits, int n_logits, const whisper_tiron_opts& opt) {
+    const int ts_begin = vocab.token_beg;
+    const int ts_end = (int)vocab.timestamp_end() - 1; // inclusive last timestamp (TS_END_ID)
+    const int eos = vocab.token_eot;
+    const int spk0 = vocab.token_speaker_beg;
+    int n_spk = vocab.n_speakers;
+    if (opt.max_speakers > 0) {
+        n_spk = std::max(1, std::min(opt.max_speakers, n_spk));
+    }
+    const int speaker1 = spk0;
+    const float NEG = -INFINITY;
+
+    auto mask = [&](int lo, int hi) {
+        lo = std::max(0, lo);
+        hi = std::min(n_logits, hi);
+        for (int i = lo; i < hi; ++i) {
+            logits[i] = NEG;
+        }
+    };
+    auto is_ts = [&](whisper_token t) { return t >= ts_begin && t <= ts_end; };
+    auto is_spk = [&](whisper_token t) { return t >= spk0 && t < spk0 + vocab.n_speakers; };
+
+    // Always suppress <|notimestamps|>; <|nospeech|> suppressed except at step 0.
+    logits[vocab.token_not] = NEG;
+    const float nospeech_save = logits[vocab.token_nosp];
+    logits[vocab.token_nosp] = NEG;
+    const float eos_save = logits[eos];
+
+    const int n = (int)out_ids.size();
+
+    // step 0: force <|speaker1|> (+ <|nospeech|> when opted in).
+    if (n == 0) {
+        const float s1 = logits[speaker1];
+        mask(0, n_logits);
+        logits[speaker1] = s1;
+        if (opt.allow_initial_nospeech) {
+            logits[vocab.token_nosp] = nospeech_save;
+        }
+        return;
+    }
+
+    // A <|nospeech|> row is trained as <|nospeech|><|endoftext|>.
+    if (out_ids.back() == vocab.token_nosp) {
+        mask(0, n_logits);
+        logits[eos] = eos_save;
+        return;
+    }
+
+    const whisper_token last = out_ids.back();
+    const bool last_is_ts = is_ts(last);
+    const bool last_is_spk = is_spk(last);
+    const bool penult_is_ts = n >= 2 && is_ts(out_ids[n - 2]);
+    const bool penult_is_spk = n >= 2 && is_spk(out_ids[n - 2]);
+    bool allow_eos = true;
+
+    if (last_is_spk) {
+        // speaker tag -> forced opening timestamp (first ts capped at max_init).
+        bool first_ts = true;
+        for (whisper_token t : out_ids) {
+            if (is_ts(t)) {
+                first_ts = false;
+                break;
+            }
+        }
+        mask(0, ts_begin);
+        mask(ts_end + 1, n_logits);
+        if (first_ts) {
+            mask(ts_begin + opt.max_init_ts_index + 1, ts_end + 1);
+        }
+        allow_eos = false;
+    } else if (last_is_ts) {
+        if (penult_is_spk || penult_is_ts) {
+            // opening timestamp -> forced text (control tokens suppressed).
+            mask(eos, n_logits);
+            allow_eos = false;
+        } else {
+            // closing timestamp -> next new speaker slot, another opening ts
+            // (same speaker continues), or EOS. Keep timestamps + next speaker.
+            int max_seen = -1;
+            for (whisper_token t : out_ids) {
+                if (is_spk(t)) {
+                    max_seen = std::max(max_seen, (int)(t - spk0));
+                }
+            }
+            const int next_slot = (max_seen + 1 < n_spk) ? max_seen + 1 : -1;
+            std::vector<float> ts_saves(logits.begin() + ts_begin, logits.begin() + ts_end + 1);
+            const float spk_save = (next_slot >= 0) ? logits[spk0 + next_slot] : 0.0f;
+            mask(0, n_logits);
+            std::copy(ts_saves.begin(), ts_saves.end(), logits.begin() + ts_begin);
+            if (next_slot >= 0) {
+                logits[spk0 + next_slot] = spk_save;
+            }
+            // allow_eos stays true
+        }
+    } else {
+        // inside text: continue text or close with a timestamp.
+        mask(eos, ts_begin);
+        mask(ts_end + 1, n_logits);
+        allow_eos = false;
+        // ts-mass tie-breaker (constraints.py): if aggregate timestamp logprob
+        // mass beats the top single text token, force a timestamp this step.
+        double maxl = NEG;
+        for (int i = 0; i < n_logits; ++i) {
+            if (logits[i] > maxl) {
+                maxl = logits[i];
+            }
+        }
+        double Z = 0.0;
+        for (int i = 0; i < n_logits; ++i) {
+            if (logits[i] > NEG) {
+                Z += std::exp((double)logits[i] - maxl);
+            }
+        }
+        const double logZ = maxl + std::log(Z);
+        double ts_maxl = NEG;
+        for (int i = ts_begin; i <= ts_end; ++i) {
+            if (logits[i] > ts_maxl) {
+                ts_maxl = logits[i];
+            }
+        }
+        double ts_lp = NEG;
+        if (ts_maxl > NEG) {
+            double s = 0.0;
+            for (int i = ts_begin; i <= ts_end; ++i) {
+                if (logits[i] > NEG) {
+                    s += std::exp((double)logits[i] - ts_maxl);
+                }
+            }
+            ts_lp = ts_maxl + std::log(s) - logZ;
+        }
+        double max_text_lp = NEG;
+        for (int i = 0; i < ts_begin; ++i) {
+            if (logits[i] > NEG) {
+                max_text_lp = std::max(max_text_lp, (double)logits[i] - logZ);
+            }
+        }
+        if (ts_lp > max_text_lp) {
+            mask(0, ts_begin);
+            mask(ts_end + 1, n_logits);
+        }
+    }
+
+    // no_repeat_ngram_size (mirror HF): block any next token that would recreate
+    // an n-gram already present in out_ids.
+    const int ng = opt.no_repeat_ngram_size;
+    if (ng > 1 && n >= ng) {
+        for (int i = 0; i + ng <= n; ++i) {
+            bool m = true;
+            for (int j = 0; j < ng - 1; ++j) {
+                if (out_ids[i + j] != out_ids[n - (ng - 1) + j]) {
+                    m = false;
+                    break;
+                }
+            }
+            if (m) {
+                const whisper_token b = out_ids[i + ng - 1];
+                if (b >= 0 && b < n_logits) {
+                    logits[b] = NEG;
+                }
+            }
+        }
+    }
+
+    if (allow_eos) {
+        logits[eos] = eos_save;
+    }
+}
+
 // process the logits for the selected decoder
 // - applies logit filters
 // - computes logprobs and probs
@@ -6648,89 +7274,135 @@ static void whisper_process_logits(struct whisper_context& ctx, struct whisper_s
         logprobs.resize(n_logits);
     }
 
+    // Tiron decode mode: replace Whisper's timestamp heuristics with Tiron's
+    // constrained-decoding grammar (whisper_tiron_apply_grammar, a port of
+    // tiron/constraints.py) so the <|speakerN|> / timestamp / text token stream
+    // is well-formed — plain greedy loses ~5 cpWER. Auto-on for a speaker vocab;
+    // env CRISPASR_WHISPER_TIRON=0 forces the stock whisper path for A/B.
+    const bool tiron = vocab.has_speakers && [] {
+        const char* e = getenv("CRISPASR_WHISPER_TIRON");
+        return !(e && e[0] == '0');
+    }();
+    // exclusive upper bound of the timestamp band for this decode
+    const int ts_end = tiron ? vocab.token_speaker_beg : n_logits;
+
     // apply logit filters here
     // ref: https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L480-L493
     {
-        // suppress blank
-        // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L388-L390
-        if (params.suppress_blank) {
-            if (is_initial) {
-                logits[vocab.token_eot] = -INFINITY;
-                logits[vocab.token_to_id.at(" ")] = -INFINITY;
+        if (tiron) {
+            // Tiron: enforce the constrained-decoding grammar (constraints.py),
+            // NOT the whisper suppress/heuristic path. The grammar masks every
+            // token not legal in the current state; a user callback / regex may
+            // still narrow further on top.
+            std::vector<whisper_token> t_out_ids;
+            t_out_ids.reserve(tokens_cur.size());
+            for (const auto& t : tokens_cur) {
+                t_out_ids.push_back(t.id);
             }
-        }
-
-        // suppress <|notimestamps|> token
-        // ref: https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L410-L412
-        logits[vocab.token_not] = -INFINITY;
-        if (params.no_timestamps) {
-            for (int i = vocab.token_beg; i < n_logits; ++i) {
-                logits[i] = -INFINITY;
+            whisper_tiron_opts topt;
+            if (const char* e = getenv("CRISPASR_WHISPER_TIRON_NOSPEECH")) {
+                topt.allow_initial_nospeech = !(e[0] == '0');
             }
-        }
-
-        // suppress sot and nosp tokens
-        logits[vocab.token_sot] = -INFINITY;
-        logits[vocab.token_nosp] = -INFINITY;
-
-        // [TDRZ] when tinydiarize is disabled, suppress solm token
-        if (params.tdrz_enable == false) {
-            logits[vocab.token_solm] = -INFINITY;
-        }
-
-        // suppress task tokens
-        logits[vocab.token_translate] = -INFINITY;
-        logits[vocab.token_transcribe] = -INFINITY;
-        logits[vocab.token_prev] = -INFINITY;
-
-        // suppress lang tokens
-        for (size_t i = 0; i < g_lang.size(); ++i) {
-            logits[whisper_token_lang(&ctx, i)] = -INFINITY;
-        }
-
-        // suppress prev token
-        logits[vocab.token_prev] = -INFINITY;
-
-        if (params.logits_filter_callback) {
-            params.logits_filter_callback(&ctx, &state, tokens_cur.data(), tokens_cur.size(), logits.data(),
-                                          params.logits_filter_callback_user_data);
-        }
-
-        // suppress any tokens matching a regular expression
-        // ref: https://github.com/openai/whisper/discussions/1041
-        if (params.suppress_regex != nullptr) {
-            std::regex re(params.suppress_regex);
-            for (std::pair<whisper_vocab::token, whisper_vocab::id> token_id : vocab.token_to_id) {
-                if (std::regex_match(token_id.first, re)) {
-                    logits[token_id.second] = -INFINITY;
+            if (const char* e = getenv("CRISPASR_WHISPER_TIRON_MAX_SPEAKERS")) {
+                topt.max_speakers = atoi(e);
+            }
+            whisper_tiron_apply_grammar(vocab, t_out_ids, logits, n_logits, topt);
+            if (params.logits_filter_callback) {
+                params.logits_filter_callback(&ctx, &state, tokens_cur.data(), tokens_cur.size(), logits.data(),
+                                              params.logits_filter_callback_user_data);
+            }
+            if (params.suppress_regex != nullptr) {
+                std::regex re(params.suppress_regex);
+                for (std::pair<whisper_vocab::token, whisper_vocab::id> token_id : vocab.token_to_id) {
+                    if (std::regex_match(token_id.first, re)) {
+                        logits[token_id.second] = -INFINITY;
+                    }
                 }
             }
-        }
+        } else {
+            // suppress blank
+            // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L388-L390
+            if (params.suppress_blank) {
+                if (is_initial) {
+                    logits[vocab.token_eot] = -INFINITY;
+                    logits[vocab.token_to_id.at(" ")] = -INFINITY;
+                }
+            }
 
-        // suppress non-speech tokens
-        // ref: https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/tokenizer.py#L224-L253
-        if (params.suppress_nst) {
-            for (const std::string& token : non_speech_tokens) {
-                const std::string suppress_tokens[] = {token, " " + token};
-                for (const std::string& suppress_token : suppress_tokens) {
-                    if (vocab.token_to_id.find(suppress_token) != vocab.token_to_id.end()) {
-                        logits[vocab.token_to_id.at(suppress_token)] = -INFINITY;
+            // suppress <|notimestamps|> token
+            // ref: https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L410-L412
+            logits[vocab.token_not] = -INFINITY;
+            if (params.no_timestamps) {
+                // in tiron mode this stops at the speaker tokens so they survive
+                for (int i = vocab.token_beg; i < ts_end; ++i) {
+                    logits[i] = -INFINITY;
+                }
+            }
+
+            // suppress sot and nosp tokens
+            logits[vocab.token_sot] = -INFINITY;
+            logits[vocab.token_nosp] = -INFINITY;
+
+            // [TDRZ] when tinydiarize is disabled, suppress solm token
+            if (params.tdrz_enable == false) {
+                logits[vocab.token_solm] = -INFINITY;
+            }
+
+            // suppress task tokens
+            logits[vocab.token_translate] = -INFINITY;
+            logits[vocab.token_transcribe] = -INFINITY;
+            logits[vocab.token_prev] = -INFINITY;
+
+            // suppress lang tokens
+            for (size_t i = 0; i < g_lang.size(); ++i) {
+                logits[whisper_token_lang(&ctx, i)] = -INFINITY;
+            }
+
+            // suppress prev token
+            logits[vocab.token_prev] = -INFINITY;
+
+            if (params.logits_filter_callback) {
+                params.logits_filter_callback(&ctx, &state, tokens_cur.data(), tokens_cur.size(), logits.data(),
+                                              params.logits_filter_callback_user_data);
+            }
+
+            // suppress any tokens matching a regular expression
+            // ref: https://github.com/openai/whisper/discussions/1041
+            if (params.suppress_regex != nullptr) {
+                std::regex re(params.suppress_regex);
+                for (std::pair<whisper_vocab::token, whisper_vocab::id> token_id : vocab.token_to_id) {
+                    if (std::regex_match(token_id.first, re)) {
+                        logits[token_id.second] = -INFINITY;
                     }
                 }
             }
 
-            // allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
-            if (vocab.token_to_id.find(" -") != vocab.token_to_id.end()) {
-                logits[vocab.token_to_id.at(" -")] = -INFINITY;
+            // suppress non-speech tokens
+            // ref: https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/tokenizer.py#L224-L253
+            if (params.suppress_nst) {
+                for (const std::string& token : non_speech_tokens) {
+                    const std::string suppress_tokens[] = {token, " " + token};
+                    for (const std::string& suppress_token : suppress_tokens) {
+                        if (vocab.token_to_id.find(suppress_token) != vocab.token_to_id.end()) {
+                            logits[vocab.token_to_id.at(suppress_token)] = -INFINITY;
+                        }
+                    }
+                }
+
+                // allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
+                if (vocab.token_to_id.find(" -") != vocab.token_to_id.end()) {
+                    logits[vocab.token_to_id.at(" -")] = -INFINITY;
+                }
+                if (vocab.token_to_id.find(" '") != vocab.token_to_id.end()) {
+                    logits[vocab.token_to_id.at(" '")] = -INFINITY;
+                }
             }
-            if (vocab.token_to_id.find(" '") != vocab.token_to_id.end()) {
-                logits[vocab.token_to_id.at(" '")] = -INFINITY;
-            }
-        }
+        } // end !tiron whisper-suppression path
 
         // timestamps have to appear in pairs, except directly before EOT; mask logits accordingly
         // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L414-L424
-        {
+        // (skipped in tiron mode — the model interleaves lone timestamps + speaker markers)
+        if (!tiron) {
             const bool last_was_timestamp = tokens_cur.size() > 0 && tokens_cur.back().id >= vocab.token_beg;
             const bool penultimate_was_timestamp =
                 tokens_cur.size() < 2 || tokens_cur[tokens_cur.size() - 2].id >= vocab.token_beg;
@@ -6752,7 +7424,7 @@ static void whisper_process_logits(struct whisper_context& ctx, struct whisper_s
 
         // the initial timestamp cannot be larger than max_initial_ts
         // ref: https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L426-L429
-        if (is_initial && params.max_initial_ts > 0.0f) {
+        if (!tiron && is_initial && params.max_initial_ts > 0.0f) {
             const float precision = float(CRISPASR_CHUNK_SIZE) / ctx.model.hparams.n_audio_ctx;
             const int tid0 = std::round(params.max_initial_ts / precision);
 
@@ -6763,7 +7435,7 @@ static void whisper_process_logits(struct whisper_context& ctx, struct whisper_s
 
         // condition timestamp tokens to be increasing
         // ref: https://github.com/openai/whisper/pull/831#issuecomment-1385910556
-        if (decoder.has_ts) {
+        if (!tiron && decoder.has_ts) {
             const int tid0 = decoder.seek_delta / 2;
 
             for (int i = vocab.token_beg; i < vocab.token_beg + tid0; ++i) {
@@ -6797,7 +7469,7 @@ static void whisper_process_logits(struct whisper_context& ctx, struct whisper_s
 
             //CRISPASR_LOG_INFO("timestamp_logprob=%f max_text_token_logprob=%f\n", timestamp_logprob, max_text_token_logprob);
 
-            if (timestamp_logprob > max_text_token_logprob) {
+            if (!tiron && timestamp_logprob > max_text_token_logprob) {
                 for (int i = 0; i < vocab.token_beg; ++i) {
                     logits[i] = -INFINITY;
                     logprobs[i] = -INFINITY;
@@ -6952,7 +7624,7 @@ static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisp
         double sum_ts = 0.0;
         double max_ts = 0.0;
 
-        for (int i = vocab.token_beg; i < n_logits; i++) {
+        for (int i = vocab.token_beg; i < vocab.timestamp_end(); i++) {
             if (probs[i] == -INFINITY) {
                 continue;
             }
@@ -6984,7 +7656,7 @@ static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisp
         result.plog = logprobs[result.id];
     }
 
-    if (result.id >= vocab.token_beg) {
+    if (vocab.is_timestamp(result.id)) {
         result.tid = result.id;
         result.pt = result.p;
     }
@@ -7034,7 +7706,7 @@ static std::vector<whisper_token_data> whisper_sample_token_topk(whisper_context
         double sum_ts = 0.0;
         double max_ts = 0.0;
 
-        for (int i = vocab.token_beg; i < n_logits; i++) {
+        for (int i = vocab.token_beg; i < vocab.timestamp_end(); i++) {
             if (probs[i] == -INFINITY) {
                 continue;
             }
@@ -7069,7 +7741,7 @@ static std::vector<whisper_token_data> whisper_sample_token_topk(whisper_context
             0.0f,
         });
 
-        if (result[i].id >= vocab.token_beg) {
+        if (vocab.is_timestamp(result[i].id)) {
             result[i].tid = result[i].id;
             result[i].pt = result[i].p;
         }
@@ -7125,14 +7797,19 @@ static void whisper_sequence_score(const struct whisper_full_params& params, whi
     }
 }
 
-static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params,
+static void whisper_reset_vad_mapping(struct whisper_state* state) {
+    state->vad_mapping_table.clear();
+    state->vad_segments.clear();
+    state->has_vad_segments = false;
+}
+
+static bool whisper_vad(struct whisper_context* /*ctx*/, struct whisper_state* state, struct whisper_full_params params,
                         const float* samples, int n_samples, std::vector<float>& filtered_samples) {
     CRISPASR_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
     int filtered_n_samples = 0;
 
-    // Clear any existing mapping table
-    state->vad_mapping_table.clear();
-    state->has_vad_segments = false;
+    // Each prepass owns the mapping for this state's current audio only.
+    whisper_reset_vad_mapping(state);
 
     if (state->vad_context == nullptr) {
         struct whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
@@ -7156,8 +7833,8 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
 
     if (vad_segments->data.size() > 0) {
         state->has_vad_segments = true;
-        ctx->state->vad_segments.clear();
-        ctx->state->vad_segments.reserve(vad_segments->data.size());
+        state->vad_segments.clear();
+        state->vad_segments.reserve(vad_segments->data.size());
 
         // Initialize the time mapping table
         state->vad_mapping_table.clear();
@@ -7234,7 +7911,7 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
                     "%s: vad_segment_info: orig_start: %.2f, orig_end: %.2f, vad_start: %.2f, vad_end: %.2f\n",
                     __func__, segment.orig_start / 100.0, segment.orig_end / 100.0, segment.vad_start / 100.0,
                     segment.vad_end / 100.0);
-                ctx->state->vad_segments.push_back(segment);
+                state->vad_segments.push_back(segment);
 
                 // Copy this speech segment
                 memcpy(filtered_samples.data() + offset, samples + segment_start_samples,
@@ -7290,6 +7967,29 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
 
 int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params,
                             const float* samples, int n_samples) {
+    if (!ctx || !state || n_samples < 0 || params.offset_ms < 0 || params.duration_ms < 0 ||
+        (n_samples > 0 && !samples)) {
+        return -1;
+    }
+    // A state reused without VAD must not apply its previous audio's time map.
+    // VAD wrappers set params.vad and prepare the current map before this call.
+    if (!params.vad) {
+        whisper_reset_vad_mapping(state);
+    }
+    // Bound PCM before feature extraction, including sequential/direct-state
+    // decode. A seek limit alone still exposes later speech to the encoder.
+    // Zero PCM remains valid for callers decoding a precomputed mel buffer.
+    if (n_samples > 0) {
+        const int64_t offset_samples = int64_t(CRISPASR_SAMPLE_RATE) * params.offset_ms / 1000;
+        if (offset_samples >= n_samples) {
+            state->result_all.clear();
+            return 0;
+        }
+        if (params.duration_ms > 0) {
+            const int64_t end_samples = offset_samples + int64_t(CRISPASR_SAMPLE_RATE) * params.duration_ms / 1000;
+            n_samples = int(std::min<int64_t>(n_samples, end_samples));
+        }
+    }
     // Reset all schedulers so a second whisper_full() call on the same
     // context doesn't hit GGML_ASSERT(!sched->is_alloc) if a previous
     // call left a scheduler in the allocated state (e.g. early return,
@@ -7303,6 +8003,19 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
     auto& result_all = state->result_all;
 
     result_all.clear();
+
+    // Tiron (#295): onset guardrail — prepend 0.75 s of silence once (harness
+    // apply_onset_pad / config.PAD_START_SEC). A full-energy mid-word onset makes
+    // the model defer output; the benchmark config uses this pad. Segment/token
+    // times are shifted back by the pad before returning (original file timeline).
+    std::vector<float> tiron_pad_buf;
+    const int tiron_pad = ctx->vocab.has_speakers ? (int)(0.75f * CRISPASR_SAMPLE_RATE) : 0;
+    if (tiron_pad > 0 && n_samples > 0) {
+        tiron_pad_buf.resize((size_t)tiron_pad + n_samples, 0.0f);
+        std::copy(samples, samples + n_samples, tiron_pad_buf.begin() + tiron_pad);
+        samples = tiron_pad_buf.data();
+        n_samples += tiron_pad;
+    }
 
     if (n_samples > 0) {
         // compute log mel spectrogram
@@ -7342,8 +8055,9 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
     }
 
     const int seek_start = params.offset_ms / 10;
-    const int seek_end =
-        params.duration_ms == 0 ? whisper_n_len_from_state(state) : seek_start + params.duration_ms / 10;
+    const int seek_end = params.duration_ms == 0
+                             ? whisper_n_len_from_state(state)
+                             : std::min(whisper_n_len_from_state(state), seek_start + params.duration_ms / 10);
 
     // if length of spectrogram is less than 100ms (10 frames), then return
     // basically don't process anything that is less than 100ms
@@ -7354,6 +8068,30 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
         CRISPASR_LOG_WARN("%s: input is too short - %d ms < 100 ms. consider padding the input audio with silence\n",
                           __func__, (seek_end - seek_start) * 10);
         return 0;
+    }
+
+    // Tiron (#295): 50 ms-frame RMS energy + an adaptive silence floor (25th
+    // percentile), from the harness fixed_window_chunks. Used to skip a
+    // pure-silence window so the model doesn't hallucinate on the silent tail
+    // chunk of a >30 s clip (window 1 already matches the single-window reference
+    // byte-exact; the hard-cut tail window was the only spurious output).
+    std::vector<float> tiron_rms; // one RMS per 50 ms frame
+    float tiron_silence_thresh = 0.0f;
+    if (ctx->vocab.has_speakers && n_samples > 0) {
+        const int fs = CRISPASR_SAMPLE_RATE / 20; // 50 ms = 800 samples
+        const int nf = std::max(1, n_samples / fs);
+        tiron_rms.resize(nf);
+        for (int f = 0; f < nf; f++) {
+            double s = 0.0;
+            for (int k = 0; k < fs; k++) {
+                const float v = samples[(size_t)f * fs + k];
+                s += (double)v * v;
+            }
+            tiron_rms[f] = (float)std::sqrt(s / fs + 1e-12);
+        }
+        std::vector<float> sorted = tiron_rms;
+        std::sort(sorted.begin(), sorted.end());
+        tiron_silence_thresh = sorted[sorted.size() / 4];
     }
 
     // a set of temperatures to use
@@ -7524,6 +8262,30 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
             if (params.encoder_begin_callback(ctx, state, params.encoder_begin_callback_user_data) == false) {
                 CRISPASR_LOG_ERROR("%s: encoder_begin_callback returned false - aborting\n", __func__);
                 break;
+            }
+        }
+
+        // Tiron: skip a pure-silence window (no frame clearly above the noise
+        // floor) — the model otherwise hallucinates on a silent tail chunk. Frames
+        // are 50 ms; seek is in 10 ms units (÷5 to index tiron_rms).
+        if (ctx->vocab.has_speakers && !tiron_rms.empty()) {
+            const int win_end = std::min(seek + 100 * CRISPASR_CHUNK_SIZE, seek_end);
+            const int f0 = seek / 5;
+            const int f1 = std::min((int)tiron_rms.size(), win_end / 5);
+            int speech_frames = 0;
+            for (int f = f0; f < f1; f++) {
+                if (tiron_rms[f] > tiron_silence_thresh * 2.5f) {
+                    speech_frames++;
+                }
+            }
+            if (getenv("CRISPASR_WHISPER_TIRON_DEBUG")) {
+                fprintf(stderr, "[tiron] gate: seek=%d win_end=%d frames[%d,%d) speech=%d thresh=%.5f\n", seek, win_end,
+                        f0, f1, speech_frames, tiron_silence_thresh);
+            }
+            if (speech_frames < 5) { // < ~0.25 s of clear speech in the window
+                CRISPASR_LOG_DEBUG("%s: tiron: skipping silent window at seek=%d\n", __func__, seek);
+                seek += std::min(seek_end - seek, 100 * CRISPASR_CHUNK_SIZE);
+                continue;
             }
         }
 
@@ -7872,8 +8634,20 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                     {
                         const auto& token = decoder.sequence.tokens.back();
 
-                        // timestamp token - update sliding window
-                        if (token.id > whisper_token_beg(ctx)) {
+                        if (ctx->vocab.has_speakers) {
+                            // Tiron: fixed 30 s windows + per-speaker (non-monotonic)
+                            // timestamps — a later speaker block legitimately opens
+                            // EARLIER in the window than the previous one closed. So do
+                            // NOT drive seek from timestamps and do NOT fail on a
+                            // "backward" timestamp (the stock rule below kills the
+                            // window the moment speaker2 opens before speaker1 ended).
+                            // Commit every token; the model ends the window with EOT.
+                            result_len = i + 1;
+                            if (ctx->vocab.is_timestamp(token.id)) {
+                                has_ts = true;
+                            }
+                        } else if (token.id > whisper_token_beg(ctx) && ctx->vocab.is_timestamp(token.id)) {
+                            // timestamp token - update sliding window
                             const int seek_delta_new = 2 * (token.id - whisper_token_beg(ctx));
 
                             // do not allow to go back in time
@@ -7902,10 +8676,11 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
 #endif
 
                         // end of segment
-                        if (token.id == whisper_token_eot(ctx) ||                 // end of text token
-                            (params.max_tokens > 0 && i >= params.max_tokens) ||  // max tokens per segment reached
-                            (has_ts && seek + seek_delta + delta_min >= seek_end) // end of audio reached (100ms)
-                        ) {
+                        if (token.id == whisper_token_eot(ctx) ||                // end of text token
+                            (params.max_tokens > 0 && i >= params.max_tokens) || // max tokens per segment reached
+                            // end of audio reached (100ms) — NOT for tiron, whose window
+                            // ends on EOT (seek_delta isn't timestamp-driven there).
+                            (!ctx->vocab.has_speakers && has_ts && seek + seek_delta + delta_min >= seek_end)) {
                             if (result_len == 0 && !params.no_timestamps) {
                                 if (seek + seek_delta + delta_min >= seek_end) {
                                     result_len = i + 1;
@@ -8128,8 +8903,40 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
 
             const auto& tokens_cur = best_decoder.sequence.tokens;
 
+            if (ctx->vocab.has_speakers && getenv("CRISPASR_WHISPER_TIRON_DEBUG")) {
+                fprintf(stderr, "[tiron] window tokens (n=%d): ", (int)tokens_cur.size());
+                for (const auto& t : tokens_cur) {
+                    fprintf(stderr, "%d ", t.id);
+                }
+                fprintf(stderr, "\n");
+            }
+
             // [EXPERIMENTAL] Token-level timestamps with DTW
             const auto n_segments_before = state->result_all.size();
+
+            // Predicted timestamps can extend into the padded encoder window.
+            // Publish only times within the audio supplied to this window, even
+            // when token energy expansion, wrapping or DTW adjusts them later.
+            const int64_t window_end = std::min<int64_t>(seek_end, int64_t(seek) + CRISPASR_CHUNK_SIZE * 100);
+            const auto bound_time = [&](int64_t t) { return std::max<int64_t>(seek, std::min(t, window_end)); };
+            const auto bound_segments = [&](size_t first) {
+                for (size_t i = first; i < result_all.size(); ++i) {
+                    auto& segment = result_all[i];
+                    segment.t0 = bound_time(segment.t0);
+                    segment.t1 = std::max(segment.t0, bound_time(segment.t1));
+                    for (auto& token : segment.tokens) {
+                        const auto bound_token_time = [&](int64_t t) {
+                            return t < 0 ? t : std::max(segment.t0, std::min(t, segment.t1));
+                        };
+                        token.t0 = bound_token_time(token.t0);
+                        token.t1 = bound_token_time(token.t1);
+                        token.t_dtw = bound_token_time(token.t_dtw);
+                        if (token.t0 >= 0 && token.t1 >= 0) {
+                            token.t1 = std::max(token.t0, token.t1);
+                        }
+                    }
+                }
+            };
 
             const bool is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
                                        best_decoder.sequence.avg_logprobs < params.logprob_thold);
@@ -8161,7 +8968,10 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                     //        ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].p,
                     //        ctx->vocab.id_to_token[tokens_cur[i].tid].c_str(), tokens_cur[i].pt);
 
-                    if (params.print_special || tokens_cur[i].id < whisper_token_eot(ctx)) {
+                    // Tiron: keep <|speakerN|> markers inline in the transcript even
+                    // without print_special (they carry the speaker attribution).
+                    if (params.print_special || tokens_cur[i].id < whisper_token_eot(ctx) ||
+                        ctx->vocab.is_speaker(tokens_cur[i].id)) {
                         text += whisper_token_to_str(ctx, tokens_cur[i].id);
                     }
 
@@ -8170,12 +8980,14 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                         speaker_turn_next = true;
                     }
 
-                    if (tokens_cur[i].id > whisper_token_beg(ctx) && !params.single_segment) {
+                    // segment boundary on a real timestamp only (not a speaker marker)
+                    if (tokens_cur[i].id > whisper_token_beg(ctx) && ctx->vocab.is_timestamp(tokens_cur[i].id) &&
+                        !params.single_segment) {
                         const auto t1 = seek + 2 * (tokens_cur[i].tid - whisper_token_beg(ctx));
 
                         if (!text.empty()) {
-                            const auto tt0 = t0;
-                            const auto tt1 = t1;
+                            const auto tt0 = bound_time(t0);
+                            const auto tt1 = std::max(tt0, bound_time(t1));
 
                             if (params.print_realtime) {
                                 if (params.print_timestamps) {
@@ -8207,16 +9019,39 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                     n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                                 }
                             }
+                            bound_segments(result_all.size() - n_new);
                             if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
                                 params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                             }
                         }
                         text = "";
-                        while (i < (int)tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx)) {
-                            i++;
-                        }
-                        i--;
+                        // Issue #388 (backport of ggml-org/whisper.cpp#2279, fixing
+                        // whisper.cpp#2271): around a pause the model emits TWO
+                        // timestamp tokens — the end of this utterance and the start
+                        // of the next. Consuming them and then setting t0 = t1 threw
+                        // the second one away, so every segment began where the
+                        // previous one ended and the silence between utterances
+                        // vanished from the transcript / SRT.
+                        //
+                        // Look AHEAD at i + 1 instead, and take t0 from the LAST
+                        // timestamp consumed — that is the next utterance's real
+                        // start. Index-equivalent to the old loop (which advanced
+                        // past the run and backed off one), so only t0 and the
+                        // print_special echo change.
+                        //
+                        // The is_timestamp() guard is kept, deliberately diverging
+                        // from upstream: CrispASR has extra special tokens above
+                        // token_beg ([SOLM], <|speakerN|>) that must not be eaten
+                        // as timestamps.
                         t0 = t1;
+                        while (i + 1 < (int)tokens_cur.size() && tokens_cur[i + 1].id > whisper_token_beg(ctx) &&
+                               ctx->vocab.is_timestamp(tokens_cur[i + 1].id)) {
+                            i++;
+                            if (params.print_special) {
+                                text += whisper_token_to_str(ctx, tokens_cur[i].id);
+                            }
+                            t0 = seek + 2 * (tokens_cur[i].tid - whisper_token_beg(ctx));
+                        }
                         i0 = i + 1;
                         speaker_turn_next = false;
                     }
@@ -8225,8 +9060,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                 if (!text.empty()) {
                     const auto t1 = seek + seek_delta;
 
-                    const auto tt0 = t0;
-                    const auto tt1 = t1;
+                    const auto tt0 = bound_time(t0);
+                    const auto tt1 = std::max(tt0, bound_time(t1));
 
                     if (params.print_realtime) {
                         if (params.print_timestamps) {
@@ -8234,8 +9069,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                    text.c_str());
                         } else {
                             printf("%s", text.c_str());
-                            fflush(stdout);
                         }
+                        fflush(stdout); // #388: flush the timestamped form too, as whisper.cpp master does
                     }
 
                     result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next, {}});
@@ -8256,6 +9091,7 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                             n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                         }
                     }
+                    bound_segments(result_all.size() - n_new);
                     if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
                         params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                     }
@@ -8270,10 +9106,9 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                     const int n_frames = std::min(std::min(CRISPASR_CHUNK_SIZE * 100, seek_delta), seek_end - seek);
                     whisper_exp_compute_token_level_timestamps_dtw(ctx, state, params, result_all.size() - n_segments,
                                                                    n_segments, seek, n_frames, 7, params.n_threads);
+                    bound_segments(n_segments_before);
                     if (params.new_segment_callback) {
-                        for (int seg = (int)result_all.size() - n_segments; seg < n_segments; seg++) {
-                            params.new_segment_callback(ctx, state, seg, params.new_segment_callback_user_data);
-                        }
+                        params.new_segment_callback(ctx, state, n_segments, params.new_segment_callback_user_data);
                     }
                 }
             }
@@ -8281,9 +9116,18 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
             // ref: https://github.com/CrispStrobe/CrispASR/pull/2629
             const bool single_timestamp_ending = tokens_cur.size() > 1 &&
                                                  tokens_cur[tokens_cur.size() - 2].id < whisper_token_beg(ctx) &&
-                                                 tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx);
+                                                 tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx) &&
+                                                 ctx->vocab.is_timestamp(tokens_cur[tokens_cur.size() - 1].id);
             if (single_timestamp_ending) {
                 CRISPASR_LOG_DEBUG("single timestamp ending - skip entire chunk\n");
+                seek_delta = std::min(seek_end - seek, CRISPASR_CHUNK_SIZE * 100);
+            }
+
+            // Tiron (#295): fixed non-overlapping 30 s windows (the harness decodes
+            // fixed_window_chunks of CHUNK_MAX_SEC each — engine.py), NOT whisper's
+            // timestamp-driven overlapping seek. Advance by the full window so
+            // per-window local speaker indices line up with how the model is driven.
+            if (ctx->vocab.has_speakers) {
                 seek_delta = std::min(seek_end - seek, CRISPASR_CHUNK_SIZE * 100);
             }
 
@@ -8294,18 +9138,43 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
         }
     }
 
+    // Tiron: undo the onset pad on the output so the caller sees the original
+    // file timeline (harness shift_segments_to_original_timeline).
+    if (tiron_pad > 0) {
+        const int64_t pad_cs = (int64_t)tiron_pad / (CRISPASR_SAMPLE_RATE / 100); // samples -> centiseconds (75)
+        for (auto& seg : result_all) {
+            seg.t0 = std::max<int64_t>(0, seg.t0 - pad_cs);
+            seg.t1 = std::max<int64_t>(0, seg.t1 - pad_cs);
+            for (auto& tok : seg.tokens) {
+                if (tok.t0 >= 0) {
+                    tok.t0 = std::max<int64_t>(0, tok.t0 - pad_cs);
+                }
+                if (tok.t1 >= 0) {
+                    tok.t1 = std::max<int64_t>(0, tok.t1 - pad_cs);
+                }
+            }
+        }
+    }
+
     return 0;
 }
 
 int whisper_full(struct whisper_context* ctx, struct whisper_full_params params, const float* samples, int n_samples) {
+    if (!ctx || !ctx->state || n_samples < 0 || params.offset_ms < 0 || params.duration_ms < 0 ||
+        (n_samples > 0 && !samples)) {
+        return -1;
+    }
     std::vector<float> vad_samples;
     if (params.vad) {
         CRISPASR_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
         if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD\n", __func__);
+            whisper_reset_vad_mapping(ctx->state);
+            ctx->state->result_all.clear();
             return -1;
         }
         if (vad_samples.empty()) {
+            whisper_reset_vad_mapping(ctx->state);
             ctx->state->result_all.clear();
             return 0;
         }
@@ -8317,6 +9186,15 @@ int whisper_full(struct whisper_context* ctx, struct whisper_full_params params,
 
 int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_params params, const float* samples,
                           int n_samples, int n_processors) {
+    if (!ctx || !ctx->state || n_processors < 1 || n_samples < 0 || params.offset_ms < 0 || params.duration_ms < 0 ||
+        (n_samples > 0 && !samples)) {
+        return -1;
+    }
+    if (n_samples == 0) {
+        whisper_reset_vad_mapping(ctx->state);
+        ctx->state->result_all.clear();
+        return 0;
+    }
     if (n_processors == 1) {
         return whisper_full(ctx, params, samples, n_samples);
     }
@@ -8326,65 +9204,98 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
         CRISPASR_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
         if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD\n", __func__);
+            whisper_reset_vad_mapping(ctx->state);
+            ctx->state->result_all.clear();
             return -1;
         }
         if (vad_samples.empty()) {
+            whisper_reset_vad_mapping(ctx->state);
+            ctx->state->result_all.clear();
             return 0;
         }
         samples = vad_samples.data();
         n_samples = vad_samples.size();
     }
-    int ret = 0;
-
-    // prepare separate states for each thread
-    std::vector<whisper_state*> states;
-
-    const int offset_samples = (CRISPASR_SAMPLE_RATE * params.offset_ms) / 1000;
+    // Validate in sample units before narrowing. Even a 134-second offset
+    // overflows the old sample_rate * offset_ms int intermediate.
+    const int64_t offset_samples_wide = int64_t(CRISPASR_SAMPLE_RATE) * params.offset_ms / 1000;
+    if (offset_samples_wide >= n_samples) {
+        ctx->state->result_all.clear();
+        return 0;
+    }
+    // duration_ms limits the entire requested interval, not each worker.
+    // Bound PCM before splitting so encoders cannot see the unrequested tail.
+    // Offsets/duration retain the existing post-VAD (processed-audio) units.
+    if (params.duration_ms > 0) {
+        const int64_t end_samples = offset_samples_wide + int64_t(CRISPASR_SAMPLE_RATE) * params.duration_ms / 1000;
+        n_samples = int(std::min<int64_t>(n_samples, end_samples));
+        params.duration_ms = 0; // The PCM bound now owns the global limit.
+    }
+    const int offset_samples = int(offset_samples_wide);
     const int n_samples_per_processor = (n_samples - offset_samples) / n_processors;
+    if (n_samples_per_processor == 0) {
+        // Avoid empty workers. VAD has already run, so use the state decoder.
+        return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
+    }
 
-    // the calling thread will process the first chunk
-    // while the other threads will process the remaining chunks
-
-    std::vector<std::thread> workers(n_processors - 1);
-    for (int i = 0; i < n_processors - 1; ++i) {
-        // create a new state for each thread
-        states.push_back(whisper_init_state(ctx));
-
-        const int start_samples = offset_samples + (i + 1) * n_samples_per_processor;
-        const int n_samples_cur = (i == n_processors - 2) ? n_samples - start_samples : n_samples_per_processor;
-
+    int ret = 0;
+    using state_owner = std::unique_ptr<whisper_state, decltype(&whisper_free_state)>;
+    std::vector<state_owner> states;
+    std::vector<std::thread> workers;
+    std::vector<int> worker_status;
+    try {
+        worker_status.resize(n_processors - 1, 0);
+        states.reserve(n_processors - 1);
+        workers.reserve(n_processors - 1);
+        // Allocate every state before launching threads, so a null state never
+        // reaches a decoder and earlier states are freed on allocation failure.
+        for (int i = 0; i < n_processors - 1; ++i) {
+            states.emplace_back(whisper_init_state(ctx), whisper_free_state);
+            if (!states.back()) {
+                ctx->state->result_all.clear();
+                return -1;
+            }
+        }
+        for (int i = 0; i < n_processors - 1; ++i) {
+            const int start_samples = offset_samples + (i + 1) * n_samples_per_processor;
+            const int n_samples_cur = (i == n_processors - 2) ? n_samples - start_samples : n_samples_per_processor;
+            auto params_cur = params;
+            params_cur.offset_ms = 0;
+            params_cur.print_progress = false;
+            params_cur.print_realtime = false;
+            params_cur.new_segment_callback = nullptr;
+            params_cur.new_segment_callback_user_data = nullptr;
+            params_cur.progress_callback = nullptr;
+            params_cur.progress_callback_user_data = nullptr;
+            workers.emplace_back([&, i, params_cur, start_samples, n_samples_cur]() {
+                try {
+                    worker_status[i] = whisper_full_with_state(ctx, states[i].get(), params_cur,
+                                                               samples + start_samples, n_samples_cur);
+                } catch (...) {
+                    // Exceptions must not escape a std::thread entry point.
+                    worker_status[i] = -1;
+                }
+            });
+        }
         auto params_cur = params;
-
-        params_cur.offset_ms = 0;
-        params_cur.print_progress = false;
         params_cur.print_realtime = false;
-
-        params_cur.new_segment_callback = nullptr;
-        params_cur.new_segment_callback_user_data = nullptr;
-
-        params_cur.progress_callback = nullptr;
-        params_cur.progress_callback_user_data = nullptr;
-
-        workers[i] = std::thread(whisper_full_with_state, ctx, states[i], std::move(params_cur),
-                                 samples + start_samples, n_samples_cur);
+        ret = whisper_full_with_state(ctx, ctx->state, params_cur, samples, offset_samples + n_samples_per_processor);
+    } catch (...) {
+        // Includes thread creation failure: join every thread already started.
+        ret = -1;
     }
-
-    {
-        auto params_cur = params;
-
-        // We need to disable the print real-time for this one as well, otherwise it will show only for the first chunk.
-        params_cur.print_realtime = false;
-
-        // Run the first transformation using default state but only for the first chunk.
-        ret = whisper_full_with_state(ctx, ctx->state, std::move(params_cur), samples,
-                                      offset_samples + n_samples_per_processor);
+    for (auto& worker : workers) {
+        worker.join();
     }
-
-    for (int i = 0; i < n_processors - 1; ++i) {
-        workers[i].join();
+    for (int status : worker_status) {
+        if (ret == 0 && status != 0) {
+            ret = status;
+        }
     }
-
-    const int64_t offset_t = (int64_t)params.offset_ms / 10.0;
+    if (ret != 0) {
+        ctx->state->result_all.clear();
+        return ret;
+    }
 
     // combine results into result_state->result_all from all other states
     for (int i = 0; i < n_processors - 1; ++i) {
@@ -8392,8 +9303,20 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
 
         for (auto& result : results_i) {
             // correct the segment timestamp taking into account the offset
-            result.t0 += 100 * ((i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE + offset_t;
-            result.t1 += 100 * ((i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE + offset_t;
+            const int64_t shift = 100LL * (offset_samples + (i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE;
+            result.t0 += shift;
+            result.t1 += shift;
+            for (auto& token : result.tokens) {
+                if (token.t0 >= 0) {
+                    token.t0 += shift;
+                }
+                if (token.t1 >= 0) {
+                    token.t1 += shift;
+                }
+                if (token.t_dtw >= 0) {
+                    token.t_dtw += shift;
+                }
+            }
 
             // make sure that segments are not overlapping
             if (!ctx->state->result_all.empty()) {
@@ -8421,8 +9344,6 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
         ctx->state->n_decode += states[i]->n_decode;
         ctx->state->n_batchd += states[i]->n_batchd;
         ctx->state->n_prompt += states[i]->n_prompt;
-
-        whisper_free_state(states[i]);
     }
 
     // average the timings
@@ -8437,7 +9358,7 @@ int whisper_full_parallel(struct whisper_context* ctx, struct whisper_full_param
     for (int i = 0; i < n_processors - 1; ++i) {
         CRISPASR_LOG_WARN(
             "%s: split %d - %s\n", __func__, (i + 1),
-            to_timestamp(100 * ((i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE + offset_t).c_str());
+            to_timestamp(100LL * (offset_samples + (i + 1) * n_samples_per_processor) / CRISPASR_SAMPLE_RATE).c_str());
     }
     CRISPASR_LOG_WARN("%s: the transcription quality may be degraded near these boundaries\n", __func__);
 
@@ -8591,11 +9512,26 @@ whisper_token whisper_full_get_token_id(struct whisper_context* ctx, int i_segme
 
 struct whisper_token_data whisper_full_get_token_data_from_state(struct whisper_state* state, int i_segment,
                                                                  int i_token) {
-    return state->result_all[i_segment].tokens[i_token];
+    // Return original-audio times just like the segment getters. Keep stored
+    // tokens in processed time so repeated reads and parallel merge cannot
+    // apply the mapping twice; negative values remain unavailable sentinels.
+    auto token = state->result_all[i_segment].tokens[i_token];
+    if (state->has_vad_segments && !state->vad_mapping_table.empty()) {
+        if (token.t0 >= 0) {
+            token.t0 = map_processed_to_original_time(token.t0, state->vad_mapping_table);
+        }
+        if (token.t1 >= 0) {
+            token.t1 = map_processed_to_original_time(token.t1, state->vad_mapping_table);
+        }
+        if (token.t_dtw >= 0) {
+            token.t_dtw = map_processed_to_original_time(token.t_dtw, state->vad_mapping_table);
+        }
+    }
+    return token;
 }
 
 struct whisper_token_data whisper_full_get_token_data(struct whisper_context* ctx, int i_segment, int i_token) {
-    return ctx->state->result_all[i_segment].tokens[i_token];
+    return whisper_full_get_token_data_from_state(ctx->state, i_segment, i_token);
 }
 
 float whisper_full_get_token_p_from_state(struct whisper_state* state, int i_segment, int i_token) {
@@ -9212,7 +10148,7 @@ static void whisper_exp_compute_token_level_timestamps(struct whisper_context& c
                         s0 = k;
                     }
                 } else {
-                    while (state.energy[k] < thold && k < s1) {
+                    while (k < s1 && state.energy[k] < thold) {
                         k++;
                     }
                     s0 = k;

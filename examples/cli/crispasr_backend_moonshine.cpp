@@ -13,8 +13,19 @@
 class MoonshineBackend : public CrispasrBackend {
 public:
     MoonshineBackend() = default;
+    // Fine-tune variants (moonshine-de / moonshine-tiny-de) run through this
+    // same class but are NOT English: a blanket "en" made the 0face104
+    // sole-language guard reject `--backend moonshine-de -l de` outright, and
+    // made the #227 `-l auto` shortcut label German output "en". The factory
+    // passes the variant's language at construction.
+    explicit MoonshineBackend(const char* sole_lang) : sole_lang_(sole_lang) {}
 
     const char* name() const override { return "moonshine"; }
+
+    // Moonshine (Useful Sensors) base/tiny are English-only — skip external LID
+    // on -l auto (no whisper-tiny download just to "detect" a language it can't
+    // change). #227. Variant fine-tunes override via the constructor.
+    const char* sole_language() const override { return sole_lang_; }
 
     uint32_t capabilities() const override {
         // Best-of-N is implemented in transcribe() as a sequential loop over
@@ -32,6 +43,10 @@ public:
         mp.n_threads = params.n_threads;
         mp.use_gpu = params.use_gpu;
         ctx_ = moonshine_init_with_params(mp);
+        if (ctx_) {
+            const bool fine_tune = sole_lang_ && std::strcmp(sole_lang_, "en") != 0;
+            moonshine_set_pause_split_ms(ctx_, moonshine_default_pause_split_ms(params.model.c_str(), fine_tune));
+        }
         return ctx_ != nullptr;
     }
 
@@ -43,6 +58,8 @@ public:
 
         moonshine_set_temperature(ctx_, params.temperature);
         moonshine_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the 194 default.
+        moonshine_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
 
         // Best-of-N: when temperature > 0 and best_of > 1, run N seeded
         // decodes and keep the one with highest mean per-token softmax prob.
@@ -135,8 +152,13 @@ public:
 
 private:
     moonshine_context* ctx_ = nullptr;
+    const char* sole_lang_ = "en";
 };
 
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend() {
     return std::make_unique<MoonshineBackend>();
+}
+
+std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend_lang(const char* sole_lang) {
+    return std::make_unique<MoonshineBackend>(sole_lang);
 }

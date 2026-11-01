@@ -40,6 +40,18 @@ enum class CrispasrDiarizeMethod {
     Xcorr,
     VadTurns,
     Pyannote,
+    /// #324: WeSpeaker embeddings + spectral clustering (the FoxNose recipe).
+    /// Needs `foxnose_embedder_path`. Unlike the other methods this one
+    /// derives speaker TURNS from the audio and then attributes each caller
+    /// segment to the turn it overlaps most, so it can split a single ASR
+    /// segment's speaker assignment only at segment granularity.
+    FoxNose,
+    /// #466: NVIDIA Nemotron-3-Diarization (streaming Sortformer v3) - an
+    /// end-to-end model giving per-10-ms activity for up to 8 speakers in
+    /// arrival order. Needs `sortformer_model_path`. Like FoxNose it derives
+    /// turns from the audio; each caller segment gets the speaker with the most
+    /// probability mass inside it.
+    Sortformer,
 };
 
 // One ASR segment, in / out. Caller fills the centisecond range;
@@ -63,6 +75,37 @@ struct CrispasrDiarizeOptions {
     /// original audio, so the lib can convert each segment's absolute
     /// t0/t1 into a buffer-relative sample index.
     int64_t slice_t0_cs = 0;
+
+    // ── FoxNose (#324) ────────────────────────────────────────────────
+    /// GGUF path for the speaker-embedding model (WeSpeaker ResNet34-LM).
+    /// Ignored unless `method == FoxNose`; required when it is.
+    std::string foxnose_embedder_path;
+    /// Speaker-count bounds for automatic estimation.
+    int min_speakers = 1;
+    int max_speakers = 20;
+    /// > 0 pins the speaker count and skips estimation entirely.
+    int num_speakers = 0;
+
+    // ── Sortformer (#466) ─────────────────────────────────────────────
+    /// GGUF of Nemotron-3-Diarization (`sortformer` architecture). Required
+    /// when `method == Sortformer`.
+    std::string sortformer_model_path;
+    /// Speaker-activity threshold for turns (the model card / transformers use 0.5).
+    float sortformer_threshold = 0.5f;
+    /// Chunk schedule: "offline" / empty (default) or a streaming preset,
+    /// "low_latency", "very_low_latency", "ultra_low_latency" — the output of
+    /// a live session with that latency. Empty falls back to
+    /// CRISPASR_SORTFORMER_MODE, which is how C-ABI callers select it.
+    std::string sortformer_mode;
+};
+
+/// A speaker turn derived from the audio, independent of the caller's
+/// segmentation. Only FoxNose and Sortformer produce these; the others label
+/// caller segments directly and leave the vector empty.
+struct CrispasrDiarizeTurn {
+    double start_s = 0.0; ///< relative to the sample buffer, not absolute
+    double end_s = 0.0;
+    int speaker = 0;
 };
 
 /// Run the selected diarizer over `segs`, mutating their `speaker` field.
@@ -73,8 +116,13 @@ struct CrispasrDiarizeOptions {
 /// failed to load (currently only Pyannote). All other methods always
 /// succeed — they may leave `speaker = -1` when they have no information
 /// to pick a label.
+/// `out_turns`, when non-null, receives the speaker turns the method derived
+/// from the audio (FoxNose only). Callers with word timestamps can use them to
+/// split a segment that spans several speakers — labelling alone is limited to
+/// the caller's own segment granularity.
 bool crispasr_diarize_segments(const float* left, const float* right, int n_samples, bool is_stereo,
-                               std::vector<CrispasrDiarizeSegment>& segs, const CrispasrDiarizeOptions& opts);
+                               std::vector<CrispasrDiarizeSegment>& segs, const CrispasrDiarizeOptions& opts,
+                               std::vector<CrispasrDiarizeTurn>* out_turns = nullptr);
 
 /// Free the cached pyannote segmentation context (§176e). Call at shutdown
 /// or when the model is no longer needed.

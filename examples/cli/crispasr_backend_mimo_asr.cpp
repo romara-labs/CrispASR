@@ -51,6 +51,11 @@ std::string discover_audio_tokenizer(const std::string& model_path) {
     return "";
 }
 
+void configure_prompt(mimo_asr_context* ctx, const whisper_params& params) {
+    mimo_asr_set_language(ctx, params.language.c_str());
+    mimo_asr_set_ask(ctx, params.ask.c_str());
+}
+
 class MimoAsrBackend : public CrispasrBackend {
 public:
     MimoAsrBackend() = default;
@@ -58,6 +63,10 @@ public:
 
     const char* name() const override { return "mimo-asr"; }
     uint32_t capabilities() const override {
+        // #300/#308 audit: the model emits punctuated, sentence-cased text (verified
+        // on jfk: "And so, my fellow Americans, ... for you. Ask what ..."), so the
+        // CLI's automatic FireRedPunc pass must not run over it — it doubled every
+        // sentence-final stop ("for you..", "country..").
         // Verified against src/mimo_asr.cpp as of 2026-05-04:
         //   CAP_AUTO_DOWNLOAD     registry entry exists
         //   CAP_TIMESTAMPS_CTC    framework -am post-step works on segments
@@ -66,8 +75,9 @@ public:
         //   CAP_TEMPERATURE       init() below plumbs params.temperature
         //                         into cp.temperature → decode cfg
         //   CAP_DIARIZE           framework post-step on segment list
+        //   CAP_LANGUAGE_DETECT   empty audio tag lets MiMo detect language
         return CAP_AUTO_DOWNLOAD | CAP_TOKEN_CONFIDENCE | CAP_TIMESTAMPS_CTC | CAP_FLASH_ATTN | CAP_TEMPERATURE |
-               CAP_DIARIZE | CAP_BEAM_SEARCH;
+               CAP_DIARIZE | CAP_BEAM_SEARCH | CAP_PUNCTUATION_NATIVE | CAP_LANGUAGE_DETECT;
     }
 
     bool init(const whisper_params& params) override {
@@ -110,15 +120,9 @@ public:
         if (!ctx_)
             return out;
         mimo_asr_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
-        if (!params.ask.empty()) {
-            mimo_asr_set_ask(ctx_, params.ask.c_str());
-        } else if (!params.language.empty() && params.language != "auto") {
-            const std::string instr =
-                "Please transcribe this audio in " + crispasr_iso_to_english_lang(params.language) + ".";
-            mimo_asr_set_ask(ctx_, instr.c_str());
-        } else {
-            mimo_asr_set_ask(ctx_, nullptr);
-        }
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        mimo_asr_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
+        configure_prompt(ctx_, params);
         char* text = mimo_asr_transcribe(ctx_, samples, n_samples);
         if (text) {
             crispasr_segment seg;
@@ -137,15 +141,7 @@ public:
             CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
             return;
         }
-        if (!params.ask.empty()) {
-            mimo_asr_set_ask(ctx_, params.ask.c_str());
-        } else if (!params.language.empty() && params.language != "auto") {
-            const std::string instr =
-                "Please transcribe this audio in " + crispasr_iso_to_english_lang(params.language) + ".";
-            mimo_asr_set_ask(ctx_, instr.c_str());
-        } else {
-            mimo_asr_set_ask(ctx_, nullptr);
-        }
+        configure_prompt(ctx_, params);
         std::string accumulated;
         bool first_tok = true;
         auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {

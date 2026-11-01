@@ -7,14 +7,20 @@
 //   ✓ LLM forward (28L Qwen3 with Q/K-norm, standard RoPE)
 //   ✓ Masked iterative generation loop
 //   ✓ Audio tokenizer decode (HiggsAudioV2 DAC: codes → waveform)
-//   ✗ Audio tokenizer encode (reference audio → codes for voice cloning)
+//   ✓ CPU audio tokenizer encode (Metal encoder parity remains unresolved)
 //
 // Env knobs:
 //   OMNIVOICE_DEBUG=1      — verbose per-step trace
 //   OMNIVOICE_BENCH=1      — per-stage wall-clock timings
 //   OMNIVOICE_DUMP_DIR=/d  — dump intermediate tensors
+//   OMNIVOICE_CODEC_GPU=0/1 — override automatic CUDA codec placement
+//   CRISPASR_OMNIVOICE_PACKED_PROJ=1 — optional packed QKV / gate-up weights
+//   CRISPASR_OMNIVOICE_ATTN_VIEWS=1 — optional strided attention inputs
 
 #include "omnivoice.h"
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -22,6 +28,7 @@
 
 #include <cctype>
 #include "core/activation.h"
+#include "core/parallel_for.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/conv.h"
@@ -32,6 +39,13 @@
 #include "core/wav_reader.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h"
+#include "core/omnivoice_instruct.h" // closed-vocabulary voice-design validation (#13273)
+#include "core/omnivoice_lang.h"     // ISO-639-3 resolution for the <|lang_start|> tag (#13273)
+#include "core/omnivoice_prompt.h"   // style-prefix assembly, unit-testable (#13273)
+#include "core/omnivoice_audio.h"    // upstream reference/output utility pipeline (#518)
+#include "core/tts_ref_cache.h"      // shared content-addressed reference-voice cache (issue #265)
+#include "core/crispasr_env.h"
+#include "core/omnivoice_duration.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -45,13 +59,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -60,12 +78,19 @@ namespace {
 // ---------------------------------------------------------------------------
 
 bool env_bool(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return v && *v && std::strcmp(v, "0") != 0;
 }
 const char* env_str(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return (v && *v) ? v : nullptr;
+}
+// For default-ON gates: unset means `dflt`, an explicit "0" always disables.
+bool env_bool_default(const char* k, bool dflt) {
+    const char* v = crispasr_env::get(k);
+    if (!v || !*v)
+        return dflt;
+    return std::strcmp(v, "0") != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +100,7 @@ const char* env_str(const char* k) {
 static bool ov_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("OMNIVOICE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -93,6 +118,11 @@ struct ov_bench_stage {
         std::fprintf(stderr, "  omnivoice_bench: %-22s %.2f ms\n", name, ms);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Parallel-for over [0, n) in contiguous chunks (scoring hot loop)
+// ---------------------------------------------------------------------------
+
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -128,6 +158,8 @@ struct ov_hp {
 // ---------------------------------------------------------------------------
 
 struct ov_layer {
+    ggml_tensor* attn_qkv_w = nullptr; // optional same-value row concatenation
+    ggml_tensor* ffn_gate_up_w = nullptr;
     ggml_tensor* attn_norm_w = nullptr;
     ggml_tensor* attn_q_w = nullptr;
     ggml_tensor* attn_k_w = nullptr;
@@ -186,6 +218,10 @@ struct ov_higgs_dec_block {
     ggml_tensor* snake_alpha = nullptr;
     ggml_tensor* conv_t1_w = nullptr;
     ggml_tensor* conv_t1_b = nullptr;
+    // Pre-permuted [IC, K*OC] F32 ConvTranspose1d kernel for the decomposed
+    // mul_mat + col2im path (core_convt::convt1d_decomp). Null when the gate is
+    // off or the weight is missing — callers then use convt1d_crop unchanged.
+    ggml_tensor* conv_t1_w_perm = nullptr;
     ov_higgs_res_unit res[3]; // dilation 1, 3, 9
 };
 
@@ -230,15 +266,10 @@ struct ov_higgs_tokenizer {
     // Quantizer: 8 VQ layers (for OmniVoice's 8 codebooks)
     std::vector<ov_higgs_vq> quantizers;
 
-    // FASTCONV (#254): baked F32 copies of the decode conv kernels. The codec
-    // weights ship F16; the fork's ggml_conv_1d / conv_transpose_1d cast the
-    // kernel F16→F32 INSIDE every graph when activations are F32 (~40 casts per
-    // decode). Baking one F32 copy at load makes that cast a no-op — the result
-    // is bitwise-identical (same F16→F32 conversion, done once). Keyed by the
-    // original F16 tensor; only populated when codec fastconv is enabled.
-    ggml_context* ctx_f32 = nullptr;
-    ggml_backend_buffer_t buf_f32 = nullptr;
-    std::unordered_map<const ggml_tensor*, ggml_tensor*> f32_kernel;
+    // FASTCONV (#254): shared codec-conv fast path (baked F32 kernels + k=1→matmul),
+    // so the fork's per-graph F16→F32 conv-kernel cast becomes a no-op. See
+    // core_dac::fastconv_cache / docs/perf-sweep/PLAN.md item 1.
+    core_dac::fastconv_cache fc;
 
     // fc2: project from quantizer hidden_size (1024) → DAC hidden (256)
     ggml_tensor* fc2_w = nullptr;
@@ -306,7 +337,21 @@ struct ov_higgs_tokenizer {
     ggml_context* ctx_w = nullptr;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    // Separate context+buffer holding the F32 permuted ConvTranspose1d kernels
+    // for the decomposed decode path (CRISPASR_OMNIVOICE_CODEC_DECOMP).
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
+    core_dac::fastconv_cache enc_fc, enc_proj;
+    bool enc_fc_all = false;
+    std::vector<ggml_tensor*> enc_graph_norms;
+    std::unordered_map<const ggml_tensor*, std::vector<float>> enc_values, enc_norms;
+    std::vector<float> enc_posconv;
     bool loaded = false;
+    // Experimental split placement reloads this file on each backend change.
+    // Record requested policy separately from the backend's actual name: GPU
+    // initialization may fall back to CPU, and should not retry every decode.
+    std::string path;
+    bool gpu_requested = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -340,6 +385,9 @@ struct omnivoice_context {
     ov_vocab vocab;
     ov_gen_config gen;
     ov_higgs_tokenizer tokenizer;
+    ov_higgs_tokenizer semantic_encoder; // optional GPU semantic encoder; DAC stays CPU
+    bool encoder_gpu_failed = false;
+    ov_higgs_tokenizer resident_decoder; // optional split decoder; encoder stays on CPU
 
     int n_threads = 4;
     int verbosity = 1;
@@ -350,18 +398,39 @@ struct omnivoice_context {
     ggml_context* ctx_w = nullptr; // weight context
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    ggml_context* ctx_packed = nullptr;
+    ggml_backend_buffer_t buf_packed = nullptr;
+
+    // Utility defaults match the pinned upstream blueprint. Public setters
+    // avoid changing the layout of the by-value context_params ABI.
+    bool legacy_audio = false;
+    bool preprocess_prompt = true;
+    bool postprocess_output = true;
+    float pad_duration = 0.1f;
+    float fade_duration = 0.1f;
 
     // Voice cloning state
     std::vector<int32_t> ref_audio_codes; // (n_codebooks, T_ref) row-major
     int ref_T = 0;
+    float ref_rms = 0.0f;
     std::string ref_text;
 
     // Language / instruct
     std::string language;
-    std::string instruct;
+    // Validated at set time; the final string is rendered per synthesis because
+    // the EN/ZH choice depends on the text being spoken (see omnivoice_instruct.h).
+    core_omnivoice_instruct::Parsed instruct;
 
     // Speaking-rate multiplier for the target-length estimate (>1 faster/shorter).
     float speed = 1.0f;
+
+    // Exact target duration in seconds. 0 = derive the length from the text (and
+    // the reference's rate). Upstream OmniVoice takes a `duration` outright;
+    // this is that knob. Read live by generate_iterative().
+    float target_duration_s = 0.0f;
+    // CRISPASR_OMNIVOICE_TARGET_DURATION: what a setter call with 0 restores, so
+    // the per-request reset the server/CLI do does not silently discard it.
+    float env_target_duration_s = 0.0f;
 
     // Audio tokenizer path (separate GGUF)
     std::string tokenizer_path;
@@ -526,15 +595,15 @@ static bool load_model(omnivoice_context* ctx, const char* path) {
         const bool force_cpu = e && *e && *e != '0';
         ctx->backend = (ctx->use_gpu && !force_cpu) ? crispasr_init_gpu_backend() : nullptr;
         if (!ctx->backend)
-            ctx->backend = ggml_backend_cpu_init();
+            ctx->backend = core_cpu_backend::init();
     }
     if (!ctx->backend) {
         fprintf(stderr, "omnivoice: failed to init backend\n");
         gguf_free(gf);
         return false;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     if (ctx->verbosity >= 1)
         fprintf(stderr, "omnivoice: compute backend = %s\n", ggml_backend_name(ctx->backend));
 
@@ -633,17 +702,58 @@ static bool load_model(omnivoice_context* ctx, const char* path) {
 // ---------------------------------------------------------------------------
 
 static bool codec_fastconv_enabled();
-static bool codec_gpu_enabled();
-static void bake_decode_f32_kernels(ov_higgs_tokenizer& tok);
+static bool codec_decomp_enabled();
+static bool codec_gpu_enabled(const omnivoice_context* ctx);
+static bool codec_split_enabled();
+static bool codec_decode_on_gpu(const omnivoice_context* ctx);
 
-static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
-    auto& tok = ctx->tokenizer;
+// The GPU copy needs only decoder/RVQ output weights, not HuBERT, the DAC
+// encoder, or RVQ input projections. Keep serialized tensor bytes unchanged.
+static bool tok_is_decode_weight(const char* name) {
+    const std::string n(name);
+    const std::string embed_suffix = ".codebook.embed";
+    const bool embedding = n.size() >= embed_suffix.size() &&
+                           n.compare(n.size() - embed_suffix.size(), embed_suffix.size(), embed_suffix) == 0;
+    return n.rfind("acoustic_decoder.", 0) == 0 || n == "fc2.weight" || n == "fc2.bias" ||
+           (n.rfind("quantizer.quantizers.", 0) == 0 && (embedding || n.find(".project_out.") != std::string::npos));
+}
+
+static bool tok_is_semantic_weight(const char* name) {
+    const std::string n(name);
+    return n.rfind("sem.", 0) == 0 || n.rfind("encoder_semantic.", 0) == 0 || n == "fc.weight" || n == "fc.bias" ||
+           (n.rfind("quantizer.quantizers.", 0) == 0 &&
+            (tok_is_decode_weight(name) || n.find(".project_in.") != std::string::npos));
+}
+
+static bool tok_load_backend(omnivoice_context* ctx, const char* path, bool want_gpu,
+                             ov_higgs_tokenizer* destination = nullptr, bool semantic_only = false) {
+    auto& tok = destination ? *destination : ctx->tokenizer;
 
     struct gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&tok.ctx_w};
     struct gguf_context* gf = gguf_init_from_file(path, gp);
     if (!gf) {
         fprintf(stderr, "omnivoice: failed to open tokenizer %s\n", path);
         return false;
+    }
+
+    if (destination) {
+        // Duplicate only selected metadata before allocating any weight buffer.
+        // The data loop below then seeks only these tensors in the original file.
+        auto* source = tok.ctx_w;
+        ggml_init_params ip = {(size_t)(gguf_get_n_tensors(gf) + 1) * 2 * ggml_tensor_overhead(), nullptr, true};
+        tok.ctx_w = ggml_init(ip);
+        if (!tok.ctx_w) {
+            ggml_free(source);
+            gguf_free(gf);
+            return false;
+        }
+        for (auto* t = ggml_get_first_tensor(source); t; t = ggml_get_next_tensor(source, t)) {
+            if (!(semantic_only ? tok_is_semantic_weight(t->name) : tok_is_decode_weight(t->name)))
+                continue;
+            auto* selected = ggml_dup_tensor(tok.ctx_w, t);
+            ggml_set_name(selected, t->name);
+        }
+        ggml_free(source);
     }
 
     auto find = [&](const char* name) -> ggml_tensor* { return ggml_get_tensor(tok.ctx_w, name); };
@@ -809,11 +919,11 @@ static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
 
     // Verify critical weights
     bool ok = true;
-    if (!tok.fc2_w) {
+    if (!semantic_only && !tok.fc2_w) {
         fprintf(stderr, "omnivoice: tokenizer missing fc2.weight\n");
         ok = false;
     }
-    if (!tok.dec_conv1_w) {
+    if (!semantic_only && !tok.dec_conv1_w) {
         fprintf(stderr, "omnivoice: tokenizer missing acoustic_decoder.conv1.weight\n");
         ok = false;
     }
@@ -823,24 +933,36 @@ static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
             ok = false;
         }
     }
+    if (semantic_only && (!tok.fc_w || !tok.encsem_conv_w || !tok.sem_featproj_w || !tok.sem_posconv_v ||
+                          !tok.sem_posconv_g || tok.sem_blocks.size() != 12 || tok.sem_conv.size() != 7)) {
+        fprintf(stderr, "omnivoice: semantic encoder weights missing\n");
+        ok = false;
+    }
     if (!ok) {
         gguf_free(gf);
         return false;
     }
 
-    // Create backend + buffer. Codec decode is normally CPU; OMNIVOICE_CODEC_GPU=1
-    // (with a GPU main backend) puts the conv-heavy decode/encode graphs on the GPU
-    // — experimental, default OFF (see codec_gpu_enabled). A fresh GPU backend keeps
-    // the tokenizer independent of ctx->backend for clean teardown.
-    const bool codec_gpu = ctx->use_gpu && codec_gpu_enabled();
+    // Create backend + buffer on the requested placement. A fresh GPU backend
+    // keeps the tokenizer independent of ctx->backend for clean teardown.
+    const bool codec_gpu = ctx->use_gpu && want_gpu;
+    tok.gpu_requested = codec_gpu;
     tok.backend = codec_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!tok.backend)
-        tok.backend = ggml_backend_cpu_init();
-    if (ggml_backend_is_cpu(tok.backend))
-        ggml_backend_cpu_set_n_threads(tok.backend, ctx->n_threads);
-    if (ctx->verbosity >= 1)
+        tok.backend = core_cpu_backend::init();
+    if (tok.backend && core_cpu_backend::is_cpu(tok.backend))
+        core_cpu_backend::set_n_threads(tok.backend, ctx->n_threads);
+    if (tok.backend && ctx->verbosity >= 1)
         fprintf(stderr, "omnivoice: codec backend = %s\n", ggml_backend_name(tok.backend));
+    if (!tok.backend) {
+        gguf_free(gf);
+        return false;
+    }
     tok.buf_w = ggml_backend_alloc_ctx_tensors(tok.ctx_w, tok.backend);
+    if (!tok.buf_w) {
+        gguf_free(gf);
+        return false;
+    }
 
     // Load tensor data
     {
@@ -872,10 +994,44 @@ static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
     gguf_free(gf);
     tok.loaded = true;
 
-    // FASTCONV (#254): pre-bake F32 decode conv kernels so the per-graph F16→F32
-    // cast disappears. Bitwise-equivalent; env OMNIVOICE_CODEC_FASTCONV=0 skips it.
-    if (codec_fastconv_enabled())
-        bake_decode_f32_kernels(tok);
+    // DECOMP (#254): pre-permute the 5 ConvTranspose1d kernels to [IC, K*OC] F32
+    // so the decode graph can use mul_mat + col2im_1d instead of
+    // ggml_conv_transpose_1d (which materialises a pure-copy im2col at audio
+    // rate). Separate ctx+buffer; conv_t1_w_perm stays null when the gate is
+    // off, and higgs_decode then keeps the crop path.
+    if (codec_decomp_enabled()) {
+        std::vector<ggml_tensor*> srcs;
+        std::vector<ggml_tensor**> dsts;
+        for (auto& blk : tok.dec_blocks) {
+            if (!blk.conv_t1_w)
+                continue;
+            srcs.push_back(blk.conv_t1_w);
+            dsts.push_back(&blk.conv_t1_w_perm);
+        }
+        if (!srcs.empty() && !core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), (int)srcs.size(),
+                                                                        tok.backend, &tok.ctx_perm, &tok.buf_perm)) {
+            for (auto& blk : tok.dec_blocks)
+                blk.conv_t1_w_perm = nullptr;
+            fprintf(stderr, "omnivoice: ConvTranspose1d pre-permute failed; using the crop path\n");
+        }
+    }
+
+    // FASTCONV (#254): pre-bake F32 decode conv kernels (shared core_dac helper) so
+    // the per-graph F16→F32 cast disappears. env OMNIVOICE_CODEC_FASTCONV=0 skips it.
+    {
+        std::vector<ggml_tensor*> convs = {tok.dec_conv1_w, tok.dec_conv2_w};
+        for (auto& blk : tok.dec_blocks) {
+            // Decomposition already owns an F32 permutation. Bake the crop
+            // kernel only when it is actually used (including fallback).
+            if (!blk.conv_t1_w_perm)
+                convs.push_back(blk.conv_t1_w);
+            for (int r = 0; r < 3; r++) {
+                convs.push_back(blk.res[r].conv1_w);
+                convs.push_back(blk.res[r].conv2_w);
+            }
+        }
+        tok.fc.bake(tok.backend, convs, codec_fastconv_enabled());
+    }
 
     if (ctx->verbosity >= 1) {
         size_t total = ggml_backend_buffer_get_size(tok.buf_w);
@@ -883,6 +1039,90 @@ static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
                 tok.n_quantizers);
     }
     return true;
+}
+
+// Free everything the tokenizer holds for its CURRENT backend, so it can be
+// rebuilt elsewhere. The GGUF is re-read from `path`; nothing else survives.
+static void tok_release_backend(ov_higgs_tokenizer& tok) {
+    tok.fc.free();
+    tok.enc_fc.free();
+    tok.enc_fc_all = false;
+    tok.enc_proj.free();
+    tok.enc_graph_norms.clear();
+    tok.enc_values.clear();
+    tok.enc_norms.clear();
+    tok.enc_posconv.clear();
+    if (tok.buf_perm)
+        ggml_backend_buffer_free(tok.buf_perm);
+    tok.buf_perm = nullptr;
+    if (tok.ctx_perm)
+        ggml_free(tok.ctx_perm);
+    tok.ctx_perm = nullptr;
+    for (auto& blk : tok.dec_blocks)
+        blk.conv_t1_w_perm = nullptr;
+    if (tok.buf_w)
+        ggml_backend_buffer_free(tok.buf_w);
+    tok.buf_w = nullptr;
+    if (tok.backend)
+        ggml_backend_free(tok.backend);
+    tok.backend = nullptr;
+    if (tok.ctx_w)
+        ggml_free(tok.ctx_w);
+    tok.ctx_w = nullptr;
+    // Clear every borrowed tensor pointer, including encoder vectors. A failed
+    // reload must never leave pointers into the context just freed above.
+    tok.quantizers.clear();
+    tok.dec_blocks.clear();
+    tok.enc_blocks.clear();
+    tok.sem_conv.clear();
+    tok.sem_blocks.clear();
+    tok.encsem_blocks.clear();
+    tok.dec_conv1_w = tok.dec_conv1_b = tok.dec_snake_alpha = nullptr;
+    tok.dec_conv2_w = tok.dec_conv2_b = nullptr;
+    tok.fc2_w = tok.fc2_b = nullptr;
+    tok.enc_conv1_w = tok.enc_conv1_b = tok.enc_snake1_alpha = nullptr;
+    tok.enc_conv2_w = tok.enc_conv2_b = nullptr;
+    tok.fc_w = tok.fc_b = nullptr;
+    tok.sem_featproj_ln_w = tok.sem_featproj_ln_b = nullptr;
+    tok.sem_featproj_w = tok.sem_featproj_b = nullptr;
+    tok.sem_posconv_g = tok.sem_posconv_v = tok.sem_posconv_b = nullptr;
+    tok.sem_enc_ln_w = tok.sem_enc_ln_b = nullptr;
+    tok.encsem_conv_w = nullptr;
+    tok.gpu_requested = false;
+    tok.loaded = false;
+}
+
+// Move the tokenizer weights to `want_gpu` if they are not already there.
+// Used by CRISPASR_OMNIVOICE_CODEC_SPLIT: encode on the CPU (exact), decode on
+// the GPU. Costs one re-upload, only when the placement actually changes.
+static bool tok_rebind(omnivoice_context* ctx, bool want_gpu) {
+    auto& tok = ctx->tokenizer;
+    if (tok.loaded && tok.gpu_requested == want_gpu)
+        return true;
+    const std::string path = tok.path;
+    tok_release_backend(tok);
+    if (path.empty() || !tok_load_backend(ctx, path.c_str(), want_gpu)) {
+        tok_release_backend(tok);
+        fprintf(stderr, "omnivoice: failed to re-host the tokenizer on %s\n", want_gpu ? "the GPU" : "the CPU");
+        return false;
+    }
+    return true;
+}
+
+static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
+    // Repeated setters replace the old allocation; a failed load leaves an
+    // unloaded tokenizer and can be retried without leaking partial resources.
+    tok_release_backend(ctx->semantic_encoder);
+    ctx->encoder_gpu_failed = false;
+    tok_release_backend(ctx->resident_decoder);
+    tok_release_backend(ctx->tokenizer);
+    ctx->tokenizer.path = path;
+    const bool gpu =
+        ctx->use_gpu && codec_gpu_enabled(ctx) && !codec_split_enabled(); // split starts on the CPU (encoder first)
+    if (tok_load_backend(ctx, path, gpu))
+        return true;
+    tok_release_backend(ctx->tokenizer);
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -907,100 +1147,80 @@ static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
 // Gated for regression bisection, default ON. OMNIVOICE_CODEC_FASTCONV=0 = legacy.
 
 static bool codec_fastconv_enabled() {
-    const char* e = std::getenv("OMNIVOICE_CODEC_FASTCONV");
+    const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_CODEC_FASTCONV");
     return !(e && e[0] == '0');
 }
 
-// GPU codec decode (#254, experimental). The DAC decode is one big conv-heavy
-// graph (not a per-step small-matmul loop), so unlike an AR decode it is a good
-// GPU candidate — the dev-guide "codec 3× Metal" case. Every op in the decode
-// graph is Metal-supported (CONV_TRANSPOSE_1D, IM2COL, MUL_MAT, SIN/SQR/DIV,
-// CAST, GET_ROWS). Default OFF: a GPU default must be Kaggle-CUDA-verified per
-// perf-discipline before flipping. Enable with OMNIVOICE_CODEC_GPU=1 (requires
-// --use-gpu / GPU main backend). Pairs with FASTCONV (baked F32 kernels).
-static bool codec_gpu_enabled() {
-    const char* e = std::getenv("OMNIVOICE_CODEC_GPU");
+// Decomposition is an explicit experiment on every backend. Counterbalanced
+// M1 CPU measurements reduced CPU work but did not establish a consistent wall
+// latency win. Preserve the established crop default until that gate passes.
+static bool codec_decomp_enabled() {
+    const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_CODEC_DECOMP");
+    return e && *e && e[0] != '0';
+}
+
+// CUDA retains its existing GPU-codec default. Metal remains opt-in because
+// its acoustic encoder has not passed CPU/reference parity. Decode-only speed
+// measurements do not certify voice cloning or identify a faulty kernel.
+static bool codec_gpu_enabled(const omnivoice_context* ctx) {
+    const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_CODEC_GPU");
+    if (e && e[0])
+        return e[0] != '0';
+    return ctx && ctx->backend && std::strstr(ggml_backend_name(ctx->backend), "CUDA") != nullptr;
+}
+
+// Experimental CPU encode / GPU decode. Each placement change reloads the
+// entire tokenizer. Default OFF: include reload cost in end-to-end timings.
+static bool codec_split_enabled() {
+    const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_CODEC_SPLIT");
     return e && e[0] && e[0] != '0';
 }
+
+// Which placement the DECODE half should use.
+static bool codec_decode_on_gpu(const omnivoice_context* ctx) {
+    if (!ctx || !ctx->use_gpu)
+        return false;
+    if (codec_split_enabled())
+        return true;
+    return codec_gpu_enabled(ctx);
+}
+
 
 // Bake F32 copies of every decode-path conv kernel into a dedicated buffer on
 // the tokenizer backend. Only F16 kernels are baked (k-quant would need a
 // different dequant; the shipped tokenizer is F16). Idempotent.
-static void bake_decode_f32_kernels(ov_higgs_tokenizer& tok) {
-    if (tok.ctx_f32)
-        return;
-    std::vector<ggml_tensor*> srcs;
-    auto add = [&](ggml_tensor* t) {
-        if (t && t->type == GGML_TYPE_F16)
-            srcs.push_back(t);
-    };
-    add(tok.dec_conv1_w);
-    add(tok.dec_conv2_w);
-    for (auto& blk : tok.dec_blocks) {
-        add(blk.conv_t1_w);
-        for (int r = 0; r < 3; r++) {
-            add(blk.res[r].conv1_w);
-            add(blk.res[r].conv2_w);
-        }
-    }
-    if (srcs.empty())
-        return;
-
-    size_t mem = (srcs.size() + 2) * ggml_tensor_overhead();
-    ggml_init_params ip = {mem, nullptr, /*.no_alloc=*/true};
-    tok.ctx_f32 = ggml_init(ip);
-    for (auto* s : srcs) {
-        ggml_tensor* d = ggml_new_tensor(tok.ctx_f32, GGML_TYPE_F32, GGML_MAX_DIMS, s->ne);
-        tok.f32_kernel[s] = d;
-    }
-    tok.buf_f32 = ggml_backend_alloc_ctx_tensors(tok.ctx_f32, tok.backend);
-    for (auto* s : srcs) {
-        ggml_tensor* d = tok.f32_kernel[s];
-        size_t n = ggml_nelements(s);
-        std::vector<ggml_fp16_t> h(n);
-        ggml_backend_tensor_get(s, h.data(), 0, n * sizeof(ggml_fp16_t));
-        std::vector<float> f(n);
-        ggml_fp16_to_fp32_row(h.data(), f.data(), (int)n);
-        ggml_backend_tensor_set(d, f.data(), 0, n * sizeof(float));
-    }
-}
-
-// Fast Conv1d: baked-F32 kernel; a k=1 conv becomes a direct channel matmul.
-// x: (Cin, T) F32; w_f32: (K, Cin, Cout) F32; b: (Cout,) — returns (Cout, T).
-static ggml_tensor* ov_fastconv1d(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* w_f32, ggml_tensor* b, int K,
-                                  int dil = 1) {
-    const int T = (int)x->ne[1];
-    const int Cin = (int)w_f32->ne[1];
-    const int Cout = (int)w_f32->ne[2];
-    if (K == 1 && dil == 1) {
-        // Pointwise conv == matmul over channels. im2col of a 1×1 kernel is a
-        // pure copy; skip it. w_f32 (1,Cin,Cout) → (Cin,Cout); mul_mat contracts Cin.
-        ggml_tensor* w2d = ggml_reshape_2d(ctx0, w_f32, Cin, Cout);
-        ggml_tensor* y = ggml_mul_mat(ctx0, w2d, x); // (Cout, T)
-        if (b)
-            y = ggml_add(ctx0, y, b);
-        return y;
-    }
-    // K>1: same shape dance as core_dac::conv1d, but the F32 kernel makes the
-    // in-graph cast a no-op.
-    const int p = dil * (K - 1) / 2;
-    ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (T, Cin)
-    y = ggml_conv_1d(ctx0, w_f32, y, /*stride=*/1, p, dil);    // (T, Cout, 1)
-    y = ggml_reshape_2d(ctx0, y, T, Cout);
-    y = ggml_cont(ctx0, ggml_transpose(ctx0, y)); // (Cout, T)
-    if (b)
-        y = ggml_add(ctx0, y, b);
-    return y;
-}
-
 // ---------------------------------------------------------------------------
 // HiggsAudioV2 decode: codes → PCM
 // ---------------------------------------------------------------------------
 
-static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* codes, int n_codebooks, int T_frames) {
-    auto& tok = ctx->tokenizer;
+// Resident split is independently gated for A/B against the full-file rebind.
+// It trades an additional ~125 MB (F16 tokenizer plus F32 caches) for eliminating
+// placement reloads. It does not change codec math or enable GPU encoding.
+static bool codec_resident_enabled() {
+    return env_bool("CRISPASR_OMNIVOICE_CODEC_RESIDENT");
+}
+
+static bool tok_prepare_resident_decoder(omnivoice_context* ctx) {
+    auto& decoder = ctx->resident_decoder;
+    if (decoder.loaded)
+        return true;
+    if (ctx->tokenizer.path.empty())
+        return false;
+    if (tok_load_backend(ctx, ctx->tokenizer.path.c_str(), true, &decoder))
+        return true;
+    tok_release_backend(decoder);
+    return false;
+}
+
+static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* codes, int n_codebooks, int T_frames,
+                                       ov_higgs_tokenizer* decoder = nullptr) {
+    auto& tok = decoder ? *decoder : ctx->tokenizer;
     if (!tok.loaded)
         return {};
+
+    auto _dbg_t0 = std::chrono::steady_clock::now();
+    auto _dbg_now = []() { return std::chrono::steady_clock::now(); };
+    auto _dbg_ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
 
     // Graph context
     // Generous allocation — conv1d creates ~7 intermediate tensors each (transpose,
@@ -1042,12 +1262,10 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
         z_q = k == 0 ? z : ggml_add(ctx0, z_q, z);
     }
 
-    // FASTCONV gate: use baked F32 kernels + k=1-as-matmul when enabled.
-    const bool fastconv = codec_fastconv_enabled() && !tok.f32_kernel.empty();
-    auto F32 = [&](ggml_tensor* w) -> ggml_tensor* {
-        auto it = tok.f32_kernel.find(w);
-        return it != tok.f32_kernel.end() ? it->second : w;
-    };
+    // FASTCONV: route decode convs through the shared core_dac fast path. The
+    // cache (&tok.fc) selects baked-F32 kernels + k=1→matmul when enabled, and is
+    // a no-op (identical to legacy conv1d) when OMNIVOICE_CODEC_FASTCONV=0.
+    const core_dac::fastconv_cache* fc = &tok.fc;
 
     // fc2: Linear(hidden_size=1024 → dac_hidden=256)
     // fc2_w is (hidden_size, dac_hidden) in ggml convention
@@ -1058,15 +1276,14 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
 
     // DAC decoder: conv1 → 5 blocks → snake → conv2
     // Input conv: Conv1d(256, 1024, k=7, p=3)
-    if (env_bool("OMNIVOICE_DEBUG")) {
+    if (env_bool("CRISPASR_OMNIVOICE_DEBUG")) {
         fprintf(stderr, "  decode: pre-fc2 z_q ne=[%ld,%ld]\n", z_q->ne[0], z_q->ne[1]);
         fprintf(stderr, "  decode: fc2_w ne=[%ld,%ld] fc2_b ne=[%ld]\n", tok.fc2_w->ne[0], tok.fc2_w->ne[1],
                 tok.fc2_b ? tok.fc2_b->ne[0] : -1);
         fprintf(stderr, "  decode: h ne=[%ld,%ld] conv1_w ne=[%ld,%ld,%ld]\n", h->ne[0], h->ne[1],
                 tok.dec_conv1_w->ne[0], tok.dec_conv1_w->ne[1], tok.dec_conv1_w->ne[2]);
     }
-    h = fastconv ? ov_fastconv1d(ctx0, h, F32(tok.dec_conv1_w), tok.dec_conv1_b, 7)
-                 : core_dac::conv1d(ctx0, h, tok.dec_conv1_w, tok.dec_conv1_b, 7);
+    h = core_dac::conv1d(ctx0, h, tok.dec_conv1_w, tok.dec_conv1_b, 7, 1, fc);
 
     // 5 decoder blocks with strides [8, 5, 4, 2, 3]
     static const int dilations[3] = {1, 3, 9};
@@ -1077,18 +1294,21 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
         // Snake → ConvTranspose1d (baked-F32 kernel selects the direct _f32 CPU path)
         h = core_dac::snake(ctx0, h, blk.snake_alpha);
         int pad = (int)std::ceil((double)stride / 2.0);
-        h = core_convt::convt1d_crop(ctx0, h, fastconv ? F32(blk.conv_t1_w) : blk.conv_t1_w, blk.conv_t1_b, stride, pad,
-                                     pad);
+        if (blk.conv_t1_w_perm) {
+            // Decomposed upsampler: mul_mat + col2im_1d, no audio-rate im2col copy.
+            h = core_convt::convt1d_decomp(ctx0, h, blk.conv_t1_w_perm, blk.conv_t1_b, stride,
+                                           (int)blk.conv_t1_w->ne[0], pad, pad);
+        } else {
+            h = core_convt::convt1d_crop(ctx0, h, fc->get(blk.conv_t1_w), blk.conv_t1_b, stride, pad, pad);
+        }
 
         // 3 ResidualUnits (d=1, 3, 9)
         for (int r = 0; r < 3; r++) {
             auto& ru = blk.res[r];
             ggml_tensor* y = core_dac::snake(ctx0, h, ru.snake1_alpha);
-            y = fastconv ? ov_fastconv1d(ctx0, y, F32(ru.conv1_w), ru.conv1_b, 7, dilations[r])
-                         : core_dac::conv1d(ctx0, y, ru.conv1_w, ru.conv1_b, 7, dilations[r]);
+            y = core_dac::conv1d(ctx0, y, ru.conv1_w, ru.conv1_b, 7, dilations[r], fc);
             y = core_dac::snake(ctx0, y, ru.snake2_alpha);
-            y = fastconv ? ov_fastconv1d(ctx0, y, F32(ru.conv2_w), ru.conv2_b, 1) // k=1 → matmul
-                         : core_dac::conv1d(ctx0, y, ru.conv2_w, ru.conv2_b, 1);
+            y = core_dac::conv1d(ctx0, y, ru.conv2_w, ru.conv2_b, 1, 1, fc); // k=1 → matmul
             h = ggml_add(ctx0, h, y);
         }
         h = ggml_cont(ctx0, h);
@@ -1096,8 +1316,7 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
 
     // Final: Snake → Conv1d(32, 1, k=7) — no Tanh (HiggsAudio removes it)
     h = core_dac::snake(ctx0, h, tok.dec_snake_alpha);
-    h = fastconv ? ov_fastconv1d(ctx0, h, F32(tok.dec_conv2_w), tok.dec_conv2_b, 7)
-                 : core_dac::conv1d(ctx0, h, tok.dec_conv2_w, tok.dec_conv2_b, 7);
+    h = core_dac::conv1d(ctx0, h, tok.dec_conv2_w, tok.dec_conv2_b, 7, 1, fc);
 
     // Output: (1, T_pcm) → flatten
     int T_pcm = (int)h->ne[1];
@@ -1106,9 +1325,19 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
     ggml_set_output(h);
     ggml_build_forward_expand(gf, h);
 
+    if (ov_bench_enabled()) {
+        fprintf(stderr, "  omnivoice_bench: %-22s %.2f ms\n", "decode_graph_build", _dbg_ms(_dbg_t0, _dbg_now()));
+    }
+    auto _dbg_t1 = _dbg_now();
+
     // Allocate and compute
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
     ggml_gallocr_alloc_graph(ga, gf);
+
+    if (ov_bench_enabled()) {
+        fprintf(stderr, "  omnivoice_bench: %-22s %.2f ms\n", "decode_gallocr", _dbg_ms(_dbg_t1, _dbg_now()));
+    }
+    auto _dbg_t2 = _dbg_now();
 
     // Set code inputs
     for (int k = 0; k < n_codebooks; k++) {
@@ -1117,6 +1346,11 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
 
     ggml_backend_graph_compute(tok.backend, gf);
 
+    if (ov_bench_enabled()) {
+        fprintf(stderr, "  omnivoice_bench: %-22s %.2f ms\n", "decode_compute", _dbg_ms(_dbg_t2, _dbg_now()));
+    }
+    auto _dbg_t3 = _dbg_now();
+
     // Read PCM output
     ggml_tensor* pcm_out = ggml_graph_get_tensor(gf, "pcm");
     std::vector<float> pcm(T_pcm);
@@ -1124,6 +1358,10 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
 
     ggml_gallocr_free(ga);
     ggml_free(ctx0);
+
+    if (ov_bench_enabled()) {
+        fprintf(stderr, "  omnivoice_bench: %-22s %.2f ms\n", "decode_readback", _dbg_ms(_dbg_t3, _dbg_now()));
+    }
 
     return pcm;
 }
@@ -1173,119 +1411,12 @@ static std::vector<int32_t> tokenize(const ov_vocab& vocab, const std::string& t
 // Estimate target audio length (frames) from text length
 // ---------------------------------------------------------------------------
 
-// Per-codepoint "phonetic weight" (relative speech duration). Adapted from
-// OmniVoice's rule-based estimator (omnivoice/utils/duration.py — Apache-2.0,
-// © Xiaomi/k2-fsa; C++ mirror in ServeurpersoCom/omnivoice.cpp — MIT). Weights:
-// mark 0, separator 0.2, punct/symbol 0.5, digit 3.5 (spoken as words),
-// latin/cyrillic/greek 1.0, arabic/hebrew/thai 1.5, indic 1.8, kana 2.2,
-// hangul 2.5, cjk 3.0.
-static double duration_cp_weight(uint32_t cp) {
-    if ((cp >= 0x30 && cp <= 0x39) || (cp >= 0xFF10 && cp <= 0xFF19))
-        return 3.5; // digits — spoken as words
-    if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A))
-        return 1.0; // ASCII letters
-    if (cp < 0x80)
-        return (cp == 0x20 || cp == 0x09 || cp == 0x0A || cp == 0x0D) ? 0.2 : 0.5;
-    if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF))
-        return 0.0; // combining marks — silent
-    if (cp == 0x3000)
-        return 0.2; // ideographic space
-    if ((cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF00 && cp <= 0xFF0F) || (cp >= 0xFF1A && cp <= 0xFF20) ||
-        (cp >= 0xFF3B && cp <= 0xFF40) || (cp >= 0xFF5B && cp <= 0xFF65))
-        return 0.5; // CJK punctuation
-    if (cp >= 0x00C0 && cp <= 0x024F)
-        return 1.0; // Latin extended
-    if (cp >= 0x0370 && cp <= 0x03FF)
-        return 1.0; // Greek
-    if (cp >= 0x0400 && cp <= 0x04FF)
-        return 1.0; // Cyrillic
-    if (cp >= 0x0590 && cp <= 0x06FF)
-        return 1.5; // Hebrew + Arabic
-    if (cp >= 0x0E00 && cp <= 0x0EFF)
-        return 1.5; // Thai + Lao
-    if (cp >= 0x0900 && cp <= 0x0DFF)
-        return 1.8; // Indic (Devanagari..Sinhala)
-    if (cp >= 0x3040 && cp <= 0x30FF)
-        return 2.2; // Hiragana + Katakana
-    if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF))
-        return 2.5; // Hangul
-    if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x20000 && cp <= 0x2FA1F))
-        return 3.0; // CJK ideographs
-    return 1.0;     // default letter-ish
-}
-
-static double duration_text_weight(const std::string& text) {
-    double w = 0.0;
-    for (size_t i = 0; i < text.size();) {
-        unsigned char c = text[i];
-        uint32_t cp;
-        int adv;
-        if (c < 0x80) {
-            cp = c;
-            adv = 1;
-        } else if (c < 0xE0) {
-            cp = c & 0x1F;
-            adv = 2;
-        } else if (c < 0xF0) {
-            cp = c & 0x0F;
-            adv = 3;
-        } else {
-            cp = c & 0x07;
-            adv = 4;
-        }
-        for (int k = 1; k < adv && i + (size_t)k < text.size(); k++)
-            cp = (cp << 6) | ((unsigned char)text[i + k] & 0x3F);
-        w += duration_cp_weight(cp);
-        i += adv;
-    }
-    return w;
-}
-
-// Estimate target length (in ref_dur's unit) from a reference (text, dur) pair,
-// mirroring RuleDurationEstimator.estimate_duration:
-//   speed = weight(ref_text) / ref_dur;  est = weight(target) / speed
-// with a power-curve BOOST when the linear estimate is short (< low_threshold):
-//   est = low_threshold * (est/low_threshold)^(1/boost_strength)
-// The boost lengthens short clips so they don't render too fast / skip
-// characters (#254). Defaults (low_threshold=50, boost_strength=3) match Python.
-static double duration_estimate(const std::string& target_text, const std::string& ref_text, double ref_dur,
-                                double low_threshold = 50.0, double boost_strength = 3.0) {
-    if (ref_dur <= 0.0 || ref_text.empty())
-        return 0.0;
-    double ref_weight = duration_text_weight(ref_text);
-    if (ref_weight == 0.0)
-        return 0.0;
-    double speed = ref_weight / ref_dur;
-    double est = duration_text_weight(target_text) / speed;
-    if (est < low_threshold)
-        return low_threshold * std::pow(est / low_threshold, 1.0 / boost_strength);
-    return est;
-}
-
-// Target audio length (frames). With a voice prompt the anchor IS the reference
-// (ref_text → ref_T frames) so the length tracks the reference speaker's actual
-// rate (fixes "duration doesn't change with a reference voice", #254). Without
-// one, fall back to the canonical "Nice to meet you." ≈ 25-frame anchor.
-// OMNIVOICE_FRAMES_PER_CHAR overrides the no-ref frames/weighted-char rate.
-static int estimate_target_tokens(const std::string& text, const std::string& ref_text = std::string(), int ref_T = 0,
-                                  float speed = 1.0f) {
-    std::string rt;
-    double rd;
-    if (ref_T > 0 && !ref_text.empty()) {
-        rt = ref_text;
-        rd = (double)ref_T;
-    } else {
-        rt = "Nice to meet you.";
-        rd = 25.0;
-        if (const char* e = std::getenv("OMNIVOICE_FRAMES_PER_CHAR")) {
-            float v = (float)atof(e);
-            if (v > 0.0f)
-                rd = v * duration_text_weight(rt); // env = frames per weighted char
-        }
-    }
-    double est = duration_estimate(text, rt, rd) / speed;
-    return std::max((int)est, 10);
-}
+// Extracted to src/core/omnivoice_duration.h so it can be unit-tested, and so
+// the #363 reference-rate guard lives with the weights it depends on.
+using core_omnivoice_duration::duration_estimate;
+using core_omnivoice_duration::duration_text_weight;
+using core_omnivoice_duration::estimate_target_tokens;
+using core_omnivoice_duration::ref_rate_is_plausible;
 
 // ---------------------------------------------------------------------------
 // Time steps for masked iterative schedule
@@ -1302,6 +1433,68 @@ static std::vector<float> get_time_steps(float t_start, float t_end, int num_ste
         steps[i] = t;
     }
     return steps;
+}
+
+// Concatenate output rows without dequantizing/requantizing. Original weights
+// remain available for A/B and unsupported type/shape combinations fall back.
+static bool prepare_packed_projections(omnivoice_context* ctx) {
+    if (ctx->buf_packed)
+        return true;
+    if (!ctx->backend || ctx->model.blocks.empty())
+        return false;
+    ggml_init_params ip = {ctx->model.blocks.size() * 2 * ggml_tensor_overhead(), nullptr, true};
+    auto* weights = ggml_init(ip);
+    if (!weights)
+        return false;
+    struct pack {
+        ggml_tensor* dst;
+        ggml_tensor** slot;
+        std::vector<ggml_tensor*> sources;
+    };
+    std::vector<pack> packs;
+    auto add = [&](ggml_tensor** slot, std::vector<ggml_tensor*> sources) {
+        auto* first = sources.front();
+        if (!first || !ggml_is_matrix(first) || !ggml_is_contiguous(first))
+            return;
+        int64_t rows = 0;
+        for (auto* t : sources) {
+            if (!t || !ggml_is_matrix(t) || !ggml_is_contiguous(t) || t->type != first->type ||
+                t->ne[0] != first->ne[0])
+                return;
+            rows += t->ne[1];
+        }
+        auto* dst = ggml_new_tensor_2d(weights, first->type, first->ne[0], rows);
+        packs.push_back({dst, slot, std::move(sources)});
+    };
+    for (auto& block : ctx->model.blocks) {
+        add(&block.attn_qkv_w, {block.attn_q_w, block.attn_k_w, block.attn_v_w});
+        add(&block.ffn_gate_up_w, {block.ffn_gate_w, block.ffn_up_w});
+    }
+    if (packs.empty()) {
+        ggml_free(weights);
+        return false;
+    }
+    auto* buffer = ggml_backend_alloc_ctx_tensors(weights, ctx->backend);
+    if (!buffer) {
+        ggml_free(weights);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (auto& pack : packs) {
+        size_t offset = 0;
+        for (auto* t : pack.sources) {
+            std::vector<uint8_t> bytes(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+            ggml_backend_tensor_set(pack.dst, bytes.data(), offset, bytes.size());
+            offset += bytes.size();
+        }
+    }
+    // Publish only after successful allocation and every copy has completed.
+    ctx->ctx_packed = weights;
+    ctx->buf_packed = buffer;
+    for (auto& pack : packs)
+        *pack.slot = pack.dst;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,14 +1532,23 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
         attn_in = ggml_mul(ctx0, attn_in, b.attn_norm_w);
 
         // Q, K, V projections
-        ggml_tensor* Q = ggml_mul_mat(ctx0, b.attn_q_w, attn_in);
-        ggml_tensor* K = ggml_mul_mat(ctx0, b.attn_k_w, attn_in);
-        ggml_tensor* V = ggml_mul_mat(ctx0, b.attn_v_w, attn_in);
-
-        // Reshape to (head_dim, n_heads, T) / (head_dim, n_kv_heads, T)
-        Q = ggml_reshape_3d(ctx0, Q, hp.head_dim, hp.n_heads, T);
-        K = ggml_reshape_3d(ctx0, K, hp.head_dim, hp.n_kv_heads, T);
-        V = ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_kv_heads, T);
+        ggml_tensor *Q, *K, *V;
+        if (env_bool("CRISPASR_OMNIVOICE_PACKED_PROJ") && b.attn_qkv_w) {
+            auto* qkv = ggml_mul_mat(ctx0, b.attn_qkv_w, attn_in);
+            const size_t qbytes = (size_t)hp.head_dim * hp.n_heads * sizeof(float);
+            const size_t kbytes = (size_t)hp.head_dim * hp.n_kv_heads * sizeof(float);
+            Q = ggml_view_3d(ctx0, qkv, hp.head_dim, hp.n_heads, T, hp.head_dim * sizeof(float), qkv->nb[1], 0);
+            K = ggml_view_3d(ctx0, qkv, hp.head_dim, hp.n_kv_heads, T, hp.head_dim * sizeof(float), qkv->nb[1], qbytes);
+            V = ggml_view_3d(ctx0, qkv, hp.head_dim, hp.n_kv_heads, T, hp.head_dim * sizeof(float), qkv->nb[1],
+                             qbytes + kbytes);
+        } else {
+            Q = ggml_mul_mat(ctx0, b.attn_q_w, attn_in);
+            K = ggml_mul_mat(ctx0, b.attn_k_w, attn_in);
+            V = ggml_mul_mat(ctx0, b.attn_v_w, attn_in);
+            Q = ggml_reshape_3d(ctx0, Q, hp.head_dim, hp.n_heads, T);
+            K = ggml_reshape_3d(ctx0, K, hp.head_dim, hp.n_kv_heads, T);
+            V = ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_kv_heads, T);
+        }
 
         // Q/K norms (Qwen3 style)
         if (b.attn_q_norm_w) {
@@ -1367,9 +1569,14 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
         // ggml_flash_attn_ext requires Q/K/V in (head_dim, T, n_heads) layout.
         // Permute from (head_dim, n_heads, T) → (head_dim, T, n_heads).
         // ggml handles GQA natively (Q.ne[2]=n_heads, K.ne[2]=n_kv_heads).
-        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
-        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+        const bool attn_views = env_bool("CRISPASR_OMNIVOICE_ATTN_VIEWS");
+        auto layout = [&](ggml_tensor* x) {
+            auto* view = ggml_permute(ctx0, x, 0, 2, 1, 3);
+            return attn_views ? view : ggml_cont(ctx0, view);
+        };
+        Q = layout(Q);
+        K = layout(K);
+        V = layout(V);
 
         // flash_attn_ext: Q/K/V in (hd, T, n_heads/n_kv) → output (hd, n_heads, T).
         ggml_tensor* attn_out;
@@ -1377,8 +1584,8 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
             // Independent flash-attn per block (cond [0:split], uncond [split:T]).
             const int Ta = block_split, Tb = T - block_split;
             auto blk = [&](ggml_tensor* X, int nh, int t0, int tn) {
-                return ggml_cont(ctx0,
-                                 ggml_view_3d(ctx0, X, hp.head_dim, tn, nh, X->nb[1], X->nb[2], (size_t)t0 * X->nb[1]));
+                auto* view = ggml_view_3d(ctx0, X, hp.head_dim, tn, nh, X->nb[1], X->nb[2], (size_t)t0 * X->nb[1]);
+                return attn_views ? view : ggml_cont(ctx0, view);
             };
             ggml_tensor* Ac = ggml_flash_attn_ext(ctx0, blk(Q, hp.n_heads, 0, Ta), blk(K, hp.n_kv_heads, 0, Ta),
                                                   blk(V, hp.n_kv_heads, 0, Ta), nullptr, attn_scale, 0.0f, 0.0f);
@@ -1401,8 +1608,15 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
         ggml_tensor* ffn_in = ggml_rms_norm(ctx0, cur, hp.rms_norm_eps);
         ffn_in = ggml_mul(ctx0, ffn_in, b.ffn_norm_w);
 
-        ggml_tensor* gate = ggml_mul_mat(ctx0, b.ffn_gate_w, ffn_in);
-        ggml_tensor* up = ggml_mul_mat(ctx0, b.ffn_up_w, ffn_in);
+        ggml_tensor *gate, *up;
+        if (env_bool("CRISPASR_OMNIVOICE_PACKED_PROJ") && b.ffn_gate_up_w) {
+            auto* both = ggml_mul_mat(ctx0, b.ffn_gate_up_w, ffn_in);
+            gate = ggml_view_2d(ctx0, both, hp.ff_dim, T, both->nb[1], 0);
+            up = ggml_view_2d(ctx0, both, hp.ff_dim, T, both->nb[1], hp.ff_dim * sizeof(float));
+        } else {
+            gate = ggml_mul_mat(ctx0, b.ffn_gate_w, ffn_in);
+            up = ggml_mul_mat(ctx0, b.ffn_up_w, ffn_in);
+        }
         gate = ggml_silu(ctx0, gate);
         ggml_tensor* ffn_out = ggml_mul(ctx0, gate, up);
         ffn_out = ggml_mul_mat(ctx0, b.ffn_down_w, ffn_out);
@@ -1419,8 +1633,6 @@ static ggml_cgraph* build_llm_graph(omnivoice_context* ctx, ggml_context* ctx0, 
     ggml_set_name(logits, "audio_logits");
     ggml_set_output(logits);
 
-    ggml_set_name(cur, "llm_out");
-    ggml_set_output(cur);
     ggml_build_forward_expand(gf, logits);
 
     return gf;
@@ -1470,6 +1682,57 @@ static std::vector<float> read_embedding_rows(ggml_backend_t backend, ggml_tenso
     ggml_free(ctx0);
     return result;
 }
+
+// Persistent embedding-lookup graph: avoids per-call ggml_context + gallocr
+// creation in the hot MaskGIT loop. Shape is fixed (n_rows constant across
+// steps), so the graph and buffer allocation are reused — only the row-ID
+// input data changes per step.
+struct ov_persist_embed {
+    std::vector<uint8_t> mem_buf;
+    ggml_context* ctx0 = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_tensor* ids = nullptr;
+    ggml_tensor* out = nullptr;
+    ggml_gallocr_t ga = nullptr;
+    int n_rows = 0;
+    int dim = 0;
+
+    void init(ggml_backend_t backend, ggml_tensor* embd_w, int nr, int d) {
+        n_rows = nr;
+        dim = d;
+        size_t mem = (size_t)(n_rows + 6) * ggml_tensor_overhead() + ggml_graph_overhead();
+        mem_buf.resize(mem);
+        ggml_init_params ip = {mem, mem_buf.data(), true};
+        ctx0 = ggml_init(ip);
+        ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+        ggml_set_name(ids, "pe_row_ids");
+        ggml_set_input(ids);
+        out = ggml_get_rows(ctx0, embd_w, ids);
+        ggml_set_name(out, "pe_embd_out");
+        ggml_set_output(out);
+        gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, out);
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+    }
+
+    void compute(ggml_backend_t backend, const int32_t* row_data, float* result) {
+        ggml_backend_tensor_set(ids, row_data, 0, (size_t)n_rows * sizeof(int32_t));
+        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_tensor_get(out, result, 0, (size_t)n_rows * dim * sizeof(float));
+    }
+
+    void release() {
+        if (ga) {
+            ggml_gallocr_free(ga);
+            ga = nullptr;
+        }
+        if (ctx0) {
+            ggml_free(ctx0);
+            ctx0 = nullptr;
+        }
+    }
+};
 
 static std::vector<float> prepare_embeddings(
     omnivoice_context* ctx, const std::vector<int32_t>& text_ids,
@@ -1553,9 +1816,11 @@ struct ov_gen_result {
 };
 
 static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::string& text) {
+    if (env_bool("CRISPASR_OMNIVOICE_PACKED_PROJ"))
+        prepare_packed_projections(ctx);
     auto& hp = ctx->hp;
     auto& gen = ctx->gen;
-    bool debug = env_bool("OMNIVOICE_DEBUG");
+    bool debug = env_bool("CRISPASR_OMNIVOICE_DEBUG");
 
     ov_gen_result result;
     result.n_codebooks = (int)hp.n_codebooks;
@@ -1580,6 +1845,19 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
     //    reference (ref_text → ref_T frames) so it tracks the reference speaker's
     //    actual rate; otherwise use the built-in speaking-rate anchor.
     int T_target = estimate_target_tokens(text, ctx->ref_text, ctx->ref_T, ctx->speed);
+
+    // Exact-duration override (upstream OmniVoice `duration` parity). When set it
+    // WINS over the estimate — the caller dubbing into a known window knows the
+    // length better than the estimator does. It also removes the estimator's two
+    // failure modes: a ref_text that does not match the reference audio, and an
+    // under-estimate that truncates the tail (the generator is masked-iterative
+    // and cannot ask for more room, #363).
+    // Frames are 40 ms (24 kHz / hop 960) => 25 frames per second.
+    if (ctx->target_duration_s > 0.0f) {
+        const int frames = (int)std::lround((double)ctx->target_duration_s * 25.0);
+        if (frames >= 1)
+            T_target = frames;
+    }
     result.T = T_target;
 
     if (debug) {
@@ -1594,15 +1872,51 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
 
     // 3. Build style prefix. When cloning, a <|denoise|> token leads the style
     //    (Python create_voice_clone_prompt), then language + instruct.
-    std::string style_text;
-    if (ctx->ref_T > 0)
-        style_text += "<|denoise|>";
-    std::string lang_str = ctx->language.empty() ? "None" : ctx->language;
-    std::string instruct_str = ctx->instruct.empty() ? "None" : ctx->instruct;
-    style_text += "<|lang_start|>" + lang_str + "<|lang_end|>";
-    style_text += "<|instruct_start|>" + instruct_str + "<|instruct_end|>";
+    // The language the caller asked for wins outright. Only when nobody set one
+    // do we guess from the text (#13273): SubtitleEdit's language menu is still
+    // not wired to the payload upstream, so without this every dubbed line
+    // arrives language-agnostic no matter what the user picked.
+    //
+    // Computed PER CALL into a local — never written back to ctx->language.
+    // The server reuses one context across requests, so a sticky guess would
+    // leak line N's detected language onto line N+1, which is the exact
+    // per-call-vs-init bug this whole change exists to fix.
+    //
+    // ⚠ Detect over `text` (the target), NOT `combined_text` — the latter has
+    // the reference transcript glued to its front, so an English reference clip
+    // would pull every German subtitle's guess to English.
+    std::string eff_lang = ctx->language;
+    if (eff_lang.empty() && env_bool_default("CRISPASR_OMNIVOICE_AUTO_LANG", true)) {
+        eff_lang = core_omnivoice_lang::auto_detect(text);
+        if (debug && !eff_lang.empty())
+            fprintf(stderr, "omnivoice: no language requested; detected '%s' from the target text\n", eff_lang.c_str());
+    }
+
+    // Render the validated instruct for THIS text: a dialect forces Chinese, an
+    // accent forces English, otherwise it follows whether the target text is
+    // Chinese. Text-dependent, so it cannot be baked in at set time.
+    const std::string instruct_rendered =
+        core_omnivoice_instruct::render(ctx->instruct, core_omnivoice_instruct::text_is_zh(text));
+
+    // Assembly lives in a weight-free header so the exact prompt string is
+    // unit-testable (tests/test-omnivoice-prompt.cpp) instead of only
+    // observable by loading the model and reading the debug print below.
+    const std::string style_text = core_omnivoice_prompt::build_style_text(ctx->ref_T > 0, eff_lang, instruct_rendered);
     std::vector<int32_t> style_ids = tokenize(ctx->vocab, style_text);
     int T_style = (int)style_ids.size();
+
+    // The style prefix is where the language conditioning actually lives, and a
+    // BPE difference here is invisible in every downstream metric — the graph
+    // still computes, the audio still sounds like speech. Print the ids so
+    // prompt-token parity against the HF tokenizer stays a one-command check
+    // (dev-guide step 0 for any AR model):
+    //   AutoTokenizer.from_pretrained(<lm-src>)(style_text).input_ids
+    if (debug) {
+        fprintf(stderr, "omnivoice: style '%s' -> %d ids:", style_text.c_str(), T_style);
+        for (int id : style_ids)
+            fprintf(stderr, " %d", id);
+        fprintf(stderr, "\n");
+    }
 
     // 4. Build the full input sequence
     // Layout: [style_tokens | text_tokens | ref_audio_tokens? | target_mask_tokens]
@@ -1691,7 +2005,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         g.ctx0 = nullptr;
     };
     const bool persistent = [] {
-        const char* e = getenv("OMNIVOICE_PERSISTENT_GRAPH");
+        const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_PERSISTENT_GRAPH");
         return !(e && e[0] == '0');
     }();
     // Unified CFG: fuse cond + uncond into ONE graph (seq-concat + per-block
@@ -1700,7 +2014,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
     // there; on Metal/CPU the forward is compute-bound and fusion is ~3% slower, so
     // 2-forward stays the default. Override with OMNIVOICE_UNIFIED_CFG=0/1.
     const bool unified_cfg = [&] {
-        const char* e = getenv("OMNIVOICE_UNIFIED_CFG");
+        const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_UNIFIED_CFG");
         if (e && e[0])
             return e[0] != '0'; // explicit override
         return ctx->backend && std::strstr(ggml_backend_name(ctx->backend), "CUDA") != nullptr;
@@ -1713,13 +2027,29 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
     // and validated by ASR + listening, never a silent default. Only applies to
     // the 2-forward path (unified fuses cond+uncond, so K>1 forces 2-forward).
     const int cfg_interval = [&] {
-        const char* e = getenv("OMNIVOICE_CFG_INTERVAL");
+        const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_CFG_INTERVAL");
         int k = e ? atoi(e) : 1;
         return k >= 1 ? k : 1;
     }();
     if (cfg_interval > 1 && debug)
         fprintf(stderr, "omnivoice: interval-CFG K=%d (uncond recomputed every %d steps)\n", cfg_interval,
                 cfg_interval);
+    // Fused step graph (#254): move the audio-embedding lookup + codebook sum +
+    // text-embed concat INTO the forward graph (token ids in, target-slice
+    // logits out). Kills the per-step ~18 MB embed readback, the CPU codebook
+    // sum, the ~5 MB embed re-upload, and two extra graph dispatches. The
+    // embedding math is the same get_rows + same-order F32 adds the legacy
+    // path does on the host, so codes are byte-identical (A/B-gated).
+    // OMNIVOICE_FUSED_STEP=0 restores the legacy split path. Default ON
+    // everywhere: byte-identical codes proven on M1 Metal (5 config classes)
+    // AND on CUDA by the #254 reporter (RTX 5070 Ti, cmp identical, gen
+    // 3.55 s → 1.53 s, RTF 0.17 → 0.07, single CUDA-graph warmup).
+    const bool fused_step = [&] {
+        const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_FUSED_STEP");
+        if (e && e[0])
+            return e[0] != '0';
+        return persistent; // fused graphs are persistent-only
+    }();
     auto run_llm_forward = [&](ov_step_graph& g, const std::vector<float>& emb, int T_in,
                                int target_offset) -> std::vector<float> {
         if (!g.ctx0) {
@@ -1759,7 +2089,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         }
         if (!persistent)
             fwd_free(g);
-        if (getenv("OMNIVOICE_DEBUG_SUM")) {
+        if (crispasr_env::get("CRISPASR_OMNIVOICE_DEBUG_SUM")) {
             double s = 0;
             for (float v : tgt)
                 s += v;
@@ -1823,8 +2153,265 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
             fwd_free(g);
     };
 
-    // 8. Iterative generation loop
-    std::vector<float> u_logits_cache; // interval-CFG: last computed uncond logits
+    // 8. Pre-computed/persistent embeddings for the hot loop.
+    //
+    // Text embeddings are constant across MaskGIT steps (only audio tokens
+    // change as masks lift). Compute once and reuse. Audio embedding graphs
+    // are shape-constant (n_codebooks × T_audio / T_target rows), so we
+    // build one persistent gallocr per arm and reuse the buffer across steps
+    // — eliminating the per-step ggml_context + gallocr alloc/free overhead
+    // and the repeated text-embedding GPU→CPU round-trip. (#254)
+    const int d = (int)hp.d_model;
+    const int target_start = T_total - T_target;
+
+    // 8a. Text embedding cache (positions 0..audio_start-1) — computed once.
+    std::vector<float> text_emb_cache;
+    if (audio_start > 0) {
+        std::vector<int32_t> text_only_ids(full_text_ids.begin(), full_text_ids.begin() + audio_start);
+        text_emb_cache =
+            read_embedding_rows(ctx->backend, ctx->model.token_embd_w, text_only_ids.data(), audio_start, d);
+    }
+
+    // 8b. Persistent audio embedding graphs (reused across all 32 steps).
+    const int n_cond_audio_rows = (int)hp.n_codebooks * T_audio;
+    const int n_uncond_audio_rows = (int)hp.n_codebooks * T_target;
+    ov_persist_embed audio_cond_pe, audio_uncond_pe;
+    if (!fused_step) {
+        audio_cond_pe.init(ctx->backend, ctx->model.audio_embd_w, n_cond_audio_rows, d);
+        if (gen.guidance_scale != 0.0f)
+            audio_uncond_pe.init(ctx->backend, ctx->model.audio_embd_w, n_uncond_audio_rows, d);
+    }
+
+    // 8b'. Fused step graphs (#254). One persistent graph per arm that takes
+    // shifted audio-token IDs as its only per-step input and emits ONLY the
+    // target-slice logits. The text embeddings live in a dedicated backend
+    // buffer (outside any gallocr, so they can't be aliased) and are uploaded
+    // once; the audio embedding lookup + per-position codebook sum run
+    // in-graph (get_rows + chained adds in the same cb-ascending order as the
+    // host sum — bitwise-identical F32).
+    struct ov_fused_graph {
+        std::vector<uint8_t> mem_buf;
+        ggml_context* ctx0 = nullptr;
+        ggml_cgraph* gf = nullptr;
+        ggml_tensor* ids_c = nullptr; // cond audio ids (n_cb * T_audio) or null
+        ggml_tensor* ids_u = nullptr; // uncond audio ids (n_cb * T_target) or null
+        ggml_tensor* pos = nullptr;
+        ggml_tensor* c_out = nullptr; // (out_dim, T_target) cond-target logits
+        ggml_tensor* u_out = nullptr; // (out_dim, T_target) uncond logits
+        void release() {
+            if (ga)
+                ggml_gallocr_free(ga);
+            if (ctx0)
+                ggml_free(ctx0);
+            ga = nullptr;
+            ctx0 = nullptr;
+        }
+        ggml_gallocr_t ga = nullptr;
+    };
+    ov_fused_graph fu_c, fu_u, fu_uni;
+    ggml_context* ctx_ext = nullptr;
+    ggml_backend_buffer_t buf_ext = nullptr;
+    ggml_tensor* text_ext = nullptr;
+    if (fused_step && audio_start > 0) {
+        ggml_init_params ipe = {2 * ggml_tensor_overhead(), nullptr, true};
+        ctx_ext = ggml_init(ipe);
+        text_ext = ggml_new_tensor_2d(ctx_ext, GGML_TYPE_F32, d, audio_start);
+        ggml_set_name(text_ext, "text_emb_ext");
+        buf_ext = ggml_backend_alloc_ctx_tensors(ctx_ext, ctx->backend);
+        ggml_backend_tensor_set(text_ext, text_emb_cache.data(), 0, (size_t)audio_start * d * sizeof(float));
+    }
+
+    // In-graph audio embedding: ids ordered [cb * T_a + t] (the audio_tokens
+    // layout) → get_rows (d, n_cb*T_a) → reshape (d, T_a, n_cb) → sum the
+    // n_cb slices with chained adds (cb ascending, matching the host loop).
+    auto build_audio_sum = [&](ggml_context* c, ggml_tensor* ids, int T_a) -> ggml_tensor* {
+        ggml_tensor* rows = ggml_get_rows(c, ctx->model.audio_embd_w, ids);
+        ggml_tensor* r3 = ggml_reshape_3d(c, rows, d, T_a, hp.n_codebooks);
+        ggml_tensor* acc = ggml_view_2d(c, r3, d, T_a, r3->nb[1], 0);
+        for (uint32_t cb = 1; cb < hp.n_codebooks; cb++)
+            acc = ggml_add(c, acc, ggml_view_2d(c, r3, d, T_a, r3->nb[1], (size_t)cb * r3->nb[2]));
+        return acc;
+    };
+
+    // mode: 0 = cond-only (T_total), 1 = uncond-only (T_target),
+    //       2 = unified cond+uncond (T_total + T_target, split attention)
+    auto build_fused = [&](ov_fused_graph& g, int mode) {
+        const size_t n_tensors = (size_t)hp.n_layers * 64 + 256;
+        const size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(8192, false);
+        g.mem_buf.resize(mem_size);
+        ggml_init_params ip2 = {mem_size, g.mem_buf.data(), true};
+        g.ctx0 = ggml_init(ip2);
+
+        ggml_tensor* emb_in = nullptr;
+        int T_in = 0;
+        int split = 0;
+        if (mode == 0 || mode == 2) {
+            g.ids_c = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_cond_audio_rows);
+            ggml_set_name(g.ids_c, "fused_ids_c");
+            ggml_set_input(g.ids_c);
+            ggml_tensor* audio_c = build_audio_sum(g.ctx0, g.ids_c, T_audio);
+            emb_in = (audio_start > 0) ? ggml_concat(g.ctx0, text_ext, audio_c, 1) : audio_c;
+            T_in = T_total;
+        }
+        if (mode == 1 || mode == 2) {
+            g.ids_u = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_uncond_audio_rows);
+            ggml_set_name(g.ids_u, "fused_ids_u");
+            ggml_set_input(g.ids_u);
+            ggml_tensor* audio_u = build_audio_sum(g.ctx0, g.ids_u, T_target);
+            if (mode == 2) {
+                emb_in = ggml_concat(g.ctx0, emb_in, audio_u, 1);
+                T_in = T_total + T_target;
+                split = T_total;
+            } else {
+                emb_in = audio_u;
+                T_in = T_target;
+            }
+        }
+
+        g.gf = build_llm_graph(ctx, g.ctx0, emb_in, T_in, split);
+        g.pos = ggml_graph_get_tensor(g.gf, "pos_ids");
+        ggml_tensor* logits = ggml_graph_get_tensor(g.gf, "audio_logits");
+
+        if (mode == 0 || mode == 2) {
+            g.c_out = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, out_dim, T_target, logits->nb[1],
+                                                     (size_t)target_start * logits->nb[1]));
+            ggml_set_name(g.c_out, "fused_c_tgt");
+            ggml_set_output(g.c_out);
+            ggml_build_forward_expand(g.gf, g.c_out);
+        }
+        if (mode == 1) {
+            g.u_out = logits; // uncond-only graph IS the target slice already
+        } else if (mode == 2) {
+            g.u_out = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, out_dim, T_target, logits->nb[1],
+                                                     (size_t)T_total * logits->nb[1]));
+            ggml_set_name(g.u_out, "fused_u_tgt");
+            ggml_set_output(g.u_out);
+            ggml_build_forward_expand(g.gf, g.u_out);
+        }
+
+        g.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        ggml_gallocr_alloc_graph(g.ga, g.gf);
+    };
+
+    // Per-step fused inputs (rebuilt on the host each step — a few hundred KB
+    // of int32, trivially cheap) and persistent logit read-back buffers.
+    std::vector<int32_t> fused_cond_ids(n_cond_audio_rows);
+    std::vector<int32_t> fused_uncond_ids(n_uncond_audio_rows);
+    std::vector<int32_t> fused_pos_buf;
+    std::vector<float> c_buf, u_buf;
+    if (fused_step) {
+        c_buf.resize((size_t)out_dim * T_target);
+        if (gen.guidance_scale != 0.0f)
+            u_buf.resize((size_t)out_dim * T_target);
+    }
+
+    // Refresh EVERY gallocr-managed input each compute (aliasing gotcha —
+    // see run_llm_forward). text_ext lives in its own buffer and is exempt.
+    auto run_fused = [&](ov_fused_graph& g, int mode) {
+        {
+            ov_bench_stage b("  ids_upload");
+            if (g.ids_c) {
+                for (int t = 0; t < T_audio; t++)
+                    for (uint32_t cb = 0; cb < hp.n_codebooks; cb++)
+                        fused_cond_ids[(size_t)cb * T_audio + t] =
+                            audio_tokens[cb * T_audio + t] + (int)(cb * hp.audio_vocab_size);
+                ggml_backend_tensor_set(g.ids_c, fused_cond_ids.data(), 0, (size_t)n_cond_audio_rows * sizeof(int32_t));
+            }
+            if (g.ids_u) {
+                for (int t = 0; t < T_target; t++)
+                    for (uint32_t cb = 0; cb < hp.n_codebooks; cb++)
+                        fused_uncond_ids[(size_t)cb * T_target + t] =
+                            audio_tokens[cb * T_audio + T_ref + t] + (int)(cb * hp.audio_vocab_size);
+                ggml_backend_tensor_set(g.ids_u, fused_uncond_ids.data(), 0,
+                                        (size_t)n_uncond_audio_rows * sizeof(int32_t));
+            }
+            if (g.pos) {
+                const int T_in = (mode == 2) ? T_total + T_target : (mode == 0 ? T_total : T_target);
+                fused_pos_buf.resize(T_in);
+                if (mode == 2) {
+                    for (int i = 0; i < T_total; i++)
+                        fused_pos_buf[i] = i;
+                    for (int i = 0; i < T_target; i++)
+                        fused_pos_buf[T_total + i] = i;
+                } else {
+                    for (int i = 0; i < T_in; i++)
+                        fused_pos_buf[i] = i;
+                }
+                ggml_backend_tensor_set(g.pos, fused_pos_buf.data(), 0, (size_t)T_in * sizeof(int32_t));
+            }
+        }
+        {
+            ov_bench_stage b("  fwd_fused");
+            ggml_backend_graph_compute(ctx->backend, g.gf);
+        }
+        {
+            ov_bench_stage b("  read_logits");
+            if (g.c_out)
+                ggml_backend_tensor_get(g.c_out, c_buf.data(), 0, c_buf.size() * sizeof(float));
+            if (g.u_out)
+                ggml_backend_tensor_get(g.u_out, u_buf.data(), 0, u_buf.size() * sizeof(float));
+        }
+    };
+
+    // 8c. Pre-allocated per-step buffers (avoid heap churn in the hot loop).
+    std::vector<int32_t> cond_audio_ids(n_cond_audio_rows);
+    std::vector<int32_t> uncond_audio_ids(n_uncond_audio_rows);
+    std::vector<float> cond_audio_emb((size_t)n_cond_audio_rows * d);
+    std::vector<float> uncond_audio_emb((size_t)n_uncond_audio_rows * d);
+    std::vector<float> cond_embeds_buf((size_t)T_total * d);
+    std::vector<float> uncond_embeds_buf((size_t)T_target * d);
+
+    // 8d. Fast embedding helpers: text from cache, audio via persistent graph.
+    auto prepare_cond_fast = [&]() {
+        // Text portion: copy from cache (constant across steps)
+        if (audio_start > 0)
+            std::memcpy(cond_embeds_buf.data(), text_emb_cache.data(), (size_t)audio_start * d * sizeof(float));
+        // Audio portion: zero then accumulate codebook embeddings
+        std::memset(cond_embeds_buf.data() + (size_t)audio_start * d, 0, (size_t)T_audio * d * sizeof(float));
+        // Build shifted row IDs for all codebooks × all audio positions
+        for (int t = 0; t < T_audio; t++)
+            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++)
+                cond_audio_ids[(size_t)t * hp.n_codebooks + cb] =
+                    audio_tokens[cb * T_audio + t] + (int)(cb * hp.audio_vocab_size);
+        // Single persistent GPU compute (no alloc/free)
+        audio_cond_pe.compute(ctx->backend, cond_audio_ids.data(), cond_audio_emb.data());
+        // Sum across codebooks per position
+        for (int t = 0; t < T_audio; t++) {
+            float* dst = cond_embeds_buf.data() + (size_t)(audio_start + t) * d;
+            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                const float* src = cond_audio_emb.data() + (size_t)((size_t)t * hp.n_codebooks + cb) * d;
+                for (int j = 0; j < d; j++)
+                    dst[j] += src[j];
+            }
+        }
+    };
+
+    auto prepare_uncond_fast = [&]() {
+        std::memset(uncond_embeds_buf.data(), 0, (size_t)T_target * d * sizeof(float));
+        for (int t = 0; t < T_target; t++)
+            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++)
+                uncond_audio_ids[(size_t)t * hp.n_codebooks + cb] =
+                    audio_tokens[cb * T_audio + T_ref + t] + (int)(cb * hp.audio_vocab_size);
+        audio_uncond_pe.compute(ctx->backend, uncond_audio_ids.data(), uncond_audio_emb.data());
+        for (int t = 0; t < T_target; t++) {
+            float* dst = uncond_embeds_buf.data() + (size_t)t * d;
+            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                const float* src = uncond_audio_emb.data() + (size_t)((size_t)t * hp.n_codebooks + cb) * d;
+                for (int j = 0; j < d; j++)
+                    dst[j] += src[j];
+            }
+        }
+    };
+
+    // 9. Iterative generation loop
+    std::vector<float> u_logits_cache; // interval-CFG (legacy path): last computed uncond logits
+    bool fused_u_valid = false;        // interval-CFG (fused path): u_buf holds a computed uncond
+    // Scoring buffers hoisted out of the hot loop (multi-MB, reused each step).
+    std::vector<float> log_probs((size_t)out_dim * T_target);
+    std::vector<int32_t> pred_tokens(hp.n_codebooks * T_target);
+    std::vector<float> confidence(hp.n_codebooks * T_target);
+    std::vector<int> indices(hp.n_codebooks * T_target);
+    std::vector<float> pos_noise; // precomputed Gumbel noise (rng-order preserving)
     for (int step = 0; step < gen.num_steps; step++) {
         int k = schedule[step];
         if (k <= 0)
@@ -1843,39 +2430,53 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
             }
         }
 
-        int target_start = T_total - T_target;
-        std::vector<float> c_logits, u_logits;
-        // Build the uncond (target-only) inputs once when guidance is on.
-        auto build_uncond_embeds = [&]() {
-            std::vector<int32_t> u_text_ids(T_target, 0);
-            std::vector<bool> u_mask(T_target, true);
-            std::vector<int32_t> u_audio(hp.n_codebooks * T_target);
-            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++)
-                for (int t = 0; t < T_target; t++)
-                    u_audio[cb * T_target + t] = audio_tokens[cb * T_audio + T_ref + t];
-            return prepare_embeddings(ctx, u_text_ids, u_audio, u_mask, T_target);
-        };
+        std::vector<float> c_logits, u_logits; // legacy-path storage
+        const float* c_lg = nullptr;
+        const float* u_lg = nullptr;
 
-        if (unified_cfg && cfg_interval <= 1 && gen.guidance_scale != 0.0f) {
+        if (fused_step) {
+            if (unified_cfg && cfg_interval <= 1 && gen.guidance_scale != 0.0f) {
+                if (!fu_uni.ctx0)
+                    build_fused(fu_uni, 2);
+                run_fused(fu_uni, 2);
+                c_lg = c_buf.data();
+                u_lg = u_buf.data();
+            } else {
+                if (!fu_c.ctx0)
+                    build_fused(fu_c, 0);
+                run_fused(fu_c, 0);
+                c_lg = c_buf.data();
+                if (gen.guidance_scale != 0.0f) {
+                    const bool recompute = (step % cfg_interval == 0) || !fused_u_valid || (step == gen.num_steps - 1);
+                    if (recompute) {
+                        if (!fu_u.ctx0)
+                            build_fused(fu_u, 1);
+                        run_fused(fu_u, 1);
+                        fused_u_valid = true;
+                    }
+                    u_lg = u_buf.data();
+                }
+            }
+        } else if (unified_cfg && cfg_interval <= 1 && gen.guidance_scale != 0.0f) {
             // Fused single-graph CFG (exact only; interval-CFG needs the 2-forward path).
-            std::vector<float> embeds, u_embeds;
             {
                 ov_bench_stage b("  embeds");
-                embeds = prepare_embeddings(ctx, full_text_ids, audio_tokens, audio_mask, T_total);
-                u_embeds = build_uncond_embeds();
+                prepare_cond_fast();
+                prepare_uncond_fast();
             }
             ov_bench_stage b("  fwd_unified");
-            run_unified(embeds, T_total, u_embeds, T_target, target_start, c_logits, u_logits);
+            run_unified(cond_embeds_buf, T_total, uncond_embeds_buf, T_target, target_start, c_logits, u_logits);
+            c_lg = c_logits.data();
+            u_lg = u_logits.data();
         } else {
             // Prepare conditional embeddings (full context: style + text + ref + target)
-            std::vector<float> embeds;
             {
                 ov_bench_stage b("  embeds_cond");
-                embeds = prepare_embeddings(ctx, full_text_ids, audio_tokens, audio_mask, T_total);
+                prepare_cond_fast();
             }
             {
                 ov_bench_stage b("  fwd_cond");
-                c_logits = run_llm_forward(fwd_c, embeds, T_total, target_start);
+                c_logits = run_llm_forward(fwd_c, cond_embeds_buf, T_total, target_start);
             }
             // Unconditional forward (target tokens only) for classifier-free guidance.
             // Interval-CFG: recompute only every cfg_interval steps (plus the first
@@ -1885,16 +2486,17 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
                 const bool recompute =
                     (step % cfg_interval == 0) || u_logits_cache.empty() || (step == gen.num_steps - 1);
                 if (recompute) {
-                    std::vector<float> u_embeds;
                     {
                         ov_bench_stage b("  embeds_uncond");
-                        u_embeds = build_uncond_embeds();
+                        prepare_uncond_fast();
                     }
                     ov_bench_stage b("  fwd_uncond");
-                    u_logits_cache = run_llm_forward(fwd_u, u_embeds, T_target, 0);
+                    u_logits_cache = run_llm_forward(fwd_u, uncond_embeds_buf, T_target, 0);
                 }
                 u_logits = u_logits_cache;
             }
+            c_lg = c_logits.data();
+            u_lg = u_logits.empty() ? nullptr : u_logits.data();
         }
 
         // _predict_tokens_with_scoring — mirrors Python exactly:
@@ -1926,44 +2528,85 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         int mask_id = (int)hp.audio_mask_id;
 
         // Pass 1: compute per-codebook log-probs with CFG, store in log_probs.
-        std::vector<float> log_probs(out_dim * T_target);
+        // Parallel over target positions — each (t, cb) cell is independent and
+        // rng-free, so the arithmetic (and output) is identical to the serial
+        // loop. This pass is ~13M exp() calls per step at T_target≈545.
         {
-            std::vector<float> c_lp(V), u_lp(V), guided(V), final_lp(V);
-            for (int t = 0; t < T_target; t++) {
-                for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
-                    size_t base = (size_t)t * out_dim + cb * V;
-                    const float* c_raw = c_logits.data() + base;
+            ov_bench_stage b("  score_cfg");
+            core_parallel::for_each_chunk(T_target, ctx->n_threads, [&](int t0, int t1) {
+                std::vector<float> c_lp(V), u_lp(V), guided(V), final_lp(V);
+                for (int t = t0; t < t1; t++) {
+                    for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                        size_t base = (size_t)t * out_dim + cb * V;
+                        const float* c_raw = c_lg + base;
 
-                    if (gen.guidance_scale != 0.0f && !u_logits.empty()) {
-                        const float* u_raw = u_logits.data() + base;
-                        log_softmax_all(c_raw, c_lp.data(), V);
-                        log_softmax_all(u_raw, u_lp.data(), V);
-                        for (int v = 0; v < V; v++)
-                            guided[v] = c_lp[v] + gen.guidance_scale * (c_lp[v] - u_lp[v]);
-                        log_softmax_all(guided.data(), final_lp.data(), V);
-                    } else {
-                        log_softmax_all(c_raw, final_lp.data(), V);
+                        if (gen.guidance_scale != 0.0f && u_lg) {
+                            const float* u_raw = u_lg + base;
+                            log_softmax_all(c_raw, c_lp.data(), V);
+                            log_softmax_all(u_raw, u_lp.data(), V);
+                            for (int v = 0; v < V; v++)
+                                guided[v] = c_lp[v] + gen.guidance_scale * (c_lp[v] - u_lp[v]);
+                            log_softmax_all(guided.data(), final_lp.data(), V);
+                        } else {
+                            log_softmax_all(c_raw, final_lp.data(), V);
+                        }
+                        // Set mask_id to -inf AFTER all log_softmax passes
+                        // (Python: log_probs[..., audio_mask_id] = -float("inf"))
+                        final_lp[mask_id] = -1e30f;
+                        std::memcpy(log_probs.data() + base, final_lp.data(), V * sizeof(float));
                     }
-                    // Set mask_id to -inf AFTER all log_softmax passes
-                    // (Python: log_probs[..., audio_mask_id] = -float("inf"))
-                    final_lp[mask_id] = -1e30f;
-                    std::memcpy(log_probs.data() + base, final_lp.data(), V * sizeof(float));
                 }
-            }
+            });
         }
 
         // Pass 2: top-k filter → Gumbel sample pred_tokens; compute confidence.
-        std::vector<int32_t> pred_tokens(hp.n_codebooks * T_target);
-        std::vector<float> confidence(hp.n_codebooks * T_target);
+        ov_bench_stage bench_sample("  sample_select");
+        if (gen.class_temperature <= 0.0f) {
+            // Greedy path (default). Draw the position-Gumbel noise serially
+            // FIRST — same rng stream, same (t-outer, cb-inner) order as the
+            // serial loop — then consume it from the threaded loop, so the
+            // output is bitwise-identical to the single-threaded original.
+            if (gen.position_temperature > 0.0f) {
+                pos_noise.resize((size_t)T_target * hp.n_codebooks);
+                for (size_t i = 0; i < pos_noise.size(); i++)
+                    pos_noise[i] = gumbel_noise();
+            }
+            core_parallel::for_each_chunk(T_target, ctx->n_threads, [&](int t0, int t1) {
+                for (int t = t0; t < t1; t++) {
+                    for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                        const float* lp = log_probs.data() + (size_t)t * out_dim + cb * V;
+                        // Confidence = max log-prob; greedy pick = argmax (first
+                        // maximum, matching std::max_element tie-breaking).
+                        int best_tok = 0;
+                        float max_lp = -1e30f;
+                        for (int v = 0; v < V; v++) {
+                            if (lp[v] > max_lp) {
+                                max_lp = lp[v];
+                                best_tok = v;
+                            }
+                        }
+                        int idx = (int)cb * T_target + t;
+                        pred_tokens[idx] = best_tok;
+                        // Confidence = max log-prob - layer penalty
+                        confidence[idx] = max_lp - cb * gen.layer_penalty_factor;
+                        // Position Gumbel noise
+                        if (gen.position_temperature > 0.0f)
+                            confidence[idx] =
+                                confidence[idx] / gen.position_temperature + pos_noise[(size_t)t * hp.n_codebooks + cb];
+                    }
+                }
+            });
+        } else {
+            // Sampled path (class_temperature > 0): draws a data-dependent
+            // number of gumbels per cell, so the rng stream can't be
+            // precomputed — stays serial.
+            for (int t = 0; t < T_target; t++) {
+                for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                    float* lp = log_probs.data() + (size_t)t * out_dim + cb * V;
+                    // mask_id already -inf in lp
 
-        for (int t = 0; t < T_target; t++) {
-            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
-                float* lp = log_probs.data() + (size_t)t * out_dim + cb * V;
-                // mask_id already -inf in lp
-
-                // Top-k filter: keep top ceil(0.1*V) tokens
-                // (Python: _filter_top_k(log_probs, ratio=0.1), k=ceil(0.1*1025)=103)
-                if (gen.class_temperature > 0.0f) {
+                    // Top-k filter: keep top ceil(0.1*V) tokens
+                    // (Python: _filter_top_k(log_probs, ratio=0.1), k=ceil(0.1*1025)=103)
                     int top_k = std::max(1, (int)std::ceil(0.1f * V));
                     std::vector<float> vals(lp, lp + V);
                     std::nth_element(vals.begin(), vals.begin() + (V - top_k), vals.end());
@@ -1971,16 +2614,14 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
                     for (int v = 0; v < V; v++)
                         if (lp[v] < threshold)
                             lp[v] = -1e30f;
-                }
 
-                // Confidence = max log-prob after filter (Python: log_probs.max(dim=-1)[0]).
-                // The top-k always preserves the maximum, so max-after-filter = max-before-filter.
-                float max_lp = *std::max_element(lp, lp + V);
+                    // Confidence = max log-prob after filter (Python: log_probs.max(dim=-1)[0]).
+                    // The top-k always preserves the maximum, so max-after-filter = max-before-filter.
+                    float max_lp = *std::max_element(lp, lp + V);
 
-                // Sample token: Gumbel or greedy.
-                int best_tok = 0;
-                float best_score = -1e30f;
-                if (gen.class_temperature > 0.0f) {
+                    // Sample token: Gumbel.
+                    int best_tok = 0;
+                    float best_score = -1e30f;
                     for (int v = 0; v < V; v++) {
                         if (lp[v] < -1e20f)
                             continue;
@@ -1990,26 +2631,19 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
                             best_tok = v;
                         }
                     }
-                } else {
-                    for (int v = 0; v < V; v++) {
-                        if (lp[v] > best_score) {
-                            best_score = lp[v];
-                            best_tok = v;
-                        }
+
+                    int idx = (int)cb * T_target + t;
+                    pred_tokens[idx] = best_tok;
+
+                    // Confidence = max log-prob - layer penalty
+                    // (Python: scores = confidence_scores - layer_ids * layer_penalty_factor)
+                    confidence[idx] = max_lp - cb * gen.layer_penalty_factor;
+
+                    // Position Gumbel noise
+                    // (Python: scores = _gumbel_sample(scores, position_temperature))
+                    if (gen.position_temperature > 0.0f) {
+                        confidence[idx] = confidence[idx] / gen.position_temperature + gumbel_noise();
                     }
-                }
-
-                int idx = (int)cb * T_target + t;
-                pred_tokens[idx] = best_tok;
-
-                // Confidence = max log-prob - layer penalty
-                // (Python: scores = confidence_scores - layer_ids * layer_penalty_factor)
-                confidence[idx] = max_lp - cb * gen.layer_penalty_factor;
-
-                // Position Gumbel noise
-                // (Python: scores = _gumbel_sample(scores, position_temperature))
-                if (gen.position_temperature > 0.0f) {
-                    confidence[idx] = confidence[idx] / gen.position_temperature + gumbel_noise();
                 }
             }
         }
@@ -2022,7 +2656,6 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         }
 
         // Select top-k positions to unmask
-        std::vector<int> indices(hp.n_codebooks * T_target);
         std::iota(indices.begin(), indices.end(), 0);
         std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
                           [&](int a, int b) { return confidence[a] > confidence[b]; });
@@ -2035,8 +2668,27 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
     fwd_free(fwd_c);
     fwd_free(fwd_u);
     fwd_free(fwd_uni);
+    fu_c.release();
+    fu_u.release();
+    fu_uni.release();
+    if (buf_ext)
+        ggml_backend_buffer_free(buf_ext);
+    if (ctx_ext)
+        ggml_free(ctx_ext);
+    audio_cond_pe.release();
+    audio_uncond_pe.release();
 
-    if (getenv("OMNIVOICE_DEBUG_CODES")) {
+    // Byte-exact A/B hook: dump the raw generated codes to a file so two runs
+    // (e.g. OMNIVOICE_FUSED_STEP=0 vs 1) can be diffed with cmp.
+    if (const char* dump_path = env_str("CRISPASR_OMNIVOICE_DUMP_CODES")) {
+        if (FILE* f = fopen(dump_path, "wb")) {
+            fwrite(tokens.data(), sizeof(int32_t), tokens.size(), f);
+            fclose(f);
+            fprintf(stderr, "omnivoice: dumped %zu codes to %s\n", tokens.size(), dump_path);
+        }
+    }
+
+    if (crispasr_env::get("CRISPASR_OMNIVOICE_DEBUG_CODES")) {
         int n_mask = 0;
         std::map<int32_t, int> hist;
         for (int32_t t : tokens) {
@@ -2082,6 +2734,149 @@ static std::vector<float> read_tensor_f32(ggml_tensor* t) {
         out.assign(n, 0.0f);
     }
     return out;
+}
+
+// Default promotion is deliberately scoped: the data cache changes no math;
+// encoder convolution has exact-code and repeat timing evidence on Apple CPU.
+static bool encoder_cache_enabled() {
+    return env_bool_default("CRISPASR_OMNIVOICE_ENCODER_CACHE", true);
+}
+// Promotion scope: the validated F16 Higgs profile on Apple Metal only.
+static bool encoder_metal_profile(const ov_higgs_tokenizer& tok, ggml_backend_t backend) {
+#if defined(__APPLE__) && TARGET_OS_OSX && (defined(__aarch64__) || defined(__arm64__))
+    const bool profile = backend && std::strncmp(ggml_backend_name(backend), "MTL", 3) == 0 && tok.loaded &&
+                         tok.sem_featproj_w && tok.sem_featproj_w->type == GGML_TYPE_F16 && tok.fc_w &&
+                         tok.fc_w->type == GGML_TYPE_F16 && tok.sem_d == 768 && tok.n_sem_layers == 12 &&
+                         tok.hidden_size == 1024 && tok.n_quantizers == 8 && tok.codebook_dim == 64 &&
+                         tok.codebook_size == 1024;
+    if (!profile || !tok.ctx_w)
+        return false;
+    for (auto* t = ggml_get_first_tensor(tok.ctx_w); t; t = ggml_get_next_tensor(tok.ctx_w, t))
+        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32)
+            return false;
+    return true;
+#else
+    (void)tok;
+    (void)backend;
+    return false;
+#endif
+}
+static bool encoder_hybrid_enabled(const omnivoice_context* ctx) {
+    const char* full_gpu = env_str("CRISPASR_OMNIVOICE_CODEC_GPU");
+    const bool explicit_full_gpu = full_gpu && std::strcmp(full_gpu, "0") != 0 && !codec_split_enabled();
+    return ctx->use_gpu && env_bool_default("CRISPASR_OMNIVOICE_ENCODER_HYBRID",
+                                            !explicit_full_gpu && !ctx->encoder_gpu_failed &&
+                                                encoder_metal_profile(ctx->tokenizer, ctx->backend));
+}
+static bool encoder_gpu_defaults(const omnivoice_context* ctx) {
+    return !ctx->encoder_gpu_failed && encoder_hybrid_enabled(ctx) &&
+           encoder_metal_profile(ctx->tokenizer, ctx->backend);
+}
+static bool encoder_precision_enabled(const ov_higgs_tokenizer& tok) {
+    return env_bool_default("CRISPASR_OMNIVOICE_ENCODER_SEMANTIC_F32", encoder_metal_profile(tok, tok.backend));
+}
+static bool encoder_fastconv_enabled(const ov_higgs_tokenizer& tok, bool force_cpu_policy = false) {
+    bool default_on = false;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    default_on = force_cpu_policy || (tok.backend && core_cpu_backend::is_cpu(tok.backend)) ||
+                 encoder_metal_profile(tok, tok.backend);
+#else
+    (void)tok;
+    (void)force_cpu_policy;
+#endif
+    return env_bool_default("CRISPASR_OMNIVOICE_ENCODER_FASTCONV", default_on);
+}
+
+// The scalar path and cache use exactly the same F16-to-F32 conversion and
+// accumulation order. Cache ownership follows tokenizer replacement/placement.
+static const std::vector<float>& encoder_values(ov_higgs_tokenizer& tok, ggml_tensor* t, std::vector<float>& scratch) {
+    if (!t) {
+        scratch.clear();
+        return scratch;
+    }
+    if (!encoder_cache_enabled()) {
+        scratch = read_tensor_f32(t);
+        return scratch;
+    }
+    auto found = tok.enc_values.find(t);
+    if (found == tok.enc_values.end())
+        found = tok.enc_values.emplace(t, read_tensor_f32(t)).first;
+    return found->second;
+}
+
+// Metal's tiled matrix path can reduce operand precision even for F32 tensors.
+// Keep this independent of placement/fusion so the numerical tradeoff is measurable.
+static void encoder_semantic_precision(ggml_cgraph* graph, const ov_higgs_tokenizer& tok) {
+    if (!encoder_precision_enabled(tok))
+        return;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        auto* node = ggml_graph_node(graph, i);
+        if (node->op == GGML_OP_MUL_MAT)
+            ggml_prec_set_acc(node, GGML_PREC_F32);
+    }
+}
+
+// Transactional, encoder-only F32 convolution bake. Do not mutate the decoder
+// cache or publish any tensors before allocation succeeds.
+static bool prepare_encoder_fastconv(ov_higgs_tokenizer& tok) {
+    const char* option = env_str("CRISPASR_OMNIVOICE_ENCODER_FASTCONV");
+    const bool all_kernels = option && std::strcmp(option, "2") == 0;
+    if (tok.enc_fc.enabled && tok.enc_fc_all == all_kernels)
+        return true;
+    tok.enc_fc.free();
+    tok.enc_fc_all = all_kernels;
+    std::vector<ggml_tensor*> weights = {tok.enc_conv1_w, tok.enc_conv2_w, tok.encsem_conv_w};
+    for (auto& b : tok.enc_blocks) {
+        weights.push_back(b.conv1_w);
+        for (auto& r : b.res) {
+            weights.push_back(r.conv1_w);
+            weights.push_back(r.conv2_w);
+        }
+    }
+    for (auto& b : tok.encsem_blocks) {
+        weights.push_back(b.conv_w);
+        for (auto& r : b.res) {
+            weights.push_back(r.conv1_w);
+            weights.push_back(r.conv2_w);
+        }
+    }
+    for (auto& b : tok.sem_conv)
+        weights.push_back(b.conv_w);
+    std::vector<ggml_tensor*> selected;
+    for (auto* w : weights)
+        if (w && w->type == GGML_TYPE_F16 && (all_kernels || w->ne[0] == 1) &&
+            std::find(selected.begin(), selected.end(), w) == selected.end())
+            selected.push_back(w);
+    if (selected.empty()) {
+        tok.enc_fc.enabled = true;
+        return true;
+    }
+    core_dac::fastconv_cache candidate;
+    ggml_init_params ip = {(selected.size() + 1) * ggml_tensor_overhead(), nullptr, true};
+    candidate.ctx = ggml_init(ip);
+    if (!candidate.ctx)
+        return false;
+    for (auto* w : selected)
+        candidate.f32[w] = ggml_new_tensor(candidate.ctx, GGML_TYPE_F32, GGML_MAX_DIMS, w->ne);
+    candidate.buf = ggml_backend_alloc_ctx_tensors(candidate.ctx, tok.backend);
+    if (!candidate.buf)
+        return false;
+    ggml_backend_buffer_set_usage(candidate.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (auto* w : selected) {
+        auto f = read_tensor_f32(w);
+        ggml_backend_tensor_set(candidate.f32.at(w), f.data(), 0, f.size() * sizeof(float));
+    }
+    tok.enc_fc.ctx = candidate.ctx;
+    candidate.ctx = nullptr;
+    tok.enc_fc.buf = candidate.buf;
+    candidate.buf = nullptr;
+    tok.enc_fc.f32.swap(candidate.f32);
+    tok.enc_fc.enabled = true;
+    return true;
+}
+
+static const core_dac::fastconv_cache* encoder_fastconv(ov_higgs_tokenizer& tok) {
+    return encoder_fastconv_enabled(tok) && prepare_encoder_fastconv(tok) ? &tok.enc_fc : nullptr;
 }
 
 // Factorized residual VQ encode: emb (T, hidden=1024 row-major) → codes (n_q, T).
@@ -2131,7 +2926,7 @@ static void higgs_cos(const float* a, const float* b, int T, int C, float& cos_m
 }
 
 static bool higgs_rvq_encode(ov_higgs_tokenizer& tok, const std::vector<float>& emb, int T,
-                             std::vector<int32_t>& out_codes) {
+                             std::vector<int32_t>& out_codes, int n_threads) {
     const int H = tok.hidden_size;   // 1024
     const int D = tok.codebook_dim;  // 64
     const int S = tok.codebook_size; // 1024
@@ -2148,11 +2943,16 @@ static bool higgs_rvq_encode(ov_higgs_tokenizer& tok, const std::vector<float>& 
 
     for (int k = 0; k < NQ; k++) {
         auto& q = tok.quantizers[k];
-        std::vector<float> pin_w = read_tensor_f32(q.proj_in_w);   // (D, H) row-major: [o*H + i]
-        std::vector<float> pin_b = read_tensor_f32(q.proj_in_b);   // (D,)
-        std::vector<float> cb = read_tensor_f32(q.codebook);       // (S, D) row-major: [s*D + d]
-        std::vector<float> pout_w = read_tensor_f32(q.proj_out_w); // (H, D) row-major: [o*D + d]
-        std::vector<float> pout_b = read_tensor_f32(q.proj_out_b); // (H,)
+        std::vector<float> pin_w_scratch;
+        const auto& pin_w = encoder_values(tok, q.proj_in_w, pin_w_scratch); // (D, H) row-major: [o*H + i]
+        std::vector<float> pin_b_scratch;
+        const auto& pin_b = encoder_values(tok, q.proj_in_b, pin_b_scratch); // (D,)
+        std::vector<float> cb_scratch;
+        const auto& cb = encoder_values(tok, q.codebook, cb_scratch); // (S, D) row-major: [s*D + d]
+        std::vector<float> pout_w_scratch;
+        const auto& pout_w = encoder_values(tok, q.proj_out_w, pout_w_scratch); // (H, D) row-major: [o*D + d]
+        std::vector<float> pout_b_scratch;
+        const auto& pout_b = encoder_values(tok, q.proj_out_b, pout_b_scratch); // (H,)
 
         // Project all frames' residual → P (T, D).
         std::vector<float> P((size_t)T * D);
@@ -2169,17 +2969,21 @@ static bool higgs_rvq_encode(ov_higgs_tokenizer& tok, const std::vector<float>& 
         }
 
         // Euclidean nearest-neighbor over the codebook (reuse core_rvq).
-        std::vector<float> norm_sq(S);
-        for (int s = 0; s < S; s++) {
-            float ss = 0.0f;
-            const float* e = cb.data() + (size_t)s * D;
-            for (int d = 0; d < D; d++)
-                ss += e[d] * e[d];
-            norm_sq[s] = ss;
+        std::vector<float> norm_scratch;
+        auto& norm_sq = encoder_cache_enabled() ? tok.enc_norms[q.codebook] : norm_scratch;
+        if (norm_sq.empty()) {
+            norm_sq.resize(S);
+            for (int s = 0; s < S; s++) {
+                float ss = 0.0f;
+                const float* e = cb.data() + (size_t)s * D;
+                for (int d = 0; d < D; d++)
+                    ss += e[d] * e[d];
+                norm_sq[s] = ss;
+            }
         }
         core_rvq::Codebook cbk{cb.data(), norm_sq.data(), S, D};
         std::vector<int32_t> idx(T);
-        if (!core_rvq::encode_euclidean(P.data(), T, D, &cbk, 1, idx.data()))
+        if (!core_rvq::encode_euclidean(P.data(), T, D, &cbk, 1, idx.data(), n_threads))
             return false;
 
         // Store codes + subtract project_out(centroid) from the residual.
@@ -2198,6 +3002,117 @@ static bool higgs_rvq_encode(ov_higgs_tokenizer& tok, const std::vector<float>& 
         }
     }
     return true;
+}
+
+// F32 copies preserve serialized F16/F32 values and avoid the implicit F16
+// activation conversion in CPU matmul. GPU graphs request F32 accumulation.
+static bool prepare_encoder_projection(ov_higgs_tokenizer& tok) {
+    if (tok.enc_proj.buf)
+        return true;
+    if (!tok.fc_w || tok.n_quantizers < 1 || (int)tok.quantizers.size() < tok.n_quantizers)
+        return false;
+    std::vector<ggml_tensor*> weights = {tok.fc_w};
+    if (tok.fc_b)
+        weights.push_back(tok.fc_b);
+    for (auto& q : tok.quantizers) {
+        if (!q.codebook || !q.proj_in_w || !q.proj_in_b || !q.proj_out_w || !q.proj_out_b)
+            return false;
+        for (auto* w : {q.codebook, q.proj_in_w, q.proj_in_b, q.proj_out_w, q.proj_out_b})
+            weights.push_back(w);
+    }
+    core_dac::fastconv_cache candidate;
+    ggml_init_params ip = {(weights.size() + tok.quantizers.size() + 1) * ggml_tensor_overhead(), nullptr, true};
+    candidate.ctx = ggml_init(ip);
+    if (!candidate.ctx)
+        return false;
+    for (auto* w : weights) {
+        if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16)
+            return false;
+        candidate.f32[w] = ggml_new_tensor(candidate.ctx, GGML_TYPE_F32, GGML_MAX_DIMS, w->ne);
+    }
+    std::vector<ggml_tensor*> norms;
+    for (size_t k = 0; k < tok.quantizers.size(); k++)
+        norms.push_back(ggml_new_tensor_1d(candidate.ctx, GGML_TYPE_F32, tok.codebook_size));
+    candidate.buf = ggml_backend_alloc_ctx_tensors(candidate.ctx, tok.backend);
+    if (!candidate.buf)
+        return false;
+    ggml_backend_buffer_set_usage(candidate.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (auto* w : weights) {
+        auto f = read_tensor_f32(w);
+        ggml_backend_tensor_set(candidate.f32.at(w), f.data(), 0, f.size() * sizeof(float));
+    }
+    for (size_t k = 0; k < tok.quantizers.size(); k++) {
+        auto f = read_tensor_f32(tok.quantizers[k].codebook);
+        std::vector<float> n(tok.codebook_size, 0.f);
+        for (int j = 0; j < tok.codebook_size; j++)
+            for (int d = 0; d < tok.codebook_dim; d++)
+                n[j] += f[(size_t)j * tok.codebook_dim + d] * f[(size_t)j * tok.codebook_dim + d];
+        ggml_backend_tensor_set(norms[k], n.data(), 0, n.size() * sizeof(float));
+    }
+    tok.enc_proj.ctx = candidate.ctx;
+    candidate.ctx = nullptr;
+    tok.enc_proj.buf = candidate.buf;
+    candidate.buf = nullptr;
+    tok.enc_proj.f32.swap(candidate.f32);
+    tok.enc_proj.enabled = true;
+    tok.enc_graph_norms = std::move(norms);
+    return true;
+}
+
+static std::vector<int32_t> higgs_projection_graph(ov_higgs_tokenizer& tok, const float* cat, int T) {
+    ov_bench_stage bench("enc_fc_rvq_graph");
+    if (T <= 0 || !prepare_encoder_projection(tok))
+        return {};
+    ggml_init_params ip = {2048 * ggml_tensor_overhead() + ggml_graph_overhead_custom(2048, false), nullptr, true};
+    auto* c = ggml_init(ip);
+    if (!c)
+        return {};
+    auto* graph = ggml_new_graph_custom(c, 2048, false);
+    auto* input = ggml_new_tensor_2d(c, GGML_TYPE_F32, tok.hidden_size, T);
+    ggml_set_input(input);
+    auto weight = [&](ggml_tensor* w) { return tok.enc_proj.f32.at(w); };
+    auto linear = [&](ggml_tensor* w, ggml_tensor* bias, ggml_tensor* x) {
+        auto* y = ggml_mul_mat(c, weight(w), x);
+        ggml_prec_set_acc(y, GGML_PREC_F32);
+        return bias ? ggml_add(c, y, weight(bias)) : y;
+    };
+    auto* residual = linear(tok.fc_w, tok.fc_b, input);
+    std::vector<ggml_tensor*> indices;
+    for (int k = 0; k < tok.n_quantizers; k++) {
+        auto& q = tok.quantizers[k];
+        auto* projected = linear(q.proj_in_w, q.proj_in_b, residual);
+        auto* dots = ggml_mul_mat(c, weight(q.codebook), projected);
+        ggml_prec_set_acc(dots, GGML_PREC_F32);
+        auto* scores = ggml_sub(c, ggml_scale(c, dots, 2.f), tok.enc_graph_norms[k]);
+        // Preserve the scalar/PyTorch FIRST-index tie rule. Plain ggml argmax
+        // differs across backends. Select equal maxima with an exact mask,
+        // then choose the largest descending ordinal (no epsilon score bias).
+        auto* maximum = ggml_pool_1d(c, scores, GGML_OP_POOL_MAX, tok.codebook_size, tok.codebook_size, 0);
+        auto* mask = ggml_scale_bias(c, ggml_sgn(c, ggml_sub(c, scores, maximum)), 1.f, 1.f);
+        auto* ordinal =
+            ggml_scale_bias(c, ggml_arange(c, 0.f, (float)tok.codebook_size, 1.f), -1.f, (float)tok.codebook_size);
+        auto* ids = ggml_argmax(c, ggml_mul(c, mask, ordinal));
+        ggml_set_output(ids);
+        indices.push_back(ids);
+        ggml_build_forward_expand(graph, ids);
+        if (k + 1 < tok.n_quantizers) {
+            auto* centroid = ggml_get_rows(c, weight(q.codebook), ids);
+            residual = ggml_sub(c, residual, linear(q.proj_out_w, q.proj_out_b, centroid));
+        }
+    }
+    auto* a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
+    std::vector<int32_t> result;
+    if (ggml_gallocr_alloc_graph(a, graph)) {
+        ggml_backend_tensor_set(input, cat, 0, (size_t)T * tok.hidden_size * sizeof(float));
+        if (ggml_backend_graph_compute(tok.backend, graph) == GGML_STATUS_SUCCESS) {
+            result.resize((size_t)T * tok.n_quantizers);
+            for (int k = 0; k < tok.n_quantizers; k++)
+                ggml_backend_tensor_get(indices[k], result.data() + (size_t)k * T, 0, (size_t)T * sizeof(int32_t));
+        }
+    }
+    ggml_gallocr_free(a);
+    ggml_free(c);
+    return result;
 }
 
 // Minimal reader for a reference GGUF: pull a named F32/I32 tensor to a flat
@@ -2222,7 +3137,9 @@ struct ov_ref_gguf {
 // Strided Conv1d for the DAC encoder downsampling convs (core_dac::conv1d is
 // stride-1 only). x (Cin, T), w (K, Cin, Cout) → (Cout, T_out); explicit pad.
 static ggml_tensor* enc_conv1d_strided(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
-                                       int pad) {
+                                       int pad, const core_dac::fastconv_cache* fc = nullptr) {
+    if (fc)
+        w = fc->get(w);
     const int Cout = (int)w->ne[2];
     ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, Cin)
     y = ggml_conv_1d(ctx, w, y, stride, pad, 1);             // (T_out, Cout, 1)
@@ -2246,6 +3163,8 @@ struct ov_dbg_tensor {
 static std::vector<float> higgs_acoustic_encode(omnivoice_context* ctx, const float* wav, int T_samp, int* out_T,
                                                 std::vector<ov_dbg_tensor>* dbg = nullptr) {
     auto& tok = ctx->tokenizer;
+    ov_bench_stage bench("enc_acoustic");
+    const auto* fc = encoder_fastconv(tok);
     if (!tok.enc_conv1_w || tok.enc_blocks.size() != 5 || !tok.enc_conv2_w)
         return {};
 
@@ -2271,7 +3190,7 @@ static std::vector<float> higgs_acoustic_encode(omnivoice_context* ctx, const fl
     ggml_set_input(x);
     // conv1: (1, T) → (64, T). core_dac::conv1d wants (Cin, T).
     ggml_tensor* h = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (1, T)
-    h = core_dac::conv1d(ctx0, h, tok.enc_conv1_w, tok.enc_conv1_b, 7);
+    h = core_dac::conv1d(ctx0, h, tok.enc_conv1_w, tok.enc_conv1_b, 7, 1, fc);
     tag(h, "ac_conv1");
 
     static const int dil[3] = {1, 3, 9};
@@ -2280,9 +3199,9 @@ static std::vector<float> higgs_acoustic_encode(omnivoice_context* ctx, const fl
         for (int r = 0; r < 3; r++) {
             auto& ru = blk.res[r];
             ggml_tensor* y = core_dac::snake(ctx0, h, ru.snake1_alpha);
-            y = core_dac::conv1d(ctx0, y, ru.conv1_w, ru.conv1_b, 7, dil[r]);
+            y = core_dac::conv1d(ctx0, y, ru.conv1_w, ru.conv1_b, 7, dil[r], fc);
             y = core_dac::snake(ctx0, y, ru.snake2_alpha);
-            y = core_dac::conv1d(ctx0, y, ru.conv2_w, ru.conv2_b, 1);
+            y = core_dac::conv1d(ctx0, y, ru.conv2_w, ru.conv2_b, 1, 1, fc);
             h = ggml_add(ctx0, h, y);
         }
         h = core_dac::snake(ctx0, h, blk.snake1_alpha);
@@ -2291,7 +3210,7 @@ static std::vector<float> higgs_acoustic_encode(omnivoice_context* ctx, const fl
         tag(h, snm);
         int stride = tok.downsampling_ratios[bl];
         int pad = (stride + 1) / 2; // ceil(stride/2); k = 2*stride
-        h = enc_conv1d_strided(ctx0, h, blk.conv1_w, blk.conv1_b, stride, pad);
+        h = enc_conv1d_strided(ctx0, h, blk.conv1_w, blk.conv1_b, stride, pad, fc);
         h = ggml_cont(ctx0, h);
         char nm[16];
         snprintf(nm, sizeof(nm), "ac_block%d", bl);
@@ -2299,7 +3218,7 @@ static std::vector<float> higgs_acoustic_encode(omnivoice_context* ctx, const fl
     }
     h = core_dac::snake(ctx0, h, tok.enc_snake1_alpha);
     tag(h, "ac_snake1");
-    h = core_dac::conv1d(ctx0, h, tok.enc_conv2_w, tok.enc_conv2_b, 3); // (256, T25)
+    h = core_dac::conv1d(ctx0, h, tok.enc_conv2_w, tok.enc_conv2_b, 3, 1, fc); // (256, T25)
     ggml_set_name(h, "e_acoustic");
     ggml_set_output(h);
     ggml_build_forward_expand(gf, h);
@@ -2341,8 +3260,11 @@ static std::vector<float> higgs_acoustic_encode(omnivoice_context* ctx, const fl
 // encoder_semantic bridge: sem (768, T) → e_semantic (768, T). conv(k3) then
 // 2 blocks of {2 ELU ResidualUnits [ELU→conv k3→ELU→conv k1] + block conv k3}.
 // All res-unit convs are bias-free; block conv has bias. No temporal change.
-static std::vector<float> higgs_encoder_semantic(omnivoice_context* ctx, const float* sem, int T) {
-    auto& tok = ctx->tokenizer;
+static std::vector<float> higgs_encoder_semantic(omnivoice_context* ctx, const float* sem, int T,
+                                                 ov_higgs_tokenizer* override_tok = nullptr) {
+    auto& tok = override_tok ? *override_tok : ctx->tokenizer;
+    ov_bench_stage bench("enc_semantic");
+    const auto* fc = encoder_fastconv(tok);
     if (!tok.encsem_conv_w || tok.encsem_blocks.size() != 2)
         return {};
     const int D = tok.sem_d; // 768
@@ -2355,26 +3277,35 @@ static std::vector<float> higgs_encoder_semantic(omnivoice_context* ctx, const f
     ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T); // (768, T)
     ggml_set_name(x, "sem");
     ggml_set_input(x);
-    ggml_tensor* h = core_dac::conv1d(ctx0, x, tok.encsem_conv_w, nullptr, 3);
+    ggml_tensor* h = core_dac::conv1d(ctx0, x, tok.encsem_conv_w, nullptr, 3, 1, fc);
     for (int b = 0; b < 2; b++) {
         auto& blk = tok.encsem_blocks[b];
         for (int r = 0; r < 2; r++) {
             ggml_tensor* y = ggml_elu(ctx0, h);
-            y = core_dac::conv1d(ctx0, y, blk.res[r].conv1_w, nullptr, 3);
+            y = core_dac::conv1d(ctx0, y, blk.res[r].conv1_w, nullptr, 3, 1, fc);
             y = ggml_elu(ctx0, y);
-            y = core_dac::conv1d(ctx0, y, blk.res[r].conv2_w, nullptr, 1);
+            y = core_dac::conv1d(ctx0, y, blk.res[r].conv2_w, nullptr, 1, 1, fc);
             h = ggml_add(ctx0, h, y);
         }
-        h = core_dac::conv1d(ctx0, h, blk.conv_w, blk.conv_b, 3);
+        h = core_dac::conv1d(ctx0, h, blk.conv_w, blk.conv_b, 3, 1, fc);
     }
     ggml_set_name(h, "e_semantic");
     ggml_set_output(h);
     ggml_build_forward_expand(gf, h);
+    encoder_semantic_precision(gf, tok);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
-    ggml_gallocr_alloc_graph(ga, gf);
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return {};
+    }
     ggml_backend_tensor_set(x, sem, 0, (size_t)D * T * sizeof(float));
-    ggml_backend_graph_compute(tok.backend, gf);
+    if (ggml_backend_graph_compute(tok.backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return {};
+    }
 
     int C = (int)h->ne[0], To = (int)h->ne[1];
     std::vector<float> out((size_t)To * C);
@@ -2397,24 +3328,13 @@ static ggml_tensor* hubert_groupnorm(ggml_context* ctx, ggml_tensor* h, ggml_ten
 // HuBERT frontend: wav16k (1, T_samp) → feat_proj (768, T_feat). Feature
 // extractor = 7 VALID (no-pad) strided convs, GroupNorm on layer 0, GELU(erf);
 // feat_projection = LayerNorm(512) + Linear(512→768). Captures hb_featextract.
-static std::vector<float> higgs_hubert_frontend(omnivoice_context* ctx, const float* wav, int T_samp, int* out_T,
-                                                std::vector<ov_dbg_tensor>* dbg = nullptr) {
-    auto& tok = ctx->tokenizer;
-    if (tok.sem_conv.size() != 7 || !tok.sem_featproj_w)
-        return {};
-    size_t mem_size = 4096 * 2 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8192, false);
-    std::vector<uint8_t> mem_buf(mem_size);
-    ggml_init_params ip = {mem_size, mem_buf.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
-
-    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_samp, 1);
-    ggml_set_name(x, "wav16k");
-    ggml_set_input(x);
+static ggml_tensor* build_hubert_frontend(ggml_context* ctx0, ov_higgs_tokenizer& tok, ggml_tensor* x,
+                                          ggml_tensor** feature_out = nullptr) {
+    const auto* fc = encoder_fastconv(tok);
     ggml_tensor* h = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (1, T)
     for (int i = 0; i < 7; i++) {
         // VALID conv (pad=0), stride sem_conv_s[i].
-        h = enc_conv1d_strided(ctx0, h, tok.sem_conv[i].conv_w, nullptr, tok.sem_conv_s[i], 0);
+        h = enc_conv1d_strided(ctx0, h, tok.sem_conv[i].conv_w, nullptr, tok.sem_conv_s[i], 0, fc);
         if (i == 0 && tok.sem_conv[0].ln_w)
             h = hubert_groupnorm(ctx0, h, tok.sem_conv[0].ln_w, tok.sem_conv[0].ln_b, 1e-5f);
         h = ggml_gelu_erf(ctx0, h);
@@ -2422,6 +3342,8 @@ static std::vector<float> higgs_hubert_frontend(omnivoice_context* ctx, const fl
     }
     // h: (512, T_feat).
     ggml_tensor* feat = h;
+    if (feature_out)
+        *feature_out = feat;
     ggml_set_name(feat, "hb_featextract");
     ggml_set_output(feat);
     // feat_projection: LayerNorm(512) over channels per frame, then Linear(512→768).
@@ -2434,12 +3356,43 @@ static std::vector<float> higgs_hubert_frontend(omnivoice_context* ctx, const fl
         p = ggml_add(ctx0, p, tok.sem_featproj_b);
     ggml_set_name(p, "hb_featproj");
     ggml_set_output(p);
+    return p;
+}
+
+static std::vector<float> higgs_hubert_frontend(omnivoice_context* ctx, const float* wav, int T_samp, int* out_T,
+                                                std::vector<ov_dbg_tensor>* dbg = nullptr,
+                                                ov_higgs_tokenizer* override_tok = nullptr) {
+    auto& tok = override_tok ? *override_tok : ctx->tokenizer;
+    ov_bench_stage bench("enc_frontend");
+    const auto* fc = encoder_fastconv(tok);
+    if (tok.sem_conv.size() != 7 || !tok.sem_featproj_w)
+        return {};
+    size_t mem_size = 4096 * 2 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8192, false);
+    std::vector<uint8_t> mem_buf(mem_size);
+    ggml_init_params ip = {mem_size, mem_buf.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_samp, 1);
+    ggml_set_name(x, "wav16k");
+    ggml_set_input(x);
+    ggml_tensor* feat = nullptr;
+    auto* p = build_hubert_frontend(ctx0, tok, x, &feat);
     ggml_build_forward_expand(gf, p);
+    encoder_semantic_precision(gf, tok);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
-    ggml_gallocr_alloc_graph(ga, gf);
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return {};
+    }
     ggml_backend_tensor_set(x, wav, 0, (size_t)T_samp * sizeof(float));
-    ggml_backend_graph_compute(tok.backend, gf);
+    if (ggml_backend_graph_compute(tok.backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return {};
+    }
 
     if (dbg) {
         for (ggml_tensor* t : {feat}) {
@@ -2490,6 +3443,16 @@ static std::vector<float> fold_posconv_weight(ov_higgs_tokenizer& tok) {
     return w;
 }
 
+static const std::vector<float>& encoder_posconv(ov_higgs_tokenizer& tok, std::vector<float>& scratch) {
+    if (!encoder_cache_enabled()) {
+        scratch = fold_posconv_weight(tok);
+        return scratch;
+    }
+    if (tok.enc_posconv.empty())
+        tok.enc_posconv = fold_posconv_weight(tok);
+    return tok.enc_posconv;
+}
+
 // LayerNorm over ne0 (channels), affine (w,b length = ne0). x (C, T) → (C, T).
 static ggml_tensor* hubert_layernorm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, float eps) {
     int C = (int)x->ne[0];
@@ -2503,30 +3466,9 @@ static ggml_tensor* hubert_layernorm(ggml_context* ctx, ggml_tensor* x, ggml_ten
 // (768, T). pos_conv (weight-normed grouped conv, SamePad, GELU) + residual;
 // encoder LayerNorm; 12 post-norm layers (12-head MHA + FFN); mean of the
 // encoder-input + 12 layer outputs. Captures hb_layer0/hb_layer11.
-static std::vector<float> higgs_hubert_encoder(omnivoice_context* ctx, const float* featproj, int T,
-                                               std::vector<ov_dbg_tensor>* dbg = nullptr) {
-    auto& tok = ctx->tokenizer;
-    const int D = tok.sem_d;     // 768
-    const int H = tok.sem_heads; // 12
-    const int hd = D / H;        // 64
-    const int groups = 16;
-    const int in_g = D / groups; // 48
-    const int K = 128;
-    std::vector<float> pcw = fold_posconv_weight(tok);
-
-    size_t mem_size = 8192 * 2 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16384, false);
-    std::vector<uint8_t> mem_buf(mem_size);
-    ggml_init_params ip = {mem_size, mem_buf.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
-
-    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T); // (768, T)
-    ggml_set_name(x, "featproj");
-    ggml_set_input(x);
-    ggml_tensor* pc_w = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, K, in_g, D); // grouped conv weight
-    ggml_set_name(pc_w, "pc_w");
-    ggml_set_input(pc_w);
-
+static ggml_tensor* build_hubert_encoder(ggml_context* ctx0, ov_higgs_tokenizer& tok, ggml_tensor* x, ggml_tensor* pc_w,
+                                         int T, bool dbg = false) {
+    const int D = tok.sem_d, H = tok.sem_heads, hd = D / H, groups = 16, in_g = D / groups, K = 128;
     // pos_conv: grouped conv (16 groups), pad=64, stride=1, then SamePad (drop
     // last col, even kernel) + GELU; residual add.
     std::vector<ggml_tensor*> gouts(groups);
@@ -2592,13 +3534,49 @@ static std::vector<float> higgs_hubert_encoder(omnivoice_context* ctx, const flo
     mean = ggml_scale(ctx0, mean, 1.0f / (float)hidden.size());
     ggml_set_name(mean, "hb_mean13");
     ggml_set_output(mean);
+    return mean;
+}
+
+static std::vector<float> higgs_hubert_encoder(omnivoice_context* ctx, const float* featproj, int T,
+                                               std::vector<ov_dbg_tensor>* dbg = nullptr,
+                                               ov_higgs_tokenizer* override_tok = nullptr) {
+    auto& tok = override_tok ? *override_tok : ctx->tokenizer;
+    ov_bench_stage bench("enc_hubert");
+    const int D = tok.sem_d; // 768
+    const int K = 128;
+    std::vector<float> pcw_scratch;
+    const auto& pcw = encoder_posconv(tok, pcw_scratch);
+
+    size_t mem_size = 8192 * 2 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16384, false);
+    std::vector<uint8_t> mem_buf(mem_size);
+    ggml_init_params ip = {mem_size, mem_buf.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T); // (768, T)
+    ggml_set_name(x, "featproj");
+    ggml_set_input(x);
+    ggml_tensor* pc_w = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, K, D / 16, D); // grouped conv weight
+    ggml_set_name(pc_w, "pc_w");
+    ggml_set_input(pc_w);
+
+    auto* mean = build_hubert_encoder(ctx0, tok, x, pc_w, T, dbg != nullptr);
     ggml_build_forward_expand(gf, mean);
+    encoder_semantic_precision(gf, tok);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
-    ggml_gallocr_alloc_graph(ga, gf);
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return {};
+    }
     ggml_backend_tensor_set(x, featproj, 0, (size_t)D * T * sizeof(float));
     ggml_backend_tensor_set(pc_w, pcw.data(), 0, pcw.size() * sizeof(float));
-    ggml_backend_graph_compute(tok.backend, gf);
+    if (ggml_backend_graph_compute(tok.backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return {};
+    }
 
     if (dbg) {
         for (const char* nm : {"hb_layer0", "hb_layer11"}) {
@@ -2622,11 +3600,70 @@ static std::vector<float> higgs_hubert_encoder(omnivoice_context* ctx, const flo
     return out;
 }
 
+// Same frontend/transformer builders, one allocation and no feature readback.
+static std::vector<float> higgs_hubert_fused(ov_higgs_tokenizer& tok, const float* wav, int n, int* frames) {
+    ov_bench_stage bench("enc_hubert_fused");
+    if (tok.sem_conv.size() != 7 || !tok.sem_featproj_w || !tok.sem_posconv_v)
+        return {};
+    ggml_init_params ip = {24576 * ggml_tensor_overhead() + ggml_graph_overhead_custom(24576, false), nullptr, true};
+    auto* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return {};
+    auto* graph = ggml_new_graph_custom(ctx0, 24576, false);
+    auto* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n, 1);
+    ggml_set_input(x);
+    auto* frontend = build_hubert_frontend(ctx0, tok, x);
+    int T = (int)frontend->ne[1];
+    auto* pc = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 128, tok.sem_d / 16, tok.sem_d);
+    ggml_set_input(pc);
+    auto* mean = build_hubert_encoder(ctx0, tok, frontend, pc, T);
+    ggml_build_forward_expand(graph, mean);
+    encoder_semantic_precision(graph, tok);
+    auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
+    std::vector<float> result;
+    if (ggml_gallocr_alloc_graph(alloc, graph)) {
+        std::vector<float> scratch;
+        const auto& folded = encoder_posconv(tok, scratch);
+        ggml_backend_tensor_set(x, wav, 0, (size_t)n * sizeof(float));
+        ggml_backend_tensor_set(pc, folded.data(), 0, folded.size() * sizeof(float));
+        if (ggml_backend_graph_compute(tok.backend, graph) == GGML_STATUS_SUCCESS) {
+            result.resize(ggml_nelements(mean));
+            ggml_backend_tensor_get(mean, result.data(), 0, result.size() * sizeof(float));
+            *frames = T;
+        }
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx0);
+    return result;
+}
+
+// Filtered GPU semantic copy excludes the DAC encoder whose Metal parity is
+// unresolved. Do not change CPU acoustic weights or disable --no-gpu policy.
+static ov_higgs_tokenizer* encoder_semantic_tokenizer(omnivoice_context* ctx) {
+    if (!encoder_hybrid_enabled(ctx) || ctx->encoder_gpu_failed)
+        return &ctx->tokenizer;
+    auto& tok = ctx->semantic_encoder;
+    if (!tok.loaded) {
+        if (!tok_load_backend(ctx, ctx->tokenizer.path.c_str(), true, &tok, true) ||
+            core_cpu_backend::is_cpu(tok.backend)) {
+            tok_release_backend(tok);
+            ctx->encoder_gpu_failed = true;
+            return &ctx->tokenizer;
+        }
+    }
+    return &tok;
+}
+
 // Full voice-clone encode: wav @ 24 kHz mono → codes (n_q, T25). Semantic branch
 // resamples to 16 kHz, F.pad(160,160), HuBERT, mean-13, [::2]; acoustic branch runs
 // the DAC encoder on 24 kHz; concat[acoustic,semantic] → fc → RVQ.
-static std::vector<int32_t> higgs_encode(omnivoice_context* ctx, const float* wav24k, int n24k, int* out_T) {
+static std::vector<int32_t> higgs_encode_impl(omnivoice_context* ctx, const float* wav24k, int n24k, int* out_T,
+                                              bool cpu_only = false) {
+    ov_bench_stage bench("encode");
+    if ((cpu_only || encoder_hybrid_enabled(ctx)) && !tok_rebind(ctx, false))
+        return {};
     auto& tok = ctx->tokenizer;
+    auto* semantic = cpu_only ? &ctx->tokenizer : encoder_semantic_tokenizer(ctx);
     // Acoustic branch (24 kHz).
     int T_ac = 0;
     auto e_acoustic = higgs_acoustic_encode(ctx, wav24k, n24k, &T_ac); // (T_ac, 256)
@@ -2637,17 +3674,26 @@ static std::vector<int32_t> higgs_encode(omnivoice_context* ctx, const float* wa
     std::vector<float> wav16p(wav16.size() + 320, 0.0f);
     std::memcpy(wav16p.data() + 160, wav16.data(), wav16.size() * sizeof(float));
     int T_fe = 0;
-    auto featproj = higgs_hubert_frontend(ctx, wav16p.data(), (int)wav16p.size(), &T_fe, nullptr);
-    if (featproj.empty())
+    std::vector<float> mean13;
+    if (!cpu_only && env_bool_default("CRISPASR_OMNIVOICE_ENCODER_FUSED", encoder_gpu_defaults(ctx)))
+        mean13 = higgs_hubert_fused(*semantic, wav16p.data(), (int)wav16p.size(), &T_fe);
+    else {
+        auto featproj = higgs_hubert_frontend(ctx, wav16p.data(), (int)wav16p.size(), &T_fe, nullptr, semantic);
+        if (featproj.empty())
+            return {};
+        mean13 = higgs_hubert_encoder(ctx, featproj.data(), T_fe, nullptr, semantic);
+    }
+    if (mean13.empty())
         return {};
-    auto mean13 = higgs_hubert_encoder(ctx, featproj.data(), T_fe, nullptr); // (T_fe, 768)
     // [::2] downsample.
     int T_se = (T_fe + 1) / 2;
     std::vector<float> sem_ds((size_t)T_se * tok.sem_d);
     for (int t = 0; t < T_se; t++)
         std::memcpy(sem_ds.data() + (size_t)t * tok.sem_d, mean13.data() + (size_t)(2 * t) * tok.sem_d,
                     tok.sem_d * sizeof(float));
-    auto e_semantic = higgs_encoder_semantic(ctx, sem_ds.data(), T_se); // (T_se, 768)
+    auto e_semantic = higgs_encoder_semantic(ctx, sem_ds.data(), T_se, semantic); // (T_se, 768)
+    if (e_semantic.empty())
+        return {};
     // Align lengths (branches can differ by ±1).
     int T = std::min(T_ac, T_se);
     const int Ca = tok.dac_hidden, Cs = tok.sem_d, Hh = tok.hidden_size; // 256, 768, 1024
@@ -2656,15 +3702,38 @@ static std::vector<int32_t> higgs_encode(omnivoice_context* ctx, const float* wa
         std::memcpy(cat.data() + (size_t)t * Hh, e_acoustic.data() + (size_t)t * Ca, Ca * sizeof(float));
         std::memcpy(cat.data() + (size_t)t * Hh + Ca, e_semantic.data() + (size_t)t * Cs, Cs * sizeof(float));
     }
-    std::vector<float> fc_w = read_tensor_f32(tok.fc_w);
-    std::vector<float> fc_b = tok.fc_b ? read_tensor_f32(tok.fc_b) : std::vector<float>();
+    if (!cpu_only && env_bool_default("CRISPASR_OMNIVOICE_ENCODER_GRAPH", encoder_gpu_defaults(ctx))) {
+        auto codes = higgs_projection_graph(*semantic, cat.data(), T);
+        if (!codes.empty()) {
+            *out_T = T;
+            return codes;
+        }
+        return {}; // graph failure must not mint a successful timing sample
+    }
+    ov_bench_stage scalar_bench("enc_fc_rvq_scalar");
+    std::vector<float> fc_w_scratch, fc_b_scratch;
+    const auto& fc_w = encoder_values(tok, tok.fc_w, fc_w_scratch);
+    const auto& fc_b = encoder_values(tok, tok.fc_b, fc_b_scratch);
     std::vector<float> emb;
     higgs_linear(fc_w, fc_b, cat.data(), T, Hh, Hh, emb);
     std::vector<int32_t> codes;
-    if (!higgs_rvq_encode(tok, emb, T, codes))
+    if (!higgs_rvq_encode(tok, emb, T, codes, ctx->n_threads))
         return {};
     *out_T = T;
     return codes; // (n_q, T)
+}
+
+// Recover from reported GPU allocation/compute failures using the retained CPU path.
+static std::vector<int32_t> higgs_encode(omnivoice_context* ctx, const float* wav, int n, int* frames) {
+    auto codes = higgs_encode_impl(ctx, wav, n, frames);
+    if (codes.empty() && ctx->semantic_encoder.loaded && !ctx->encoder_gpu_failed) {
+        ctx->encoder_gpu_failed = true;
+        tok_release_backend(ctx->semantic_encoder);
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "omnivoice: GPU reference encoding failed; retrying on CPU\n");
+        codes = higgs_encode_impl(ctx, wav, n, frames, true);
+    }
+    return codes;
 }
 
 // Run the encode diff against a Python reference archive. Stage-by-stage: each
@@ -2682,10 +3751,13 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
         return -1;
     }
     fprintf(stderr, "omnivoice encode-diff vs %s\n", ref_path);
+    // Failed main-chain stages; the return value reflects this so callers can
+    // gate on it (a diff that prints FAIL but exits 0 is not a gate).
+    int n_fail = 0;
 
     // --- Stage HuBERT frontend: feed ref wav16k_pad (isolates resampling) →
     //     hb_featextract + hb_featproj. Uses a separate archive via env. ---
-    if (const char* hp = getenv("OMNIVOICE_HUBERT_REF")) {
+    if (const char* hp = crispasr_env::get("CRISPASR_OMNIVOICE_HUBERT_REF")) {
         ov_ref_gguf href;
         if (href.load(hp)) {
             ggml_tensor* r_wav = href.get("wav16k_pad");
@@ -2742,7 +3814,7 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             int T_out = 0;
             // Optional per-block bisect vs a separate intermediates archive.
             std::vector<ov_dbg_tensor> dbg;
-            const char* bisect = getenv("OMNIVOICE_ACENC_BISECT");
+            const char* bisect = crispasr_env::get("CRISPASR_OMNIVOICE_ACENC_BISECT");
             auto mine = higgs_acoustic_encode(ctx, (const float*)r_wav->data, T_samp, &T_out, bisect ? &dbg : nullptr);
             if (bisect) {
                 ov_ref_gguf bref;
@@ -2819,11 +3891,15 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             if ((int)mine.size() == T * C && T_out == T) {
                 float cmin, cmean, mabs;
                 higgs_cos(mine.data(), (const float*)r_ac->data, T, C, cmin, cmean, mabs);
+                const bool ok = cmin >= 0.999f;
+                if (!ok)
+                    n_fail++;
                 fprintf(stderr, "  acoustic_enc (→e_acoustic): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin,
-                        cmean, mabs, cmin >= 0.999f ? "PASS" : "FAIL");
+                        cmean, mabs, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  acoustic_enc: shape mismatch mine=%zu (T_out=%d) ref=(%d,%d)\n", mine.size(), T_out,
                         T, C);
+                n_fail++;
             }
         } else {
             fprintf(stderr, "  acoustic_enc: ref missing input_wav24k/e_acoustic\n");
@@ -2840,10 +3916,14 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             if ((int)mine.size() == T * C) {
                 float cmin, cmean, mabs;
                 higgs_cos(mine.data(), (const float*)r_es->data, T, C, cmin, cmean, mabs);
+                const bool ok = cmin >= 0.999f;
+                if (!ok)
+                    n_fail++;
                 fprintf(stderr, "  encoder_semantic (→e_semantic): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin,
-                        cmean, mabs, cmin >= 0.999f ? "PASS" : "FAIL");
+                        cmean, mabs, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  encoder_semantic: size mismatch mine=%zu ref=%d\n", mine.size(), T * C);
+                n_fail++;
             }
         } else {
             fprintf(stderr, "  encoder_semantic: ref missing sem_ds/e_semantic\n");
@@ -2873,8 +3953,11 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             higgs_linear(fc_w, fc_b, cat.data(), T, H, H, mine);
             float cmin, cmean, mabs;
             higgs_cos(mine.data(), (const float*)r_emb->data, T, H, cmin, cmean, mabs);
+            const bool ok = cmin >= 0.999f;
+            if (!ok)
+                n_fail++;
             fprintf(stderr, "  concat+fc (→emb_fc): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin, cmean, mabs,
-                    cmin >= 0.999f ? "PASS" : "FAIL");
+                    ok ? "PASS" : "FAIL");
         } else {
             fprintf(stderr, "  concat+fc: ref missing e_acoustic/e_semantic/emb_fc or fc weights\n");
         }
@@ -2891,7 +3974,7 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
         std::vector<float> emb((size_t)T * H);
         std::memcpy(emb.data(), r_emb->data, emb.size() * sizeof(float));
         std::vector<int32_t> mine;
-        if (higgs_rvq_encode(tok, emb, T, mine)) {
+        if (higgs_rvq_encode(tok, emb, T, mine, ctx->n_threads)) {
             // ref codes stored (NQ, T) row-major as float/int32.
             int NQ = tok.n_quantizers;
             std::vector<int32_t> refc((size_t)NQ * T);
@@ -2910,7 +3993,13 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
                         match++;
                         per_cb[k]++;
                     }
-            fprintf(stderr, "  RVQ (emb_fc→codes): %ld/%ld exact (%.1f%%)  per-cb:", match, tot, 100.0 * match / tot);
+            // 99.5%: measured 99.9% on the pinned fixture; the handful of
+            // off-by-one codes are borderline nearest-centroid ties.
+            const bool ok = match * 1000 >= tot * 995;
+            if (!ok)
+                n_fail++;
+            fprintf(stderr, "  RVQ (emb_fc→codes): %ld/%ld exact (%.1f%%)  %s  per-cb:", match, tot,
+                    100.0 * match / tot, ok ? "PASS" : "FAIL");
             for (int k = 0; k < NQ; k++)
                 fprintf(stderr, " %d/%d", per_cb[k], T);
             fprintf(stderr, "\n    mine cb0[:12]:");
@@ -2945,14 +4034,23 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
                 for (size_t i = 0; i < refc.size(); i++)
                     if (mine[i] == refc[i])
                         match++;
-                fprintf(stderr, "  FULL wav→codes: %ld/%zu exact (%.1f%%), T=%d\n", match, refc.size(),
-                        100.0 * match / refc.size(), T_out);
+                // 95%: measured 99.0% on the pinned fixture; the residual is
+                // our resampler vs torchaudio's Hann sinc, not a port bug.
+                // The corrupt-tokenizer failure mode sits at 15%.
+                const bool ok = match * 100 >= (long)refc.size() * 95;
+                if (!ok)
+                    n_fail++;
+                fprintf(stderr, "  FULL wav→codes: %ld/%zu exact (%.1f%%), T=%d  %s\n", match, refc.size(),
+                        100.0 * match / refc.size(), T_out, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  FULL wav→codes: T_out=%d ref T=%d (align)\n", T_out, T);
+                n_fail++;
             }
         }
     }
-    return 0;
+    if (n_fail > 0)
+        fprintf(stderr, "omnivoice encode-diff: %d stage(s) FAILED\n", n_fail);
+    return n_fail == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -2967,6 +4065,21 @@ struct omnivoice_context* omnivoice_init_from_file(const char* path_model, struc
     ctx->verbosity = params.verbosity;
     ctx->use_gpu = params.use_gpu;
     ctx->flash_attn = params.flash_attn;
+    const bool legacy_audio = ctx->legacy_audio = env_bool("CRISPASR_OMNIVOICE_AUDIO_LEGACY");
+    ctx->preprocess_prompt = env_bool_default("CRISPASR_OMNIVOICE_PREPROCESS_PROMPT", !legacy_audio);
+    ctx->postprocess_output = env_bool_default("CRISPASR_OMNIVOICE_POSTPROCESS_OUTPUT", !legacy_audio);
+    ctx->pad_duration = ctx->fade_duration = legacy_audio ? 0.f : 0.1f;
+    auto audio_duration = [](const char* key, float fallback) {
+        if (const char* value = crispasr_env::get(key)) {
+            char* end = nullptr;
+            const float duration = std::strtof(value, &end);
+            if (end != value && !*end && std::isfinite(duration) && duration >= 0.f && duration <= 10.f)
+                return duration;
+        }
+        return fallback;
+    };
+    ctx->pad_duration = audio_duration("CRISPASR_OMNIVOICE_PAD_DURATION", ctx->pad_duration);
+    ctx->fade_duration = audio_duration("CRISPASR_OMNIVOICE_FADE_DURATION", ctx->fade_duration);
 
     // Generation config
     ctx->gen.num_steps = params.num_steps > 0 ? params.num_steps : 32;
@@ -2979,18 +4092,25 @@ struct omnivoice_context* omnivoice_init_from_file(const char* path_model, struc
 
     // Diagnostic env overrides (can set exact 0, unlike the CLI which treats 0 as
     // "use default"). Used to bisect the #254 word-dropping (CFG vs forward).
-    if (const char* e = getenv("OMNIVOICE_GUIDANCE"))
+    if (const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_GUIDANCE"))
         ctx->gen.guidance_scale = (float)atof(e);
-    if (const char* e = getenv("OMNIVOICE_POS_TEMP"))
+    if (const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_POS_TEMP"))
         ctx->gen.position_temperature = (float)atof(e);
-    if (const char* e = getenv("OMNIVOICE_CLASS_TEMP"))
+    if (const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_CLASS_TEMP"))
         ctx->gen.class_temperature = (float)atof(e);
     // num_steps is the dominant speed lever (stage0 = num_steps × 2 forwards).
     // Env override for quick A/B; the CLI --tts-steps / session setter also drive it.
-    if (const char* e = getenv("OMNIVOICE_NUM_STEPS")) {
+    if (const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_NUM_STEPS")) {
         int n = atoi(e);
         if (n > 0)
             ctx->gen.num_steps = n;
+    }
+    // Exact target duration in seconds (upstream `duration` parity). 0/unset =
+    // text-based estimate. Setter: omnivoice_set_target_duration().
+    if (const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_TARGET_DURATION")) {
+        float v = (float)atof(e);
+        if (v > 0.0f)
+            ctx->target_duration_s = ctx->env_target_duration_s = std::min(v, 600.0f);
     }
 
     if (!load_model(ctx, path_model)) {
@@ -3012,16 +4132,40 @@ int omnivoice_set_tokenizer_path(struct omnivoice_context* ctx, const char* path
     return 0;
 }
 
+int omnivoice_set_audio_processing(struct omnivoice_context* ctx, bool preprocess_prompt, bool postprocess_output,
+                                   float pad_duration, float fade_duration) {
+    if (!ctx || !std::isfinite(pad_duration) || !std::isfinite(fade_duration) || pad_duration < 0.f ||
+        fade_duration < 0.f || pad_duration > 10.f || fade_duration > 10.f)
+        return -1;
+    ctx->legacy_audio = false;
+    ctx->preprocess_prompt = preprocess_prompt;
+    ctx->postprocess_output = postprocess_output;
+    ctx->pad_duration = pad_duration;
+    ctx->fade_duration = fade_duration;
+    return 0;
+}
+
 int omnivoice_set_voice_prompt(struct omnivoice_context* ctx, const char* wav_path, const char* ref_text) {
     if (!ctx)
         return -1;
     if (!wav_path || !*wav_path) {
         ctx->ref_audio_codes.clear();
         ctx->ref_T = 0;
+        ctx->ref_rms = 0.0f;
         ctx->ref_text.clear();
         return 0;
     }
-    ctx->ref_text = ref_text ? ref_text : "";
+    // Fail closed. A new reference was requested, so invalidate the previously
+    // loaded one BEFORE any failure path below can return. Those paths used to
+    // return -1 while leaving ref_audio_codes / ref_T from the PREVIOUS request
+    // in place; the caller then synthesised anyway, so a reference that could
+    // not be read (deleted/renamed file, wrong path, unreadable WAV) silently
+    // rendered the line in the previous speaker's voice. `ref_text` is stored
+    // only on success, at the end of this function.
+    ctx->ref_audio_codes.clear();
+    ctx->ref_T = 0;
+    ctx->ref_rms = 0.0f;
+    ctx->ref_text.clear();
     if (!ctx->tokenizer.loaded) {
         fprintf(stderr, "omnivoice: voice cloning requires the audio tokenizer — call "
                         "omnivoice_set_tokenizer_path first\n");
@@ -3046,6 +4190,13 @@ int omnivoice_set_voice_prompt(struct omnivoice_context* ctx, const char* wav_pa
         for (float& v : pcm)
             v *= g;
     }
+    if (ctx->preprocess_prompt)
+        pcm = core_omnivoice_audio::remove_silence(pcm, 200, 100, 200);
+    if (pcm.empty()) {
+        fprintf(stderr,
+                "omnivoice: reference is silent after preprocessing; disable preprocessing to retain raw audio\n");
+        return -1;
+    }
     size_t clip = pcm.size() % 960;
     if (clip)
         pcm.resize(pcm.size() - clip);
@@ -3053,31 +4204,172 @@ int omnivoice_set_voice_prompt(struct omnivoice_context* ctx, const char* wav_pa
         fprintf(stderr, "omnivoice: voice WAV too short after clipping\n");
         return -1;
     }
+
+    // Reference-voice disk cache (#254 reporter request; omnivoice.cpp
+    // --ref-rvq parity, but automatic). The RVQ encode (HuBERT + DAC + 8-stage
+    // RVQ over the whole reference) is the expensive part of voice cloning and
+    // its result is deterministic, so cache the codes content-addressed.
+    // Content-addressed key = FNV-1a over the PREPROCESSED pcm (post
+    // resample/RMS/silence/clip — robust to container differences) + an encoder-weight
+    // fingerprint (re-encode after a tokenizer re-conversion). Issue #265:
+    // stored via the shared crispasr_ref_cache so OmniVoice now uses the SAME
+    // <temp>/crispasr-tts-refcache dir (or CRISPASR_TTS_REF_CACHE_DIR) and the
+    // SAME CRISPASR_TTS_REF_CACHE=0 disable switch as every other TTS backend.
+    // CRISPASR_OMNIVOICE_VOICE_CACHE=0 is kept as a backward-compat alias.
+    uint64_t cache_key = 0;
+    bool cache_on = false;
+    {
+        const char* legacy = std::getenv("CRISPASR_OMNIVOICE_VOICE_CACHE");
+        const bool legacy_off = legacy && *legacy && *legacy == '0';
+        cache_on = !legacy_off && !crispasr_ref_cache::disabled() && ctx->tokenizer.enc_conv1_w != nullptr;
+        if (cache_on) {
+            uint64_t h = 1469598103934665603ull; // FNV-1a 64
+            auto mix = [&h](const void* p, size_t n) {
+                const uint8_t* b = (const uint8_t*)p;
+                for (size_t i = 0; i < n; i++) {
+                    h ^= b[i];
+                    h *= 1099511628211ull;
+                }
+            };
+            const char* placement = codec_split_enabled() ? "CPU" : ggml_backend_name(ctx->tokenizer.backend);
+            const char* gates[] = {"CRISPASR_OMNIVOICE_ENCODER_FASTCONV", "CRISPASR_OMNIVOICE_ENCODER_CACHE",
+                                   "CRISPASR_OMNIVOICE_ENCODER_GRAPH", "CRISPASR_OMNIVOICE_ENCODER_FUSED",
+                                   "CRISPASR_OMNIVOICE_ENCODER_HYBRID"};
+            uint8_t encoder_policy = 0;
+            for (int i = 0; i < 5; i++) {
+                const bool on = i == 0   ? encoder_fastconv_enabled(ctx->tokenizer,
+                                                                    codec_split_enabled() || encoder_hybrid_enabled(ctx))
+                                : i == 1 ? encoder_cache_enabled()
+                                : i == 4 ? encoder_hybrid_enabled(ctx)
+                                         : env_bool_default(gates[i], encoder_gpu_defaults(ctx));
+                if (on)
+                    encoder_policy |= (uint8_t)(1u << i);
+            }
+            const char* fast_option = env_str(gates[0]);
+            if (fast_option && std::strcmp(fast_option, "2") == 0)
+                encoder_policy |= (uint8_t)(1u << 5);
+            if (env_bool_default("CRISPASR_OMNIVOICE_ENCODER_SEMANTIC_F32",
+                                 encoder_gpu_defaults(ctx) ||
+                                     encoder_metal_profile(ctx->tokenizer, ctx->tokenizer.backend)))
+                encoder_policy |= (uint8_t)(1u << 6);
+            if (encoder_policy) {
+                const char version[] = "encoder-ab-v1";
+                mix(version, sizeof(version));
+                mix(&encoder_policy, sizeof(encoder_policy));
+                const char* model_backend = ctx->backend ? ggml_backend_name(ctx->backend) : "CPU";
+                mix(model_backend, std::strlen(model_backend));
+            }
+            const char cache_version[] = "omnivoice-encoder-placement-v2";
+            mix(cache_version, sizeof(cache_version));
+            mix(placement, std::strlen(placement));
+            mix(pcm.data(), pcm.size() * sizeof(float));
+            uint64_t n_samp = (uint64_t)pcm.size();
+            mix(&n_samp, sizeof(n_samp));
+            ggml_tensor* fp = ctx->tokenizer.enc_conv1_w;
+            size_t fp_n = std::min<size_t>(4096, ggml_nbytes(fp));
+            std::vector<uint8_t> fp_buf(fp_n);
+            ggml_backend_tensor_get(fp, fp_buf.data(), 0, fp_n);
+            mix(fp_buf.data(), fp_n);
+            uint64_t total = (uint64_t)ggml_nbytes(fp);
+            mix(&total, sizeof(total));
+            cache_key = h;
+        }
+    }
+
     int T_ref = 0;
-    auto codes = higgs_encode(ctx, pcm.data(), (int)pcm.size(), &T_ref);
-    if (codes.empty() || T_ref <= 0) {
-        fprintf(stderr, "omnivoice: voice-prompt encode failed\n");
-        return -1;
+    std::vector<int32_t> codes;
+    if (cache_on) {
+        std::vector<uint32_t> shape;
+        std::vector<uint8_t> payload;
+        if (crispasr_ref_cache::get_bytes("omnivoice-voice", &cache_key, sizeof(cache_key), shape, payload) &&
+            shape.size() == 2 && shape[0] == (uint32_t)ctx->hp.n_codebooks && shape[1] > 0 &&
+            payload.size() == (size_t)shape[0] * shape[1] * sizeof(int32_t)) {
+            T_ref = (int)shape[1];
+            codes.resize((size_t)shape[0] * shape[1]);
+            std::memcpy(codes.data(), payload.data(), payload.size());
+            if (ctx->verbosity >= 1)
+                fprintf(stderr, "omnivoice: voice codes loaded from cache (%d ref frames)\n", T_ref);
+        }
+    }
+    if (codes.empty()) {
+        // Only SPLIT changes the encoder placement. The ordinary CUDA/GPU
+        // policy must be preserved when this experimental switch is disabled.
+        if (codec_split_enabled() && !tok_rebind(ctx, false))
+            return -1;
+        codes = higgs_encode(ctx, pcm.data(), (int)pcm.size(), &T_ref);
+        if (codes.empty() || T_ref <= 0) {
+            fprintf(stderr, "omnivoice: voice-prompt encode failed\n");
+            return -1;
+        }
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "omnivoice: voice prompt encoded — %d ref frames (%d codebooks)\n", T_ref,
+                    (int)ctx->hp.n_codebooks);
+        if (cache_on && !ctx->encoder_gpu_failed)
+            crispasr_ref_cache::put_bytes("omnivoice-voice", &cache_key, sizeof(cache_key),
+                                          {(uint32_t)ctx->hp.n_codebooks, (uint32_t)T_ref}, codes.data(),
+                                          codes.size() * sizeof(int32_t));
     }
     ctx->ref_audio_codes = std::move(codes);
     ctx->ref_T = T_ref;
-    if (ctx->verbosity >= 1)
-        fprintf(stderr, "omnivoice: voice prompt encoded — %d ref frames (%d codebooks)\n", T_ref,
-                (int)ctx->hp.n_codebooks);
+    ctx->ref_rms = rms;
+    ctx->ref_text = ctx->preprocess_prompt ? core_omnivoice_audio::add_punctuation(ref_text ? ref_text : "")
+                                           : (ref_text ? ref_text : "");
     return 0;
 }
 
+// The stored value goes VERBATIM into `<|lang_start|>…<|lang_end|>`, so resolve
+// it here rather than at the call sites — this is the one funnel every surface
+// (CLI, server, session ABI, bindings) passes through, and #13273 was three
+// separate surfaces each getting the wiring wrong on its own.
+//
+// Mirrors the blueprint's `_resolve_language()`: a valid ISO 639-3 ID passes
+// through, an English name maps to its ID, anything else becomes None
+// (language-agnostic) — never itself. Passing an unrecognized string through
+// is the silent failure: the prompt still builds, the graph still computes, and
+// the model is conditioned on tokens it never saw in that slot.
 int omnivoice_set_language(struct omnivoice_context* ctx, const char* lang) {
     if (!ctx)
         return -1;
-    ctx->language = lang ? lang : "";
+
+    const std::string requested = lang ? lang : "";
+    const auto resolved = core_omnivoice_lang::resolve(requested);
+    ctx->language = resolved.id;
+
+    if (resolved.status == core_omnivoice_lang::Status::unrecognized) {
+        // Not fatal — synthesis proceeds language-agnostic, exactly as upstream
+        // does — but say so, because the caller asked for something specific
+        // and is not getting it. Silence here is what made the SubtitleEdit
+        // language menu look like it worked.
+        const std::string hint = core_omnivoice_lang::suggest(requested);
+        fprintf(stderr, "crispasr[omnivoice]: language '%s' is not one of the model's %d language IDs",
+                requested.c_str(), core_omnivoice_lang::kLangTableN);
+        if (!hint.empty())
+            fprintf(stderr, " — did you mean '%s'?", hint.c_str());
+        fprintf(stderr, "\ncrispasr[omnivoice]: falling back to language-agnostic synthesis. Pass an ISO "
+                        "639-3 id (e.g. 'en', 'de', 'arb') or an English name (e.g. 'German').\n");
+        return -2;
+    }
     return 0;
 }
 
+// Upstream `_resolve_instruct()` RAISES on an unsupported item, a
+// dialect+accent mix, or two items from one category, and we mirror that rather
+// than degrade: the instruct is a closed 48-item vocabulary, and a voice-design
+// request that silently does nothing is exactly the failure this fixes. On
+// rejection the previous instruct is CLEARED, so a bad value can never leave a
+// stale one conditioning later lines on a reused server context.
 int omnivoice_set_instruct(struct omnivoice_context* ctx, const char* instruct) {
     if (!ctx)
         return -1;
-    ctx->instruct = instruct ? instruct : "";
+
+    core_omnivoice_instruct::Parsed parsed = core_omnivoice_instruct::parse(instruct ? instruct : "");
+    if (parsed.status != core_omnivoice_instruct::Status::ok &&
+        parsed.status != core_omnivoice_instruct::Status::cleared) {
+        fprintf(stderr, "crispasr[omnivoice]: %s\n", parsed.error.c_str());
+        ctx->instruct = core_omnivoice_instruct::Parsed{};
+        return -2;
+    }
+    ctx->instruct = std::move(parsed);
     return 0;
 }
 
@@ -3088,11 +4380,29 @@ int omnivoice_set_speed(struct omnivoice_context* ctx, float speed) {
     return 0;
 }
 
+int omnivoice_set_target_duration(struct omnivoice_context* ctx, float seconds) {
+    if (!ctx)
+        return -1;
+    // 0 / negative = back to the default: CRISPASR_OMNIVOICE_TARGET_DURATION if
+    // set, else the estimate. The target is materialised as a real frame buffer,
+    // so a typo must not ask for millions of frames — clamp to the same 600 s
+    // ceiling the CLI and server validate against.
+    ctx->target_duration_s = (seconds > 0.0f) ? std::min(seconds, 600.0f) : ctx->env_target_duration_s;
+    return 0;
+}
+
 int omnivoice_set_num_steps(struct omnivoice_context* ctx, int num_steps) {
     if (!ctx)
         return -1;
     if (num_steps >= 1)
         ctx->gen.num_steps = num_steps; // read live by generate_iterative
+    return 0;
+}
+
+int omnivoice_set_seed(struct omnivoice_context* ctx, uint64_t seed) {
+    if (!ctx)
+        return -1;
+    ctx->gen.seed = seed;
     return 0;
 }
 
@@ -3109,6 +4419,10 @@ int32_t* omnivoice_synthesize_codes(struct omnivoice_context* ctx, const char* t
 
     int n = (int)result.codes.size();
     int32_t* out = (int32_t*)malloc(n * sizeof(int32_t));
+    if (!out) {
+        *out_n_codes = 0;
+        return nullptr;
+    }
     std::memcpy(out, result.codes.data(), n * sizeof(int32_t));
     *out_n_codes = n;
     return out;
@@ -3121,12 +4435,11 @@ void omnivoice_codes_free(int32_t* codes) {
 float* omnivoice_decode_codes(struct omnivoice_context* ctx, const int32_t* codes, int n_codes, int* out_n_samples) {
     if (!ctx || !codes || n_codes <= 0 || !out_n_samples)
         return nullptr;
-    if (!ctx->tokenizer.loaded) {
+    if (!ctx->tokenizer.loaded && (!codec_split_enabled() || ctx->tokenizer.path.empty())) {
         fprintf(stderr, "omnivoice: decode requires audio tokenizer — call omnivoice_set_tokenizer_path first\n");
         *out_n_samples = 0;
         return nullptr;
     }
-
     int n_cb = (int)ctx->hp.n_codebooks;
     int T_frames = n_codes / n_cb;
     if (T_frames <= 0 || n_codes != n_cb * T_frames) {
@@ -3139,8 +4452,43 @@ float* omnivoice_decode_codes(struct omnivoice_context* ctx, const int32_t* code
         fprintf(stderr, "omnivoice: decoding %d codes (%d codebooks × %d frames)\n", n_codes, n_cb, T_frames);
     }
 
+    ov_higgs_tokenizer* decoder = nullptr;
+    if (codec_split_enabled()) {
+        if (codec_decode_on_gpu(ctx) && codec_resident_enabled()) {
+            if (!tok_prepare_resident_decoder(ctx)) {
+                *out_n_samples = 0;
+                return nullptr;
+            }
+            decoder = &ctx->resident_decoder;
+        } else if (!tok_rebind(ctx, codec_decode_on_gpu(ctx))) {
+            *out_n_samples = 0;
+            return nullptr;
+        }
+    }
     ov_bench_stage bench("decode");
-    auto pcm = higgs_decode(ctx, codes, n_cb, T_frames);
+    auto pcm = higgs_decode(ctx, codes, n_cb, T_frames, decoder);
+    if (pcm.empty()) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    // Upstream _post_process_audio: PCM16 silence cleanup, original reference
+    // RMS (or 0.5 peak for an unconditioned voice), then independent fade/pad.
+    if (ctx->postprocess_output)
+        pcm = core_omnivoice_audio::remove_silence(pcm, 500, 100, 100);
+    if (ctx->ref_T > 0 && ctx->ref_rms < 0.1f && (!ctx->legacy_audio || ctx->ref_rms > 0.f)) {
+        const float gain = ctx->ref_rms / 0.1f;
+        for (float& sample : pcm)
+            sample *= gain;
+    } else if (ctx->ref_T == 0 && !ctx->legacy_audio) {
+        float peak = 0.f;
+        for (float sample : pcm)
+            peak = std::max(peak, std::fabs(sample));
+        if (peak > 1e-6f)
+            for (float& sample : pcm)
+                sample *= 0.5f / peak;
+    }
+    core_omnivoice_audio::fade_and_pad(pcm, ctx->pad_duration, ctx->fade_duration);
     if (pcm.empty()) {
         *out_n_samples = 0;
         return nullptr;
@@ -3148,6 +4496,10 @@ float* omnivoice_decode_codes(struct omnivoice_context* ctx, const int32_t* code
 
     int n = (int)pcm.size();
     float* out = (float*)malloc(n * sizeof(float));
+    if (!out) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
     std::memcpy(out, pcm.data(), n * sizeof(float));
     *out_n_samples = n;
 
@@ -3200,23 +4552,21 @@ void omnivoice_free(struct omnivoice_context* ctx) {
     if (!ctx)
         return;
     // Main model
+    if (ctx->buf_packed)
+        ggml_backend_buffer_free(ctx->buf_packed);
+    if (ctx->ctx_packed)
+        ggml_free(ctx->ctx_packed);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
-    // Tokenizer
-    if (ctx->tokenizer.buf_f32)
-        ggml_backend_buffer_free(ctx->tokenizer.buf_f32);
-    if (ctx->tokenizer.ctx_f32)
-        ggml_free(ctx->tokenizer.ctx_f32);
-    if (ctx->tokenizer.buf_w)
-        ggml_backend_buffer_free(ctx->tokenizer.buf_w);
-    if (ctx->tokenizer.backend)
-        ggml_backend_free(ctx->tokenizer.backend);
-    if (ctx->tokenizer.ctx_w)
-        ggml_free(ctx->tokenizer.ctx_w);
+    // Tokenizer (same cleanup for success, partial load and placement changes).
+    tok_release_backend(ctx->semantic_encoder);
+    ctx->encoder_gpu_failed = false;
+    tok_release_backend(ctx->resident_decoder);
+    tok_release_backend(ctx->tokenizer);
     delete ctx;
 }
 
@@ -3234,7 +4584,10 @@ int omnivoice_encode_diff(struct omnivoice_context* ctx, const char* ref_gguf_pa
 void omnivoice_set_n_threads(struct omnivoice_context* ctx, int n_threads) {
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
-        if (ctx->backend && ggml_backend_is_cpu(ctx->backend))
-            ggml_backend_cpu_set_n_threads(ctx->backend, n_threads);
+        if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend))
+            core_cpu_backend::set_n_threads(ctx->backend, n_threads);
+        for (auto* codec : {&ctx->tokenizer, &ctx->resident_decoder})
+            if (codec->backend && core_cpu_backend::is_cpu(codec->backend))
+                core_cpu_backend::set_n_threads(codec->backend, n_threads);
     }
 }

@@ -51,6 +51,16 @@ void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx);
 void cosyvoice3_tts_set_n_threads(struct cosyvoice3_tts_context* ctx, int n_threads);
 void cosyvoice3_tts_set_seed(struct cosyvoice3_tts_context* ctx, uint64_t seed);
 void cosyvoice3_tts_set_temperature(struct cosyvoice3_tts_context* ctx, float temperature);
+// #304 cross-lingual: synthesis/target language (ISO-ish, e.g. "en"/"de"/"zh";
+// "" / nullptr / "auto" = zero-shot). When it differs from the reference voice's
+// language, synth drops the reference transcript to avoid a cross-lingual accent.
+void cosyvoice3_tts_set_target_language(struct cosyvoice3_tts_context* ctx, const char* lang);
+// #329: the language the REFERENCE clip is spoken in. Optional — without it the
+// language is inferred from the voice-bank name or the reference transcript,
+// which cannot always answer (a short transcript, or an unsupported script).
+// Setting it overrides that inference, and is the only way to reach
+// cross-lingual synthesis from an unidentifiable reference.
+void cosyvoice3_tts_set_reference_language(struct cosyvoice3_tts_context* ctx, const char* lang);
 
 // Read out LLM hparams for the diff harness (each pointer may be NULL).
 // d_model, n_layers, n_heads, n_kv_heads, head_dim, text_vocab,
